@@ -1,0 +1,43 @@
+# CachePilot — Task Board
+
+> Foreman: deepseek-v4-flash @ openrouter | DuckBrain: cachepilot
+
+Cost-aware KV-cache lease optimization + nonblocking long-task runtime for
+stock Hermes Agent. Spec-complete: `docs/PRD.md` (169 sections) is the
+authoritative spec. Implementation follows the PRD's phase sequence
+(§127–139), one PR = one phase. Read `AGENTS.md` + the relevant `docs/`
+before each phase. Follow AGENTS.md invariants + PR scope rules; bridge
+every commit to a `gitreins task complete`.
+
+## Active
+
+| ID | Task | Pri | Cpx | Deps | Tags | Model | Reasoning | Fallback |
+|----|------|-----|-----|------|------|-------|-----------|----------|
+| P00 | Research harness — fake provider (KV cache/TTL/usage/pricing simulator), canonical request repr, usage normalization, cache fingerprint, economic calculator; all offline-testable | Critical | 5±1 | — | +++python, ++testing, ++economics | DS-V4-Flash | High | DS-V4-Pro |
+| P01 | Hermes plugin skeleton — manifest, middleware registration, lifecycle hooks, structured debug logs; CI test asserts stock Hermes unchanged | Critical | 3±1 | P00 | ++plugin, ++hermes | DS-V4-Flash | Medium | Kimi-K3 |
+| P02 | Long-task runtime — terminal long-task classifier (deterministic), auto-background promotion, completion notifications, subagent target tracking (refcount), command duration history; NO warming; benchmark polling reduction vs stock | Critical | 5±1 | P01 | +++background, ++process, ++benchmark | DS-V4-Flash | High | DS-V4-Pro |
+| P03 | Relay pass-through — cachepilotd (127.0.0.1:8787), 100% pass-through, 0 cache modification; golden differential tests (same response/stream/tools/errors) | High | 4±1 | P01 | ++relay, ++proxy, ++streaming | DS-V4-Flash | Medium | Kimi-K3 |
+| P04 | Physical request observation — correlation IDs (X-CachePilot-* headers, stripped before upstream), request fingerprint, cache fingerprint, usage parsing, cache telemetry, route extraction; `cachepilot status/leases/costs` | High | 4±1 | P03 | ++telemetry, ++fingerprint | DS-V4-Flash | Medium | Kimi-K3 |
+| P05 | Lease manager — arm/invalidate/complete, generation counter, normal-request-reset, scheduler; DRY-RUN only (`WOULD WARM IN 47s`), validated on real workloads | High | 5±1 | P02+P04 | ++lease, ++scheduler | DS-V4-Flash | High | DS-V4-Pro |
+| P06 | Cache warming — bounded cache-equivalent replay (max_tokens=1 output bounding, content discarded), ONE verified OpenAI-compatible adapter first | High | 5±1 | P05 | +++warm, ++adapter | DS-V4-Flash | High | DS-V4-Pro |
+| P07 | Economic controller — cost estimation, warm budget (budget_ratio 0.70), expected savings, ECONOMIC_STOP; turns KV watchdog into KV optimizer | Critical | 4±1 | P06 | +++economics, ++pricing | DS-V4-Flash | High | DS-V4-Pro |
+| P08 | TTL learning — route-aware learned bounds (lower/upper/estimate/confidence), observational refinement, `cachepilot ttl`; route changes must not corrupt bounds | High | 4±1 | P04+P07 | ++ttl, ++learning | DS-V4-Flash | Medium | Kimi-K3 |
+| P09 | Route intelligence — route identity (gateway/upstream/endpoint/region), router-miss analysis, optional economic route affinity (never blind stickiness) | Medium | 4±1 | P08 | ++routing | DS-V4-Flash | Medium | Kimi-K3 |
+| P10 | Churn intelligence — system/tools/cache-key/route/history-boundary diff classification, `cachepilot explain-miss`; DETECT only in P0, no auto-rewrite | Medium | 3±1 | P04 | ++churn, ++diagnostics | DS-V4-Flash | Medium | Kimi-K3 |
+| P11 | Advanced optimizations (only after measurement) — stable tool ordering, volatile prompt isolation, cross-request prefix topology, survival model P(cache survives | age) | Low | 5±1 | P08-P10 | ++optimize, ++probabilistic | DS-V4-Flash | Low | Kimi-K3 |
+| P12 | Optional UI dashboard (yarn/React) — live leases, cache topology, cost graph, TTL learning, route changes, miss explanation; NEVER a core dependency | Low | 4±1 | P07-P10 | ++dashboard, ++yarn | DS-V4-Flash | Low | Kimi-K3 |
+
+## Completed
+
+| ID | Task | Pri | Cpx | Commit | Model |
+|----|------|-----|-----|--------|-------|
+| P-BOOT | Bootstrap — repo, AGENTS.md, docs/PRD.md (full spec), task board, gitreins, hilo, scheduler registration | Critical | 2±1 | — | DS-V4-Flash |
+
+## [ ] NEVER-DONE — Run coding-hermes-never-done 14-point audit
+
+Load coding-hermes-never-done skill. Run ALL checks: spec alignment, doc
+coverage, test gaps, package upgrades, pitfall hunt, performance audit,
+endpoint verification, CI/CD health, DuckBrain sync, code quality,
+middle-out wiring, usability smoke test, E2E testing, GitReins judge.
+Create a task for EVERY gap found. This task is never complete — the audit
+always finds something.

@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cachepilot"]
+
+[project]
+name = "cachepilot"
+version = "0.1.0"
+description = "Cost-aware KV cache lease optimization + nonblocking long-task runtime for Hermes Agent"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.9",
+    "httpx>=0.27",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.9",
+]
+
+[tool.uv.workspace]
+members = [
+    "packages/core",
+    "packages/hermes-plugin",
+    "packages/relay",
+    "packages/cli",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

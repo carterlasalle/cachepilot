@@ -1,0 +1,21 @@
+guards:
+  secrets: true
+  lint: true
+  tests: true
+  test_mode: diff
+  test_command: uv run --group dev pytest -x --tb=short
+  test_timeout: 300
+  lint_command: uv run ruff check .
+  lint_mode: full
+  static_analysis: false
+evaluator:
+  max_iterations: 60
+  max_time: 20m
+  max_input_tokens: 1M
+  max_output_tokens: 400k
+defaults:
+  model: deepseek-v4-flash
+  api_key_env: GITREINS_LLM_API_KEY
+history:
+  enabled: true
+  storage: git
