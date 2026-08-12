@@ -33,6 +33,22 @@ every commit to a `gitreins task complete`.
 |----|------|-----|-----|--------|-------|
 | P-BOOT | Bootstrap — repo, AGENTS.md, docs/PRD.md (full spec), task board, gitreins, hilo, scheduler registration | Critical | 2±1 | — | DS-V4-Flash |
 
+## [ ] DOCS-000 — Documentation gate (completion-phase — do near the end, BEFORE E2E-001 / NEVER-DONE idle)
+
+Final documentation pass per the fleet docs gate. NOT a bootstrap task — this
+runs when implementation is substantially complete (after P10+), so the docs
+describe what was actually built:
+
+- Launchpad-style README: title + badges + nav + diagram + tables (skimmable)
+- CONTRIBUTING.md, SECURITY.md, AGENTS.md current
+- docs/ runbooks: architecture.md, provider-adapters.md, cache-economics.md,
+  threat-model.md, hermes-integration.md
+- GitHub repo description + 3-8 topics via gh repo edit
+- License file (Apache-2.0, per user decision for fleet repos)
+
+A stub/empty README does NOT satisfy this gate. Only when every required doc
+exists and meets the content bar may the project proceed to E2E verify / idle.
+
 ## [ ] NEVER-DONE — Run coding-hermes-never-done 14-point audit
 
 Load coding-hermes-never-done skill. Run ALL checks: spec alignment, doc
