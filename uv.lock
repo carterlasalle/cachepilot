@@ -6,6 +6,7 @@ requires-python = ">=3.12"
 members = [
     "cachepilot",
     "cachepilot-core",
+    "cachepilot-hermes-plugin",
 ]
 
 [[package]]
@@ -36,6 +37,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "cachepilot-core" },
+    { name = "cachepilot-hermes-plugin" },
     { name = "httpx" },
     { name = "pydantic" },
 ]
@@ -49,6 +51,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "cachepilot-core", editable = "packages/core" },
+    { name = "cachepilot-hermes-plugin", editable = "packages/hermes-plugin" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "pydantic", specifier = ">=2.9" },
 ]
@@ -73,6 +76,17 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.27" },
     { name = "pydantic", specifier = ">=2.9" },
 ]
+
+[[package]]
+name = "cachepilot-hermes-plugin"
+version = "0.1.0"
+source = { editable = "packages/hermes-plugin" }
+dependencies = [
+    { name = "pydantic" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "pydantic", specifier = ">=2.9" }]
 
 [[package]]
 name = "certifi"
