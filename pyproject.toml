@@ -13,6 +13,7 @@ requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2.9",
     "httpx>=0.27",
+    "cachepilot-core>=0.1.0",
 ]
 
 [dependency-groups]
@@ -29,9 +30,12 @@ members = [
     "packages/cli",
 ]
 
+[tool.uv.sources]
+cachepilot-core = { workspace = true }
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "packages/core/tests"]

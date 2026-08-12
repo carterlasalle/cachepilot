@@ -20,6 +20,7 @@ paths = [
   '''\.git/''',
   '''\.gitreins/''',
   '''\.gitreins/history/''',
+  '''\.venv/''',
   '''.*\.log''',
   '''specs/''',
   '''docs/''',

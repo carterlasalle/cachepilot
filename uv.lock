@@ -2,6 +2,12 @@ version = 1
 revision = 3
 requires-python = ">=3.12"
 
+[manifest]
+members = [
+    "cachepilot",
+    "cachepilot-core",
+]
+
 [[package]]
 name = "annotated-types"
 version = "0.8.0"
@@ -29,6 +35,7 @@ name = "cachepilot"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "cachepilot-core" },
     { name = "httpx" },
     { name = "pydantic" },
 ]
@@ -41,6 +48,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "cachepilot-core", editable = "packages/core" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "pydantic", specifier = ">=2.9" },
 ]
@@ -49,6 +57,21 @@ requires-dist = [
 dev = [
     { name = "pytest", specifier = ">=8.0" },
     { name = "ruff", specifier = ">=0.9" },
+]
+
+[[package]]
+name = "cachepilot-core"
+version = "0.1.0"
+source = { editable = "packages/core" }
+dependencies = [
+    { name = "httpx" },
+    { name = "pydantic" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "httpx", specifier = ">=0.27" },
+    { name = "pydantic", specifier = ">=2.9" },
 ]
 
 [[package]]
