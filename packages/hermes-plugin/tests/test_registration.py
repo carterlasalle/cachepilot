@@ -9,6 +9,7 @@ is all the plugin uses.
 
 import logging
 
+from cachepilot_hermes.config import CachePilotConfig
 from cachepilot_hermes.plugin import HOOK_NAMES, MIDDLEWARE_KINDS, create_plugin, register
 
 EXPECTED_MIDDLEWARE = {"tool_request", "tool_execution", "llm_request", "llm_execution"}
@@ -75,6 +76,27 @@ def test_create_plugin_register_matches_module_register():
     create_plugin().register(ctx_b)
     assert set(ctx_a.middleware) == set(ctx_b.middleware)
     assert set(ctx_a.hooks) == set(ctx_b.hooks)
+
+
+def test_register_emits_structured_debug_log(caplog):
+    ctx = FakePluginContext()
+    with caplog.at_level(logging.DEBUG, logger="cachepilot_hermes"):
+        register(ctx)
+    lines = [r.getMessage() for r in caplog.records]
+    assert any("event=cachepilot.plugin.register" in line for line in lines)
+    line = next(line for line in lines if "event=cachepilot.plugin.register" in line)
+    assert "middleware_count=4" in line
+    assert "hooks_count=8" in line
+    assert "plugin=cachepilot-hermes-plugin" in line
+
+
+def test_register_log_gated_when_disabled(caplog):
+    """enabled=False suppresses the registration log (config gate, not traffic)."""
+    ctx = FakePluginContext()
+    plugin = create_plugin(CachePilotConfig(enabled=False))
+    with caplog.at_level(logging.DEBUG, logger="cachepilot_hermes"):
+        plugin.register(ctx)
+    assert not any("cachepilot.plugin.register" in r.getMessage() for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------

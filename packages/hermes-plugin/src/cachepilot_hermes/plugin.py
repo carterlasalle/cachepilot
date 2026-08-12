@@ -21,12 +21,18 @@ Hermes integration (v0.20.0, installed source at
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from typing import Any
 
 from pydantic import BaseModel
 
-from cachepilot_hermes.config import PLUGIN_NAME, CachePilotConfig
+from cachepilot_hermes.config import (
+    PLUGIN_LOGGER_NAME,
+    PLUGIN_NAME,
+    CachePilotConfig,
+    emit_debug,
+)
 from cachepilot_hermes.lifecycle import HOOK_NAMES, make_hook_handlers
 from cachepilot_hermes.llm_middleware import (
     make_llm_execution_middleware,
@@ -74,6 +80,10 @@ PLUGIN_MANIFEST = PluginManifest(
     middleware=MIDDLEWARE_KINDS,
 )
 
+# One shared logger so a single level change gates all CachePilot output
+# (see emit_debug in config.py — the only log path used anywhere here).
+_logger = logging.getLogger(PLUGIN_LOGGER_NAME)
+
 
 class CachePilotPlugin:
     """One configured plugin instance: bound middleware + hook callbacks.
@@ -107,6 +117,14 @@ class CachePilotPlugin:
             ctx.register_middleware(kind, callback)
         for hook_name, callback in self.hooks.items():
             ctx.register_hook(hook_name, callback)
+        emit_debug(
+            self.config,
+            _logger,
+            "cachepilot.plugin.register",
+            middleware_count=len(self.middleware),
+            hooks_count=len(self.hooks),
+            enabled=self.config.enabled,
+        )
 
 
 def create_plugin(config: CachePilotConfig | None = None) -> CachePilotPlugin:
