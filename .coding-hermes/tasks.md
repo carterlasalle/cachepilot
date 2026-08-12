@@ -13,7 +13,6 @@ every commit to a `gitreins task complete`.
 
 | ID | Task | Pri | Cpx | Deps | Tags | Model | Reasoning | Fallback |
 |----|------|-----|-----|------|------|-------|-----------|----------|
-| P01 | Hermes plugin skeleton — manifest, middleware registration, lifecycle hooks, structured debug logs; CI test asserts stock Hermes unchanged | Critical | 3±1 | P00 | ++plugin, ++hermes | DS-V4-Flash | Medium | Kimi-K3 |
 | P02 | Long-task runtime — terminal long-task classifier (deterministic), auto-background promotion, completion notifications, subagent target tracking (refcount), command duration history; NO warming; benchmark polling reduction vs stock | Critical | 5±1 | P01 | +++background, ++process, ++benchmark | DS-V4-Flash | High | DS-V4-Pro |
 | P03 | Relay pass-through — cachepilotd (127.0.0.1:8787), 100% pass-through, 0 cache modification; golden differential tests (same response/stream/tools/errors) | High | 4±1 | P01 | ++relay, ++proxy, ++streaming | DS-V4-Flash | Medium | Kimi-K3 |
 | P04 | Physical request observation — correlation IDs (X-CachePilot-* headers, stripped before upstream), request fingerprint, cache fingerprint, usage parsing, cache telemetry, route extraction; `cachepilot status/leases/costs` | High | 4±1 | P03 | ++telemetry, ++fingerprint | DS-V4-Flash | Medium | Kimi-K3 |
@@ -31,6 +30,7 @@ every commit to a `gitreins task complete`.
 | ID | Task | Pri | Cpx | Commit | Model |
 |----|------|-----|-----|--------|-------|
 | P00 | Research harness — fake provider (KV cache/TTL/usage/pricing simulator), canonical request repr, usage normalization, cache fingerprint, economic calculator; all offline-testable | Critical | 5±1 | 4d8017c | DS-V4-Flash |
+| P01 | Hermes plugin skeleton — manifest, middleware registration, lifecycle hooks, structured debug logs; CI test asserts stock Hermes unchanged (judge PASS ddfc8a00) | Critical | 3±1 | f423a54 (+2795b4b) | DS-V4-Flash |
 | P-BOOT | Bootstrap — repo, AGENTS.md, docs/PRD.md (full spec), task board, gitreins, hilo, scheduler registration | Critical | 2±1 | — | DS-V4-Flash |
 
 ## [ ] DOCS-000 — Documentation gate (completion-phase — do near the end, BEFORE E2E-001 / NEVER-DONE idle)
