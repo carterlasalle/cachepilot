@@ -1,0 +1,120 @@
+"""Relay settings (PRD §84 ``relay`` block; PRD §26 bind policy).
+
+``cachepilotd`` listens on ``127.0.0.1:8787`` by default and NEVER binds a
+wildcard address (``0.0.0.0`` / ``::``) unless explicitly allowed — the
+relay is a local process serving Hermes on the same machine (PRD §26, §85).
+No secrets are read here (AGENTS.md rule 10).
+"""
+
+from __future__ import annotations
+
+import os
+from collections.abc import Mapping
+from typing import Self
+from urllib.parse import urlsplit
+
+from pydantic import BaseModel, field_validator, model_validator
+
+#: Default listen address (PRD §26).
+DEFAULT_LISTEN = "127.0.0.1:8787"
+
+#: Environment variables, following the plugin's ``CACHEPILOT_*`` convention.
+ENV_LISTEN = "CACHEPILOT_RELAY_LISTEN"
+ENV_UPSTREAM = "CACHEPILOT_UPSTREAM"
+ENV_ALLOW_EXTERNAL_BIND = "CACHEPILOT_RELAY_ALLOW_EXTERNAL_BIND"
+
+#: Wildcard bind hosts refused without an explicit override (PRD §26).
+WILDCARD_HOSTS = frozenset({"0.0.0.0", "::"})
+
+
+def parse_listen(value: str) -> tuple[str, int]:
+    """Split ``host:port`` into ``(host, port)``; raises ValueError when malformed.
+
+    Port 0 means "OS-assigned ephemeral port" (used by the test harness);
+    IPv6 literals in brackets are supported (``[::1]:8787``).
+    """
+    value = value.strip()
+    if value.startswith("["):
+        host, _, rest = value[1:].partition("]")
+        if not rest.startswith(":"):
+            raise ValueError(f"listen address {value!r} must be host:port")
+        port_text = rest[1:]
+    else:
+        host, _, port_text = value.rpartition(":")
+    if not host:
+        raise ValueError(f"listen address {value!r} has an empty host")
+    if not port_text.isdigit():
+        raise ValueError(f"listen address {value!r} has a non-numeric port")
+    port = int(port_text)
+    if not 0 <= port <= 65535:
+        raise ValueError(f"listen address {value!r} has an out-of-range port")
+    return host, port
+
+
+class RelayConfig(BaseModel):
+    """Relay settings.
+
+    Attributes:
+        listen: ``host:port`` the relay binds (default ``127.0.0.1:8787``).
+        upstream: provider base URL every request is forwarded to (required).
+        allow_external_bind: explicit override permitting wildcard binds
+            (``0.0.0.0`` / ``::``). Off by default (PRD §26).
+    """
+
+    listen: str = DEFAULT_LISTEN
+    upstream: str
+    allow_external_bind: bool = False
+
+    @field_validator("listen")
+    @classmethod
+    def _validate_listen(cls, value: str) -> str:
+        parse_listen(value)
+        return value
+
+    @field_validator("upstream")
+    @classmethod
+    def _validate_upstream(cls, value: str) -> str:
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError(f"upstream {value!r} must be an absolute http(s) URL")
+        return value
+
+    @model_validator(mode="after")
+    def _refuse_wildcard_bind(self) -> Self:
+        host, _ = parse_listen(self.listen)
+        if host in WILDCARD_HOSTS and not self.allow_external_bind:
+            raise ValueError(
+                f"refusing to bind {host}: cachepilotd is a local relay and never "
+                "binds a wildcard address; pass --allow-external-bind or set "
+                f"{ENV_ALLOW_EXTERNAL_BIND}=1 to override"
+            )
+        return self
+
+    @classmethod
+    def from_env(
+        cls,
+        env: Mapping[str, str] | None = None,
+        *,
+        listen: str | None = None,
+        upstream: str | None = None,
+        allow_external_bind: bool | None = None,
+    ) -> RelayConfig:
+        """Build settings from ``CACHEPILOT_*`` variables; explicit arguments
+        (CLI flags) win over the environment (PRD §84).
+        """
+        env = os.environ if env is None else env
+        effective_listen = listen or env.get(ENV_LISTEN) or DEFAULT_LISTEN
+        effective_upstream = upstream or env.get(ENV_UPSTREAM)
+        if not effective_upstream:
+            raise ValueError(f"no upstream configured: pass --upstream or set {ENV_UPSTREAM}")
+        if allow_external_bind is None:
+            allow_external_bind = _env_flag(env.get(ENV_ALLOW_EXTERNAL_BIND))
+        return cls(
+            listen=effective_listen,
+            upstream=effective_upstream,
+            allow_external_bind=allow_external_bind,
+        )
+
+
+def _env_flag(raw: str | None) -> bool:
+    return raw is not None and raw.strip().lower() in {"1", "true", "yes", "on"}
