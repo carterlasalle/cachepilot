@@ -95,6 +95,13 @@ Production mode (no dev server): `yarn build`, then the backend serves
 | `GET /api/health` | `{"ok": true}` connectivity probe |
 | any other `GET` | 404; `POST`/writes are refused with 405 (the backend is read-only) |
 
+The route counters are deliberately different measurements (PRD §25 vs §72):
+`GET /api/status` `route_changes` counts churn events with `route_changed=1`
+(churn-attributed), while `GET /api/routes` `route_switches` counts all
+`route_events` rows (observed switches). The CLI mirrors this as
+"route-change churn events" (`cachepilot status`) vs "route switches"
+(`cachepilot routes`); the JSON field names are unchanged.
+
 ## Views
 
 | View | Shows | Empty state |

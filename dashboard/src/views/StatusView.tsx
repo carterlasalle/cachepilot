@@ -28,7 +28,7 @@ export function StatusView() {
         <StatCard label="SUCCESS_UNVERIFIED" value={String(stats.unverified)} />
         <StatCard label="FAILED" value={String(stats.failed)} />
         <StatCard label="Churn events" value={String(stats.churn_events)} />
-        <StatCard label="Route changes" value={String(stats.route_changes)} />
+        <StatCard label="Route-change churn events" value={String(stats.route_changes)} />
       </div>
 
       <div className="stat-grid">

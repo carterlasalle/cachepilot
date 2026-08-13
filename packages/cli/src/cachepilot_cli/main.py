@@ -213,9 +213,13 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"  churn events        {stats.churn_events}")
     if churn:
         print(f"    most recent       {_describe_churn(churn[0])}")
-    print(f"  route changes       {stats.route_changes}")
+    print(f"  route-change churn events {stats.route_changes}")
     if routes:
         print(f"    most recent       {_describe_churn(routes[0])}")
+    print(
+        "  route-change churn events = churn events attributed to a route change"
+        " (churn_events.route_changed); all observed switches: cachepilot routes"
+    )
     return 0
 
 

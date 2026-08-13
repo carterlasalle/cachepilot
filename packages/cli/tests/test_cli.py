@@ -222,7 +222,11 @@ def test_status_cache_health_from_telemetry(tmp_path, capsys):
     assert "SUCCESS_UNVERIFIED  1" in out
     assert "FAILED              1" in out
     assert "churn events        2" in out
-    assert "route changes       1" in out
+    assert "route-change churn events 1" in out
+    assert (
+        "route-change churn events = churn events attributed to a route change"
+        in out
+    )
     assert "most recent" in out
 
 
