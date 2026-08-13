@@ -461,7 +461,16 @@ class Handler(BaseHTTPRequestHandler):
         return self._serve_static(parsed.path)
 
     def do_POST(self) -> None:  # http.server API (capitalized by contract)
-        self._send_json(405, {"error": "the dashboard backend is read-only (GET only)"})
+        self._write_refused()
+
+    def do_PUT(self) -> None:  # http.server API (capitalized by contract)
+        self._write_refused()
+
+    def do_DELETE(self) -> None:  # http.server API (capitalized by contract)
+        self._write_refused()
+
+    def do_PATCH(self) -> None:  # http.server API (capitalized by contract)
+        self._write_refused()
 
     # -- helpers -----------------------------------------------------------
 
@@ -491,6 +500,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _write_refused(self) -> None:
+        """Refuse a write with the documented read-only 405 JSON (E2E-003).
+
+        POST / PUT / DELETE / PATCH all land here — the backend is read-only
+        (docs/dashboard.md), so every write method answers the same JSON 405
+        instead of the stdlib fallback 501 HTML page for unimplemented ones.
+        """
+        self._send_json(405, {"error": "the dashboard backend is read-only (GET only)"})
 
     def _serve_static(self, path: str) -> None:
         root = self.server.dist_dir

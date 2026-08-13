@@ -550,14 +550,32 @@ def main() -> int:
                 empty_server.server_close()
 
             print("== write refusal ==")
-            req = urllib.request.Request(
-                f"http://127.0.0.1:{port}/api/leases", method="POST", data=b"{}"
-            )
-            try:
-                urllib.request.urlopen(req, timeout=10)
-                check("POST refused", False, "POST unexpectedly succeeded")
-            except urllib.error.HTTPError as exc:
-                check("POST refused 405", exc.code == 405, str(exc.code))
+            refused_error = {"error": "the dashboard backend is read-only (GET only)"}
+            for method in ("POST", "PUT", "DELETE", "PATCH"):
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/leases", method=method, data=b"{}"
+                )
+                try:
+                    urllib.request.urlopen(req, timeout=10)
+                    check(f"{method} refused", False, f"{method} unexpectedly succeeded")
+                except urllib.error.HTTPError as exc:
+                    body = exc.read().decode("utf-8")
+                    check(f"{method} refused 405", exc.code == 405, str(exc.code))
+                    content_type = exc.headers.get("Content-Type", "")
+                    check(
+                        f"{method} refused JSON content type",
+                        content_type.startswith("application/json"),
+                        content_type or "(no Content-Type header)",
+                    )
+                    try:
+                        parsed_body = json.loads(body)
+                    except json.JSONDecodeError:
+                        parsed_body = None
+                    check(
+                        f"{method} refused documented error body",
+                        parsed_body == refused_error,
+                        body,
+                    )
 
             print("== relay health probe (E2E-002) ==")
             # closed port -> unreachable (deterministic: loopback port 1)
