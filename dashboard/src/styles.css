@@ -405,3 +405,97 @@ code {
   font-size: 14px;
   font-weight: 600;
 }
+
+/* -- mobile (<=768px) --------------------------------------------------
+   The fixed 230px sidebar leaves ~90px for main content at 320px and clips
+   the Overview stat cards. Collapse the sidebar into a horizontal,
+   scrollable top nav and reflow the grids to a single column so everything
+   stays readable on narrow viewports. Desktop (>=1024px) is untouched. */
+@media (max-width: 768px) {
+  .app {
+    grid-template-columns: 1fr;
+    min-height: 100vh;
+  }
+
+  .sidebar {
+    position: sticky;
+    top: 0;
+    height: auto;
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    z-index: 10;
+    overflow-x: auto;
+  }
+
+  .brand {
+    border-bottom: 0;
+    margin-bottom: 0;
+    padding: 4px 6px 4px 0;
+    flex-shrink: 0;
+  }
+
+  .brand-sub {
+    display: none;
+  }
+
+  .nav {
+    flex-direction: row;
+    flex: 1;
+    gap: 4px;
+    overflow-x: auto;
+  }
+
+  .nav-item {
+    white-space: nowrap;
+  }
+
+  .sidebar-foot {
+    display: none;
+  }
+
+  /* let the sticky sidebar own the top; avoid overlap on scroll */
+  .topbar {
+    padding: 12px 14px 10px;
+    gap: 6px;
+    position: static;
+    flex-wrap: wrap;
+  }
+
+  .topbar h1 {
+    font-size: 16px;
+  }
+
+  .content {
+    padding: 14px 14px 32px;
+  }
+
+  .stat-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .bar-row {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+
+  .bar-label {
+    white-space: normal;
+    overflow: visible;
+  }
+
+  .bar-value {
+    text-align: left;
+    font-size: 12px;
+  }
+
+  .layer-groups {
+    grid-template-columns: 1fr;
+  }
+
+  .empty-state {
+    white-space: normal;
+    word-break: break-word;
+  }
+}
