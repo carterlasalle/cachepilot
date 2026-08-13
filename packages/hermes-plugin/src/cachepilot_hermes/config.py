@@ -176,11 +176,18 @@ class CachePilotConfig(BaseModel):
         log_format: ``"kv"`` for one ``key=value`` line per event, ``"json"``
             for one JSON object per line.
         long_tasks: Long-task runtime settings (PRD §84).
+        correlation_headers: When True, the ``llm_request`` middleware
+            injects the ``X-CachePilot-Session`` / ``X-CachePilot-Request`` /
+            ``X-CachePilot-Turn`` correlation headers into the provider
+            request (PRD §29 primary mechanism; the relay strips them before
+            forwarding upstream). Default True — the relay ignores them when
+            its own observation is disabled.
     """
 
     enabled: bool = True
     log_level: LogLevel = "DEBUG"
     log_format: LogFormat = "kv"
+    correlation_headers: bool = True
     long_tasks: LongTasksSettings = Field(default_factory=LongTasksSettings)
 
     @classmethod
@@ -195,6 +202,9 @@ class CachePilotConfig(BaseModel):
             enabled=_env_flag(env.get("CACHEPILOT_ENABLED", "true")),
             log_level=env.get("CACHEPILOT_LOG_LEVEL", "DEBUG").strip().upper(),
             log_format=env.get("CACHEPILOT_LOG_FORMAT", "kv").strip().lower(),
+            correlation_headers=_env_flag(
+                env.get("CACHEPILOT_CORRELATION_HEADERS", "true")
+            ),
             long_tasks=LongTasksSettings.from_env(env),
         )
 

@@ -55,6 +55,7 @@ def create_app(config: RelayConfig) -> Starlette:
         try:
             yield
         finally:
+            app.state.proxy.close()
             await client.aclose()
 
     app = Starlette(lifespan=lifespan)

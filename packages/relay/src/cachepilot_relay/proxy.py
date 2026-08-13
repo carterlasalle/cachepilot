@@ -1,17 +1,23 @@
-"""Pass-through proxy — PRD §27 data plane, Phase 3 (100% pass-through).
+"""Pass-through proxy — PRD §27 data plane, Phase 3 + Phase 4 observation.
 
 Forwards every request verbatim (method, path, query, headers, body) to the
 configured upstream and returns the upstream response unchanged: same status,
 same body bytes, same relevant headers, same streaming behaviour — SSE and
 chunked responses are streamed so chunks flush as they arrive.
 
-Zero cache modification (AGENTS.md rules 4 and 10): no ``X-*`` headers are
-added, the body is never rewritten, and nothing is persisted. The only header
-surgery is hop-by-hop stripping per RFC 7230 §6.1 (``Connection``,
-``Keep-Alive``, ``Transfer-Encoding``, ``TE``, ``Trailer``, ``Upgrade``,
-``Proxy-*``) plus any header nominated by the incoming ``Connection`` field,
-and dropping the client's ``Host`` so the upstream sees its own address
-(standard reverse-proxy rewrite, required for correct forwarding).
+Phase 3 guarantees (unchanged): zero cache modification — no ``X-*`` headers
+are added, the body is never rewritten, and the only header surgery is
+hop-by-hop stripping per RFC 7230 §6.1 (``Connection``, ``Keep-Alive``,
+``Transfer-Encoding``, ``TE``, ``Trailer``, ``Upgrade``, ``Proxy-*``) plus
+any header nominated by the incoming ``Connection`` field, dropping the
+client's ``Host`` so the upstream sees its own address (standard reverse-
+proxy rewrite), and — Phase 4 — removing the relay-internal correlation
+headers (PRD §29) that must never reach the upstream.
+
+Phase 4 observation (PRD §27 steps 2-6, §131) is read-only and fail-open:
+the request body is buffered once (needed for fingerprinting) and the
+response body is parsed without being modified. Any observation error logs
+a warning and never breaks forwarding (AGENTS.md invariant 9).
 """
 
 from __future__ import annotations
@@ -24,6 +30,7 @@ from starlette.requests import Request
 from starlette.responses import Response, StreamingResponse
 
 from cachepilot_relay.config import RelayConfig
+from cachepilot_relay.observation import RequestObserver, strip_correlation_headers
 
 logger = logging.getLogger("cachepilot_relay.proxy")
 
@@ -83,11 +90,24 @@ def should_stream(upstream: httpx.Response) -> bool:
 
 
 class RelayProxy:
-    """Forward one incoming request to the upstream, verbatim."""
+    """Forward one incoming request to the upstream, verbatim + observed."""
 
     def __init__(self, config: RelayConfig, client: httpx.AsyncClient) -> None:
         self.config = config
         self._client = client
+        self.observer = (
+            RequestObserver(
+                db_path=config.telemetry_db_path,
+                enabled=config.observation_enabled,
+            )
+            if config.observation_enabled
+            else None
+        )
+
+    def close(self) -> None:
+        """Release the telemetry store (safe when observation is disabled)."""
+        if self.observer is not None:
+            self.observer.close()
 
     async def forward(self, request: Request) -> Response:
         url = build_upstream_url(self.config.upstream, request.url.path, request.url.query)
@@ -95,22 +115,89 @@ class RelayProxy:
         # The client's Host names the relay, not the upstream; httpx rebuilds
         # Host from the upstream URL (standard reverse-proxy rewrite).
         headers.pop("host", None)
+        # Correlation IDs are relay-internal (PRD §29): stripped before the
+        # upstream ever sees them so they can never affect cache identity.
+        strip_correlation_headers(headers)
+        # The request body is buffered once: forwarded verbatim AND hashed
+        # for the fingerprints (observation is read-only over the bytes).
+        body = await request.body()
         upstream_request = self._client.build_request(
-            request.method, url, headers=headers, content=request.stream()
+            request.method, url, headers=headers, content=body
         )
         try:
             upstream = await self._client.send(upstream_request, stream=True)
         except httpx.HTTPError as exc:
             logger.warning("upstream request failed for %s %s: %s", request.method, url, exc)
+            self._observe_failure(request, url, body)
             return Response(b"", status_code=502)
         response_headers = strip_hop_by_hop(upstream.headers)
         # aiter_raw() keeps the body byte-exact (no transparent decompression).
         if should_stream(upstream):
             response_headers.pop("content-length", None)
+            self._observe_streaming(request, url, body, upstream)
             return StreamingResponse(
                 upstream.aiter_raw(),
                 status_code=upstream.status_code,
                 headers=response_headers,
             )
-        body = b"".join([chunk async for chunk in upstream.aiter_raw()])
-        return Response(body, status_code=upstream.status_code, headers=response_headers)
+        response_body = b"".join([chunk async for chunk in upstream.aiter_raw()])
+        self._observe_bounded(request, url, body, response_body, upstream)
+        return Response(response_body, status_code=upstream.status_code, headers=response_headers)
+
+    # -- observation (fail open: never breaks forwarding) -------------------
+
+    def _observe_bounded(
+        self,
+        request: Request,
+        url: str,
+        request_body: bytes,
+        response_body: bytes,
+        upstream: httpx.Response,
+    ) -> None:
+        if self.observer is None:
+            return
+        try:
+            # request_body is the buffered client body (fingerprints);
+            # response_body is the upstream's buffered body (usage parse).
+            self.observer.observe_bounded(
+                request_body=request_body,
+                response_body=response_body,
+                path=request.url.path,
+                upstream_url=url,
+                status_code=upstream.status_code,
+                response_headers=upstream.headers,
+                session_header=request.headers.get("x-cachepilot-session"),
+                auth_headers=request.headers,
+            )
+        except Exception as exc:  # noqa: BLE001 — fail open (AGENTS.md invariant 9)
+            logger.warning("telemetry observation failed (traffic unaffected): %s", exc)
+
+    def _observe_streaming(self, request: Request, url: str, body: bytes, upstream: httpx.Response) -> None:
+        if self.observer is None:
+            return
+        try:
+            self.observer.observe_streaming(
+                body,
+                path=request.url.path,
+                upstream_url=url,
+                status_code=upstream.status_code,
+                response_headers=upstream.headers,
+                session_header=request.headers.get("x-cachepilot-session"),
+                auth_headers=request.headers,
+            )
+        except Exception as exc:  # noqa: BLE001 — fail open (AGENTS.md invariant 9)
+            logger.warning("telemetry observation failed (traffic unaffected): %s", exc)
+
+    def _observe_failure(self, request: Request, url: str, body: bytes) -> None:
+        if self.observer is None:
+            return
+        try:
+            self.observer.observe_failure(
+                body,
+                path=request.url.path,
+                upstream_url=url,
+                session_header=request.headers.get("x-cachepilot-session"),
+                auth_headers=request.headers,
+            )
+        except Exception as exc:  # noqa: BLE001 — fail open (AGENTS.md invariant 9)
+            logger.warning("telemetry observation failed (traffic unaffected): %s", exc)

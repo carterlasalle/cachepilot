@@ -5,6 +5,7 @@ requires-python = ">=3.12"
 [manifest]
 members = [
     "cachepilot",
+    "cachepilot-cli",
     "cachepilot-core",
     "cachepilot-hermes-plugin",
     "cachepilot-relay",
@@ -37,6 +38,7 @@ name = "cachepilot"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "cachepilot-cli" },
     { name = "cachepilot-core" },
     { name = "cachepilot-hermes-plugin" },
     { name = "cachepilot-relay" },
@@ -52,6 +54,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "cachepilot-cli", editable = "packages/cli" },
     { name = "cachepilot-core", editable = "packages/core" },
     { name = "cachepilot-hermes-plugin", editable = "packages/hermes-plugin" },
     { name = "cachepilot-relay", editable = "packages/relay" },
@@ -63,6 +66,23 @@ requires-dist = [
 dev = [
     { name = "pytest", specifier = ">=8.0" },
     { name = "ruff", specifier = ">=0.9" },
+]
+
+[[package]]
+name = "cachepilot-cli"
+version = "0.1.0"
+source = { editable = "packages/cli" }
+dependencies = [
+    { name = "cachepilot-core" },
+    { name = "cachepilot-relay" },
+    { name = "pydantic" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "cachepilot-core", editable = "packages/core" },
+    { name = "cachepilot-relay", editable = "packages/relay" },
+    { name = "pydantic", specifier = ">=2.9" },
 ]
 
 [[package]]
@@ -96,6 +116,7 @@ name = "cachepilot-relay"
 version = "0.1.0"
 source = { editable = "packages/relay" }
 dependencies = [
+    { name = "cachepilot-core" },
     { name = "httpx" },
     { name = "pydantic" },
     { name = "starlette" },
@@ -104,6 +125,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "cachepilot-core", editable = "packages/core" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "pydantic", specifier = ">=2.9" },
     { name = "starlette", specifier = ">=0.37" },

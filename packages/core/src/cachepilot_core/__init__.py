@@ -27,15 +27,33 @@ from cachepilot_core.pricing import (
     estimate_cost,
     estimate_resume_costs,
 )
+from cachepilot_core.storage import (
+    ENV_TELEMETRY_DB,
+    StoredRequestEvent,
+    TelemetryStore,
+    default_db_path,
+    resolve_db_path,
+)
+from cachepilot_core.telemetry import (
+    CacheHealthStats,
+    ChurnEvent,
+    Outcome,
+    TelemetryEvent,
+    classify_outcome,
+    usage_has_cache_telemetry,
+)
 from cachepilot_core.usage import TokenUsage, UsageNormalizer
 
 __version__ = "0.1.0"
 
 __all__ = [
     "CACHE_IDENTITY_FIELDS",
+    "ENV_TELEMETRY_DB",
     "ApiMode",
+    "CacheHealthStats",
     "CacheIdentity",
     "CanonicalRequest",
+    "ChurnEvent",
     "CostResolution",
     "CostResolver",
     "CostSource",
@@ -44,15 +62,23 @@ __all__ = [
     "FakeProvider",
     "FakeProviderConfig",
     "FakeProviderResult",
+    "Outcome",
     "PricingTable",
+    "StoredRequestEvent",
+    "TelemetryEvent",
+    "TelemetryStore",
     "TokenUsage",
     "UsageNormalizer",
     "WarmAction",
     "WarmDecision",
     "cache_fingerprint",
+    "classify_outcome",
+    "default_db_path",
     "estimate_cost",
     "estimate_resume_costs",
     "hash_content",
     "provider_result_to_http_response",
     "request_fingerprint",
+    "resolve_db_path",
+    "usage_has_cache_telemetry",
 ]

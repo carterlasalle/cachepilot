@@ -58,8 +58,13 @@ class DifferentialHarness:
     relay must strip those per its spec).
     """
 
-    def __init__(self, upstream_app) -> None:
+    def __init__(self, upstream_app, *, relay_kwargs: dict | None = None) -> None:
         self._upstream_app = upstream_app
+        # P03 golden tests run the relay in pure pass-through mode: observation
+        # defaults OFF so no telemetry store is opened/written during the
+        # byte-identity comparisons. Phase 4 observation tests opt in with an
+        # explicit tmp telemetry_db_path.
+        self._relay_kwargs = {"observation_enabled": False, **(relay_kwargs or {})}
         self.upstream: RunningServer | None = None
         self.relay: RunningServer | RelayServer | None = None
         self.client: httpx.AsyncClient | None = None
@@ -68,8 +73,11 @@ class DifferentialHarness:
         self.upstream = await start_server(self._upstream_app)
         # The relay runs through the real production class (RelayServer), so
         # the tests exercise its exact uvicorn wiring — including the
-        # transparent date/server header policy.
-        self.relay = RelayServer(RelayConfig(upstream=self.upstream.base_url, listen="127.0.0.1:0"))
+        # transparent date/server header policy. ``relay_kwargs`` lets
+        # Phase 4 observation tests point the telemetry store at a tmp path.
+        self.relay = RelayServer(
+            RelayConfig(upstream=self.upstream.base_url, listen="127.0.0.1:0", **self._relay_kwargs)
+        )
         await self.relay.start()
         self.client = httpx.AsyncClient(timeout=30.0)
         return self

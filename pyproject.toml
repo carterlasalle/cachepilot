@@ -16,6 +16,7 @@ dependencies = [
     "cachepilot-core>=0.1.0",
     "cachepilot-hermes-plugin>=0.1.0",
     "cachepilot-relay>=0.1.0",
+    "cachepilot-cli>=0.1.0",
 ]
 
 [dependency-groups]
@@ -36,10 +37,17 @@ members = [
 cachepilot-core = { workspace = true }
 cachepilot-hermes-plugin = { workspace = true }
 cachepilot-relay = { workspace = true }
+cachepilot-cli = { workspace = true }
 
 [tool.ruff]
 line-length = 100
 target-version = "py312"
 
 [tool.pytest.ini_options]
-testpaths = ["tests", "packages/core/tests", "packages/hermes-plugin/tests", "packages/relay/tests"]
+testpaths = [
+    "tests",
+    "packages/core/tests",
+    "packages/hermes-plugin/tests",
+    "packages/relay/tests",
+    "packages/cli/tests",
+]

@@ -3,7 +3,8 @@
 ``cachepilotd`` listens on ``127.0.0.1:8787`` by default and NEVER binds a
 wildcard address (``0.0.0.0`` / ``::``) unless explicitly allowed — the
 relay is a local process serving Hermes on the same machine (PRD §26, §85).
-No secrets are read here (AGENTS.md rule 10).
+Phase 4 adds the telemetry store location (PRD §81) and the observation
+master switch. No secrets are read here (AGENTS.md rule 10).
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from collections.abc import Mapping
 from typing import Self
 from urllib.parse import urlsplit
 
+from cachepilot_core.storage import default_db_path
 from pydantic import BaseModel, field_validator, model_validator
 
 #: Default listen address (PRD §26).
@@ -22,6 +24,8 @@ DEFAULT_LISTEN = "127.0.0.1:8787"
 ENV_LISTEN = "CACHEPILOT_RELAY_LISTEN"
 ENV_UPSTREAM = "CACHEPILOT_UPSTREAM"
 ENV_ALLOW_EXTERNAL_BIND = "CACHEPILOT_RELAY_ALLOW_EXTERNAL_BIND"
+ENV_TELEMETRY_DB = "CACHEPILOT_TELEMETRY_DB"
+ENV_OBSERVATION_ENABLED = "CACHEPILOT_RELAY_OBSERVATION_ENABLED"
 
 #: Wildcard bind hosts refused without an explicit override (PRD §26).
 WILDCARD_HOSTS = frozenset({"0.0.0.0", "::"})
@@ -59,11 +63,18 @@ class RelayConfig(BaseModel):
         upstream: provider base URL every request is forwarded to (required).
         allow_external_bind: explicit override permitting wildcard binds
             (``0.0.0.0`` / ``::``). Off by default (PRD §26).
+        telemetry_db_path: SQLite telemetry database path (PRD §81); None
+            resolves to ``~/.hermes/cachepilot/cachepilot.db``.
+        observation_enabled: master switch for Phase 4 observation. When
+            False the relay is pure Phase 3 pass-through (no telemetry store
+            is opened, no headers are added or parsed).
     """
 
     listen: str = DEFAULT_LISTEN
     upstream: str
     allow_external_bind: bool = False
+    telemetry_db_path: str | None = None
+    observation_enabled: bool = True
 
     @field_validator("listen")
     @classmethod
@@ -113,6 +124,8 @@ class RelayConfig(BaseModel):
             listen=effective_listen,
             upstream=effective_upstream,
             allow_external_bind=allow_external_bind,
+            telemetry_db_path=env.get(ENV_TELEMETRY_DB) or str(default_db_path()),
+            observation_enabled=_env_flag(env.get(ENV_OBSERVATION_ENABLED, "true")),
         )
 
 
