@@ -13,13 +13,14 @@ every commit to a `gitreins task complete`.
 
 | ID | Task | Pri | Cpx | Deps | Tags | Model | Reasoning | Fallback |
 |----|------|-----|-----|------|------|-------|-----------|----------|
-| P11 | Advanced optimizations (only after measurement) — stable tool ordering, volatile prompt isolation, cross-request prefix topology, survival model P(cache survives \| age) | Low | 5±1 | P08-P10 | ++optimize, ++probabilistic | DS-V4-Flash | Low | Kimi-K3 |
 | P12 | Optional UI dashboard (yarn/React) — live leases, cache topology, cost graph, TTL learning, route changes, miss explanation; NEVER a core dependency | Low | 4±1 | P07-P10 | ++dashboard, ++yarn | DS-V4-Flash | Low | Kimi-K3 |
+| CI-001 | GitHub Actions CI missing — PRD §140 mandates ruff/mypy/pytest/coverage/dependency-audit/race-tests + Hermes current-main & latest-release compatibility matrix; repo has zero workflows (`gh run list` empty, no `.github/`) | High | 2±1 | — | ++ci, ++terminal | DS-V4-Flash | Low | Kimi-K3 |
 
 ## Completed
 
 | ID | Task | Pri | Cpx | Commit | Model |
 |----|------|-----|-----|--------|-------|
+| P11 | Advanced optimizations (only after measurement) — empirical survival model P(cache survives \| age) from clean ttl_observations (PRD §99, KM estimator, honest horizon), cross-request prefix topology measurement view (per-layer stability/change frequency/est. prefix-token loss + per-route tool-schema ordering stability via tools_set_hash, `cachepilot topology`), volatile prompt isolation (system-suffix churn classified as volatile-value cause, DETECT-only), tool ordering measured NOT reordered; storage migration + relay observation feed; docs/advanced-optimizations.md (judge PASS 24f3f6cb) | Low | 5±1 | 2df919d | DS-V4-Flash |
 | DOCS-000 | Documentation gate — Launchpad-style README (badges/nav/diagram/tables, no stale claims), CONTRIBUTING.md, SECURITY.md, LICENSE (Apache-2.0), docs/cache-economics.md + threat-model.md + hermes-integration.md runbooks, AGENTS.md Key Files touch-up (judge PASS 88cab1cf) | High | 3±1 | 6f624ee | DS-V4-Flash |
 | P10 | Churn intelligence — layered prefix hashing (§24), system/tools/cache-key/route/history-boundary diff classification (§25, DETECT-only), likely cause + confidence, `cachepilot churn` + `explain-miss` CLIs, CACHEPILOT_CHURN_DETECTION_ENABLED flag (§164), churn_events schema migration (judge PASS 9241ec69) | Medium | 3±1 | 2bc4986 | DS-V4-Flash |
 | P00 | Research harness — fake provider (KV cache/TTL/usage/pricing simulator), canonical request repr, usage normalization, cache fingerprint, economic calculator; all offline-testable | Critical | 5±1 | 4d8017c | DS-V4-Flash |
