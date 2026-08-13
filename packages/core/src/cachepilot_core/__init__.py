@@ -6,6 +6,14 @@ cost resolution (§60/§65), the economic controller (§60-65), and the
 deterministic fake provider cache simulator (§109).
 """
 
+from cachepilot_core.adapters import (
+    CacheCapabilities,
+    CacheProviderAdapter,
+    OpenAICompatibleAdapter,
+    TTLHint,
+    WarmExecutor,
+    WarmResult,
+)
 from cachepilot_core.economics import EconomicConfig, EconomicController, WarmAction, WarmDecision
 from cachepilot_core.fake_provider import (
     FakeProvider,
@@ -27,6 +35,7 @@ from cachepilot_core.pricing import (
     estimate_cost,
     estimate_resume_costs,
 )
+from cachepilot_core.snapshots import RequestSnapshot, SnapshotStore
 from cachepilot_core.storage import (
     ENV_TELEMETRY_DB,
     StoredRequestEvent,
@@ -50,8 +59,10 @@ __all__ = [
     "CACHE_IDENTITY_FIELDS",
     "ENV_TELEMETRY_DB",
     "ApiMode",
+    "CacheCapabilities",
     "CacheHealthStats",
     "CacheIdentity",
+    "CacheProviderAdapter",
     "CanonicalRequest",
     "ChurnEvent",
     "CostResolution",
@@ -62,15 +73,21 @@ __all__ = [
     "FakeProvider",
     "FakeProviderConfig",
     "FakeProviderResult",
+    "OpenAICompatibleAdapter",
     "Outcome",
     "PricingTable",
+    "RequestSnapshot",
+    "SnapshotStore",
     "StoredRequestEvent",
+    "TTLHint",
     "TelemetryEvent",
     "TelemetryStore",
     "TokenUsage",
     "UsageNormalizer",
     "WarmAction",
     "WarmDecision",
+    "WarmExecutor",
+    "WarmResult",
     "cache_fingerprint",
     "classify_outcome",
     "default_db_path",

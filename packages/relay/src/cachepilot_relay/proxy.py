@@ -26,6 +26,8 @@ import logging
 from collections.abc import Mapping
 
 import httpx
+from cachepilot_core.adapters import OpenAICompatibleAdapter
+from cachepilot_core.snapshots import SnapshotStore
 from cachepilot_core.telemetry import Outcome
 from starlette.requests import Request
 from starlette.responses import Response, StreamingResponse
@@ -33,6 +35,7 @@ from starlette.responses import Response, StreamingResponse
 from cachepilot_relay.config import RelayConfig
 from cachepilot_relay.lease_controller import LeaseController, LeaseRequestContext
 from cachepilot_relay.observation import RequestObserver, strip_correlation_headers
+from cachepilot_relay.warm_executor import HttpWarmExecutor
 
 logger = logging.getLogger("cachepilot_relay.proxy")
 
@@ -105,15 +108,21 @@ class RelayProxy:
             if config.observation_enabled
             else None
         )
-        # Phase 5: the lease controller shares the observer's telemetry store
-        # and turns the observed request + X-CachePilot-Targets header into
-        # lease lifecycle events (PRD §132, §148). Fail-open: a controller
-        # problem never breaks forwarding (AGENTS.md invariant 9).
+        # Phase 5/6: the lease controller shares the observer's telemetry
+        # store and turns the observed request + X-CachePilot-Targets header
+        # into lease lifecycle events (PRD §132, §148). Phase 6 adds the
+        # memory-only snapshot store (PRD §30) and the HTTP warm executor
+        # (transport + OpenAI-compatible adapter, PRD §147) — warm requests
+        # are sent DIRECTLY to the upstream and never re-enter this proxy's
+        # forwarding/observation path. Fail-open: a controller problem never
+        # breaks forwarding (AGENTS.md invariant 9).
         self.lease_controller = (
             LeaseController(
                 settings=config.lease_settings,
                 store=self.observer.store if self.observer is not None else None,
                 enabled=config.observation_enabled,
+                snapshot_store=SnapshotStore(),
+                warm_executor=HttpWarmExecutor(self._client, OpenAICompatibleAdapter()),
             )
             if config.observation_enabled
             else None

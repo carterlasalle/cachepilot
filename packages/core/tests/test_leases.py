@@ -9,7 +9,9 @@ lock to interleave a competing event with a warm that is about to fire.
 from __future__ import annotations
 
 import asyncio
+from decimal import Decimal
 
+from cachepilot_core.adapters import WarmResult
 from cachepilot_core.leases import (
     CacheLease,
     LeaseDecision,
@@ -17,7 +19,9 @@ from cachepilot_core.leases import (
     LeaseSettings,
     LeaseState,
 )
+from cachepilot_core.snapshots import RequestSnapshot, SnapshotStore
 from cachepilot_core.telemetry import Outcome
+from cachepilot_core.usage import TokenUsage
 
 
 class FakeClock:
@@ -533,3 +537,118 @@ def test_lease_settings_defaults():
     deadline = manager.next_deadline(lease)
     assert deadline is not None
     assert 240.0 * 0.97 <= deadline <= 240.0 * 1.03
+
+
+# -- real-warm path races (Phase 6, PRD §51) ---------------------------------
+
+
+class _RecordingExecutor:
+    """Stub warm executor that records snapshots (never really sends)."""
+
+    def __init__(self) -> None:
+        self.calls: list[RequestSnapshot] = []
+
+    async def execute(self, snapshot: RequestSnapshot) -> WarmResult:
+        self.calls.append(snapshot)
+        return WarmResult(
+            outcome=Outcome.CONFIRMED_HIT,
+            usage=TokenUsage(prompt_tokens=4000, cache_read_tokens=4000),
+            cost_usd=Decimal("0.001"),
+        )
+
+
+def _real_warm_manager(clock: FakeClock, executor: _RecordingExecutor) -> LeaseManager:
+    return LeaseManager(
+        LeaseSettings(jitter_fraction=0.0, dry_run=False),
+        time_fn=clock,
+        latency_p95_s=4.0,
+        snapshot_store=SnapshotStore(),
+        warm_executor=executor,
+    )
+
+
+def _store_snapshot(manager: LeaseManager, lease: CacheLease) -> None:
+    assert manager.snapshot_store is not None
+    manager.snapshot_store.store(
+        RequestSnapshot(
+            cache_fingerprint=lease.cache_fingerprint,
+            body={
+                "model": lease.model,
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 512,
+            },
+            upstream_url="https://fake-provider.invalid/v1/chat/completions",
+            stored_at=0.0,
+        )
+    )
+
+
+def test_real_warm_path_race_real_request_skips_busy():
+    clock = FakeClock()
+    executor = _RecordingExecutor()
+    manager = _real_warm_manager(clock, executor)
+    lease = _armed_touched_lease(manager, clock)
+    _store_snapshot(manager, lease)
+    clock.advance(1000)  # far past the deadline → the warm would fire
+
+    async def scenario():
+        lock = manager.lock_for(lease.cache_fingerprint)
+        await lock.acquire()
+        task = asyncio.create_task(manager.evaluate_lease(lease.lease_id))
+        await asyncio.sleep(0)  # let the warm reach the lock wait
+        manager.before_normal_request(lease.lease_id)  # real request wins
+        lock.release()
+        return await task
+
+    decision = asyncio.run(scenario())
+    assert decision is LeaseDecision.SKIPPED_BUSY
+    assert executor.calls == []  # the real warm never fired
+    assert lease.last_cache_touch_at == 1_000_000.0
+
+
+def test_real_warm_path_race_completed_request_skips_stale():
+    clock = FakeClock()
+    executor = _RecordingExecutor()
+    manager = _real_warm_manager(clock, executor)
+    lease = _armed_touched_lease(manager, clock)
+    _store_snapshot(manager, lease)
+    clock.advance(1000)
+
+    async def scenario():
+        lock = manager.lock_for(lease.cache_fingerprint)
+        await lock.acquire()
+        task = asyncio.create_task(manager.evaluate_lease(lease.lease_id))
+        await asyncio.sleep(0)
+        # A real request runs and COMPLETES while the warm waits: generation
+        # bumped, no request in flight anymore → SKIPPED_STALE (§51).
+        manager.before_normal_request(lease.lease_id)
+        manager.after_normal_request(lease.lease_id, Outcome.CONFIRMED_HIT)
+        lock.release()
+        return await task
+
+    decision = asyncio.run(scenario())
+    assert decision is LeaseDecision.SKIPPED_STALE
+    assert executor.calls == []
+
+
+def test_real_warm_path_race_targets_finished_skips_no_targets():
+    clock = FakeClock()
+    executor = _RecordingExecutor()
+    manager = _real_warm_manager(clock, executor)
+    lease = _armed_touched_lease(manager, clock)
+    _store_snapshot(manager, lease)
+    clock.advance(1000)
+
+    async def scenario():
+        lock = manager.lock_for(lease.cache_fingerprint)
+        await lock.acquire()
+        task = asyncio.create_task(manager.evaluate_lease(lease.lease_id))
+        await asyncio.sleep(0)
+        manager.target_finished(lease.lease_id, "t1")  # last target finishes
+        lock.release()
+        return await task
+
+    decision = asyncio.run(scenario())
+    assert decision is LeaseDecision.SKIPPED_NO_TARGETS
+    assert lease.state is LeaseState.INACTIVE
+    assert executor.calls == []

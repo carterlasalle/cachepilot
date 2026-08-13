@@ -1,4 +1,4 @@
-"""Relay-hosted lease controller — PRD §132 Phase 5.
+"""Relay-hosted lease controller — PRD §132 Phase 5, §133 Phase 6.
 
 Wires the relay observer + the plugin's ``X-CachePilot-Targets`` header into
 a pure :class:`~cachepilot_core.leases.LeaseManager`:
@@ -6,28 +6,40 @@ a pure :class:`~cachepilot_core.leases.LeaseManager`:
 - before every forwarded request, :meth:`LeaseController.on_request_start`
   finds-or-creates the lease for the physical cache identity, reconciles the
   active background-target COUNT from the plugin header (PRD §46 — the relay
-  sees counts, the plugin owns the target registry), then runs PRD §148
-  ``before_normal_request`` (generation bump + warm cancel);
+  sees counts, the plugin owns the target registry), runs PRD §148
+  ``before_normal_request`` (generation bump + warm cancel), and stores the
+  memory-only request snapshot for the lease (PRD §30) so a due warm can
+  replay it;
 - after the response, :meth:`LeaseController.on_request_end` runs PRD §148
   ``after_normal_request`` with the observer-classified outcome — a FAILED
-  call never refreshes the cache (invariant 3);
+  call never refreshes the cache (invariant 3) and drops the snapshot (a
+  failed request is never cache-producing);
 - a background asyncio task ticks the manager every ``scheduler_interval_s``
-  and, in Phase 5 dry-run mode, emits ``WOULD WARM IN Ns`` / ``WOULD WARM
-  NOW`` log lines (PRD §132). No warm network request is ever sent.
+  (PRD §146). With ``dry_run`` (the default) the scheduler emits ``WOULD
+  WARM NOW`` lines; with warming enabled the warm executes through the
+  injected :class:`~cachepilot_core.adapters.WarmExecutor` (transport +
+  adapter, PRD §147) — warm requests never re-enter the observation or
+  forwarding path (no recursive lease tracking, no re-observation).
 
 Everything is fail-open (AGENTS.md invariant 9): a lease-tracking error never
-breaks forwarding, and persistence failures only log a warning.
+breaks forwarding, persistence failures only log a warning, and snapshots
+are memory-only (they die with the relay — leases become non-warmable, PRD
+§30).
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from cachepilot_core.adapters import WarmExecutor
 from cachepilot_core.fingerprint import cache_fingerprint, request_fingerprint
 from cachepilot_core.leases import CacheLease, LeaseDecision, LeaseManager, LeaseSettings
+from cachepilot_core.snapshots import RequestSnapshot, SnapshotStore
 from cachepilot_core.storage import TelemetryStore
 from cachepilot_core.telemetry import Outcome
 
@@ -38,6 +50,18 @@ from cachepilot_relay.observation import (
 )
 
 logger = logging.getLogger("cachepilot_relay.lease_controller")
+
+#: Decisions that change durable lease fields and therefore need the stored
+#: snapshot refreshed (PRD §78 ``cachepilot leases``).
+_PERSIST_ON = frozenset(
+    {
+        LeaseDecision.SCHEDULED,
+        LeaseDecision.WARMED_CONFIRMED_HIT,
+        LeaseDecision.WARMED_MISS_REBUILT,
+        LeaseDecision.WARMED_UNVERIFIED,
+        LeaseDecision.WARMED_FAILED,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -60,11 +84,19 @@ class LeaseController:
         store: TelemetryStore | None = None,
         latency_p95_s: float = 4.0,
         enabled: bool = True,
+        snapshot_store: SnapshotStore | None = None,
+        warm_executor: WarmExecutor | None = None,
     ) -> None:
         self.settings = settings or LeaseSettings()
+        #: Memory-only request snapshots (PRD §30). A controller constructed
+        #: without one never stores snapshots and its leases stay
+        #: non-warmable (fail closed for warming, invariant 9).
+        self.snapshot_store = snapshot_store
         self.manager = manager or LeaseManager(
             settings=self.settings,
             latency_p95_s=latency_p95_s,
+            snapshot_store=snapshot_store,
+            warm_executor=warm_executor,
         )
         self.store = store
         self.enabled = enabled
@@ -115,9 +147,13 @@ class LeaseController:
                 history_prefix_fingerprint=canonical.prompt_key,
             )
             self._prune_target_ids()
+            self._prune_snapshots()
             targets_count = parse_targets_count(targets_header)
             self._sync_targets(lease, targets_count)
             self.manager.before_normal_request(lease.lease_id)
+            # PRD §30: remember the last cache-producing request body IN
+            # MEMORY ONLY (never persisted) so a due warm can replay it.
+            self._store_snapshot(lease, body, upstream_url, request_headers)
             self._persist(lease)
             return LeaseRequestContext(lease_id=lease.lease_id, targets_count=targets_count)
         except Exception:
@@ -127,7 +163,10 @@ class LeaseController:
     def on_request_end(self, ctx: LeaseRequestContext, outcome: Outcome) -> None:
         """After the response: PRD §148 normal-request-reset with the outcome.
 
-        A failed provider call never refreshes the cache (invariant 3).
+        A failed provider call never refreshes the cache (invariant 3) and
+        never counts as cache-producing: its snapshot is dropped, so the
+        lease stays non-warmable until the next successful request (PRD §30
+        fail-closed semantics — no unsafe reconstruction from a failed body).
         """
         if not self.enabled:
             return
@@ -136,6 +175,8 @@ class LeaseController:
             lease = self.manager.get(ctx.lease_id)
             if lease is not None:
                 self._persist(lease)
+                if outcome is Outcome.FAILED and self.snapshot_store is not None:
+                    self.snapshot_store.drop(lease.cache_fingerprint)
         except Exception:
             logger.warning("lease request completion failed (traffic unaffected)", exc_info=True)
 
@@ -170,9 +211,10 @@ class LeaseController:
         """
         results = await self.manager.tick()
         for lease_id, decision in results:
-            if decision is LeaseDecision.SCHEDULED:
-                # State moved to WARM_SCHEDULED — keep the stored snapshot
-                # fresh for `cachepilot leases` (PRD §78).
+            if decision in _PERSIST_ON:
+                # WARM_SCHEDULED / warm outcomes changed durable lease
+                # fields (deadline, warm_count, warm_cost_usd) — keep the
+                # stored snapshot fresh for `cachepilot leases` (PRD §78).
                 lease = self.manager.get(lease_id)
                 if lease is not None:
                     self._persist(lease)
@@ -214,6 +256,53 @@ class LeaseController:
             for lease_id, targets in self._target_ids.items()
             if lease_id in self.manager.lease_ids
         }
+
+    def _store_snapshot(
+        self,
+        lease: CacheLease,
+        body: bytes,
+        upstream_url: str,
+        request_headers: Mapping[str, str] | None,
+    ) -> None:
+        """Remember the request body for a due warm — IN MEMORY ONLY (PRD §30).
+
+        The raw body (prompts, history, tool arguments) and the
+        Authorization header live only in this memory store: they are never
+        persisted, never logged. A body that is not valid JSON is skipped
+        (uncertain warm = skip, invariant 9). Fail-open: a snapshot error
+        never breaks forwarding.
+        """
+        if self.snapshot_store is None:
+            return
+        try:
+            parsed = json.loads(body)
+        except (TypeError, ValueError):
+            logger.debug(
+                "request body not JSON — no warm snapshot (lease=%s)", lease.lease_id
+            )
+            return
+        if not isinstance(parsed, dict):
+            return
+        self.snapshot_store.store(
+            RequestSnapshot(
+                cache_fingerprint=lease.cache_fingerprint,
+                body=parsed,
+                upstream_url=upstream_url,
+                authorization=(request_headers or {}).get("authorization"),
+                stored_at=time.time(),
+            )
+        )
+
+    def _prune_snapshots(self) -> None:
+        """Forget snapshots for cache identities the manager no longer tracks
+        (e.g. invalidated on a model switch) — memory hygiene, never leaks
+        content."""
+        if self.snapshot_store is None:
+            return
+        tracked = self.manager.cache_fingerprints
+        for fingerprint in list(self.snapshot_store.fingerprints):
+            if fingerprint not in tracked:
+                self.snapshot_store.drop(fingerprint)
 
     def _persist(self, lease: CacheLease) -> None:
         """Snapshot the lease to the telemetry store; never breaks traffic."""

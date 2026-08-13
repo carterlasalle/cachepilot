@@ -1,17 +1,25 @@
-"""Phase 5 lease-manager integration — PRD §132 through the real relay.
+"""Phase 5/6 lease-manager integration — PRD §132-133 through the real relay.
 
 The production ``RelayServer`` runs against an offline fake-provider upstream
 (the ``DifferentialHarness`` pattern) with a tmp telemetry store. A request
 carrying the plugin's correlation headers — including the active
 background-target COUNT (``X-CachePilot-Targets``) — arms a cache lease, and
-the background scheduler task emits dry-run output.
+the background scheduler task drives it.
 
-Assertions (Phase 5 gate):
+Phase 5 assertions (dry-run gate):
 1. the scheduler logs ``WOULD WARM`` (dry-run, PRD §132) for the armed lease;
 2. NO warm request ever leaves the relay — the upstream sees EXACTLY the
    normal requests the test sent (dry-run NEVER sends a network request);
 3. a lease row was persisted with the observed state/targets/generation;
 4. correlation headers never reach the upstream (PRD §29).
+
+Phase 6 assertions (real-warm gate, PRD §133, §147):
+5. with ``dry_run=False`` the scheduler sends ONE bounded warm
+   (``max_tokens=1``) to the upstream and records it in
+   ``warm_count`` / ``warm_cost_usd``;
+6. the warm never re-enters observation: no extra telemetry event, no
+   generation bump, no recursive lease tracking;
+7. the warm re-authenticates with the snapshot's Authorization header.
 """
 
 from __future__ import annotations
@@ -21,8 +29,12 @@ import logging
 
 from cachepilot_core.leases import LeaseSettings
 from cachepilot_core.storage import TelemetryStore
+from cachepilot_relay.config import RelayConfig
 from helpers import DifferentialHarness
-from test_observation import _COMPLETION_REQUEST, ObservationUpstream
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import Response, StreamingResponse
+from test_observation import _COMPLETION_REQUEST, ObservationUpstream, _sse_body
 
 
 def test_lease_scheduler_dry_run_warms_nothing_upstream(tmp_path, caplog):
@@ -153,3 +165,113 @@ async def _scenario_multiple_requests(tmp_path) -> None:
         assert rows[0].state == "inactive"
     finally:
         store.close()
+
+
+# -- Phase 6: real warm replay (PRD §133, §147) ------------------------------
+
+
+class BodyRecordingUpstream(ObservationUpstream):
+    """ObservationUpstream that also records every request body.
+
+    Lets the integration test prove the warm that left the relay was
+    bounded (``max_tokens=1``) and cache-equivalent otherwise.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.seen_bodies: list[dict] = []
+
+    def app(self) -> Starlette:
+        app = Starlette()
+
+        async def chat_completions(request: Request) -> Response:
+            self.seen_headers.append({key.lower(): value for key, value in request.headers.items()})
+            body = await request.json()
+            self.seen_bodies.append(body)
+            if body.get("stream"):
+                return StreamingResponse(_sse_body(), media_type="text/event-stream")
+            return self._completion_for(body)
+
+        app.add_route("/v1/chat/completions", chat_completions, methods=["POST"])
+        return app
+
+
+def test_lease_real_warm_fires_only_when_dry_run_disabled(tmp_path):
+    asyncio.run(_scenario_real_warm(tmp_path))
+
+
+async def _scenario_real_warm(tmp_path) -> None:
+    upstream = BodyRecordingUpstream()
+    # TTL 12s with a 10s network margin → safe deadline = touch + 2s (PRD
+    # §53: min(12*0.8, 12-10)); the warm fires exactly once at +2s and the
+    # refreshed deadline then sits in the future again.
+    settings = LeaseSettings(
+        dry_run=False,
+        default_ttl_s=12.0,
+        minimum_margin_s=10.0,
+        scheduler_interval_s=0.05,
+        jitter_fraction=0.0,
+    )
+    kwargs = {
+        "telemetry_db_path": str(tmp_path / "telemetry.db"),
+        "observation_enabled": True,
+        "lease_settings": settings,
+    }
+    async with DifferentialHarness(upstream.app(), relay_kwargs=kwargs) as harness:
+        assert harness.relay is not None
+        resp = await harness.send(
+            harness.relay.base_url,
+            "POST",
+            "/v1/chat/completions",
+            # An output-bound field makes the warm fire: the adapter bounds
+            # it to max_tokens=1 instead of skipping (fail closed otherwise).
+            json={**_COMPLETION_REQUEST, "max_tokens": 256},
+            headers={
+                "X-CachePilot-Session": "sess-warm-1",
+                "X-CachePilot-Request": "req-1",
+                "X-CachePilot-Turn": "turn-1",
+                "X-CachePilot-Targets": "1",
+                "Authorization": "Bearer dev-token",
+            },
+        )
+        assert resp.status_code == 200
+        # Let the scheduler run past the +2s deadline so the warm fires once.
+        await asyncio.sleep(3.0)
+
+    # The upstream saw the normal request AND exactly ONE bounded warm.
+    assert len(upstream.seen_bodies) == 2
+    normal, warm = upstream.seen_bodies
+    assert warm["max_tokens"] == 1  # bounded replay
+    assert warm["messages"] == normal["messages"]  # cache-equivalent body
+
+    # The warm re-authenticated with the snapshot's Authorization header.
+    assert upstream.seen_headers[1]["authorization"] == "Bearer dev-token"
+
+    store = TelemetryStore(tmp_path / "telemetry.db")
+    try:
+        rows = store.list_leases()
+        assert len(rows) == 1
+        row = rows[0]
+        # The warm's usage is visible (invariant 4), never hidden.
+        assert row.warm_count == 1
+        assert row.warm_cost_usd >= 0
+        # The warm never re-entered observation: exactly ONE request event
+        # (the normal one) and no generation bump (no recursive tracking).
+        events = store.recent_events(limit=10)
+        assert len(events) == 1
+        assert row.generation == 1
+    finally:
+        store.close()
+
+
+def test_relay_config_env_wires_lease_dry_run(monkeypatch):
+    # Warming is opt-in via CACHEPILOT_LEASE_DRY_RUN=false (PRD §133);
+    # the default stays dry-run (fail closed for warming, invariant 9).
+    monkeypatch.setenv("CACHEPILOT_UPSTREAM", "https://api.openai.com/v1")
+    monkeypatch.setenv("CACHEPILOT_LEASE_DRY_RUN", "false")
+    config = RelayConfig.from_env()
+    assert config.lease_settings.dry_run is False
+
+    monkeypatch.delenv("CACHEPILOT_LEASE_DRY_RUN")
+    default_config = RelayConfig.from_env()
+    assert default_config.lease_settings.dry_run is True
