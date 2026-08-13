@@ -13,14 +13,14 @@ every commit to a `gitreins task complete`.
 
 | ID | Task | Pri | Cpx | Deps | Tags | Model | Reasoning | Fallback |
 |----|------|-----|-----|------|------|-------|-----------|----------|
-| P10 | Churn intelligence — system/tools/cache-key/route/history-boundary diff classification, `cachepilot explain-miss`; DETECT only in P0, no auto-rewrite | Medium | 3±1 | P04 | ++churn, ++diagnostics | DS-V4-Flash | Medium | Kimi-K3 |
-| P11 | Advanced optimizations (only after measurement) — stable tool ordering, volatile prompt isolation, cross-request prefix topology, survival model P(cache survives | age) | Low | 5±1 | P08-P10 | ++optimize, ++probabilistic | DS-V4-Flash | Low | Kimi-K3 |
+| P11 | Advanced optimizations (only after measurement) — stable tool ordering, volatile prompt isolation, cross-request prefix topology, survival model P(cache survives \| age) | Low | 5±1 | P08-P10 | ++optimize, ++probabilistic | DS-V4-Flash | Low | Kimi-K3 |
 | P12 | Optional UI dashboard (yarn/React) — live leases, cache topology, cost graph, TTL learning, route changes, miss explanation; NEVER a core dependency | Low | 4±1 | P07-P10 | ++dashboard, ++yarn | DS-V4-Flash | Low | Kimi-K3 |
 
 ## Completed
 
 | ID | Task | Pri | Cpx | Commit | Model |
 |----|------|-----|-----|--------|-------|
+| P10 | Churn intelligence — layered prefix hashing (§24), system/tools/cache-key/route/history-boundary diff classification (§25, DETECT-only), likely cause + confidence, `cachepilot churn` + `explain-miss` CLIs, CACHEPILOT_CHURN_DETECTION_ENABLED flag (§164), churn_events schema migration (judge PASS 9241ec69) | Medium | 3±1 | 2bc4986 | DS-V4-Flash |
 | P00 | Research harness — fake provider (KV cache/TTL/usage/pricing simulator), canonical request repr, usage normalization, cache fingerprint, economic calculator; all offline-testable | Critical | 5±1 | 4d8017c | DS-V4-Flash |
 | P01 | Hermes plugin skeleton — manifest, middleware registration, lifecycle hooks, structured debug logs; CI test asserts stock Hermes unchanged (judge PASS ddfc8a00) | Critical | 3±1 | f423a54 (+2795b4b) | DS-V4-Flash |
 | P02 | Long-task runtime — terminal long-task classifier (deterministic), auto-background promotion, completion notifications, subagent target tracking (refcount), command duration history; NO warming; benchmark polling reduction vs stock (judge PASS c85a2dad) | Critical | 5±1 | 4ff3a49 | DS-V4-Flash |
