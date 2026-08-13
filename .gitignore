@@ -18,6 +18,12 @@ htmlcov/
 .idea/
 .vscode/
 
+# Dashboard (optional UI, PRD §122/§139)
+node_modules/
+dashboard/dist/
+dashboard/backend/__pycache__/
+dashboard/.yarn/
+
 # Env / secrets
 .env
 .env.*

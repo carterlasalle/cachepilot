@@ -5,11 +5,11 @@
 ![Python 3.12](https://img.shields.io/badge/python-3.12-blue)
 ![uv workspace](https://img.shields.io/badge/uv-workspace-8a2be2)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
-![Phases P00-P10](https://img.shields.io/badge/phases-P00--P10%20complete-2ea44f)
+![Phases P00-P12](https://img.shields.io/badge/phases-P00--P12%20complete-2ea44f)
 
 The cheapest LLM call is the one Hermes never needs to make. The second-cheapest is a request whose expensive prefix is already cached. CachePilot sits between Hermes and the provider so neither does expensive work unnecessarily — without forking or monkey-patching Hermes.
 
-**Docs:** [PRD (169-section spec)](docs/PRD.md) · [Architecture](docs/architecture.md) · [Provider adapters](docs/provider-adapters.md) · [Cache economics](docs/cache-economics.md) · [Threat model](docs/threat-model.md) · [Hermes integration](docs/hermes-integration.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
+**Docs:** [PRD (169-section spec)](docs/PRD.md) · [Architecture](docs/architecture.md) · [Provider adapters](docs/provider-adapters.md) · [Cache economics](docs/cache-economics.md) · [Threat model](docs/threat-model.md) · [Hermes integration](docs/hermes-integration.md) · [Dashboard runbook](docs/dashboard.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 
 ---
 
@@ -22,7 +22,8 @@ The cheapest LLM call is the one Hermes never needs to make. The second-cheapest
 | **Economic controller** | Warms a cache ONLY when `expected_avoidable_loss × resume_probability > next_warm_cost + margin` and the next warm fits the remaining budget. Stops warming (`ECONOMIC_STOP`) when irrational. Never a blind "warm while alive" watchdog. |
 | **Cache intelligence** | Fingerprints requests at two levels (full request vs cache identity), learns real provider TTLs from evidence per route, detects cache churn (timestamps, router moves, tool-schema drift) with layered diagnosis, and explains misses. |
 | **Provider-aware replay** | `cachepilotd` localhost relay (127.0.0.1:8787) observes the exact wire request, reproduces cache-equivalent warms with output bounding (`max_tokens=1`), and verifies hits via telemetry — never trusts HTTP 200. |
-| **Observability CLI** | `cachepilot status / leases / costs / ttl / routes / churn / explain-miss` reads a SQLite telemetry store. Honest by construction: empty databases say so, "money saved" is never claimed with incomplete cost data. |
+| **Observability CLI** | `cachepilot status / leases / costs / ttl / routes / churn / explain-miss / topology` reads a SQLite telemetry store. Honest by construction: empty databases say so, "money saved" is never claimed with incomplete cost data. |
+| **Optional UI dashboard** | `dashboard/` — a yarn-managed React/TypeScript dashboard (live leases, cache topology, cost graph, TTL learning, route changes, miss explanation) over a read-only JSON backend. Never a core dependency; absent = no effect on the product. |
 
 ## Architecture
 
@@ -84,6 +85,27 @@ uv run cachepilotd --upstream https://api.openai.com/v1   # or CACHEPILOT_UPSTRE
 | `cachepilot routes` | Observed route identities (gateway/upstream/endpoint/region/deployment) + instability stats |
 | `cachepilot churn` | Per-layer change frequency + most common miss causes over churn events |
 | `cachepilot explain-miss` | Explains the latest (or `--session`-scoped) miss: changed layers, likely cause, confidence, estimated prefix loss |
+| `cachepilot topology` | Cross-request prefix topology: per-layer stability, attribution gaps, tool-ordering stability |
+
+## Dashboard
+
+An optional read-only UI (PRD §122/§139) lives in [`dashboard/`](dashboard/):
+React + TypeScript, yarn-managed, with views for live leases, cache topology,
+cost graph, TTL learning (incl. survival curves), route changes, churn and
+miss explanation. A small read-only backend (`dashboard/backend/server.py`,
+stdlib + `cachepilot_core`) serves the telemetry store as JSON — the same
+query surface as the CLI, opened `mode=ro`, never modifying the DB and never
+fabricating data (an empty DB renders empty states).
+
+```bash
+uv run python dashboard/backend/server.py   # backend on 127.0.0.1:8788
+cd dashboard && yarn install && yarn dev    # frontend on http://127.0.0.1:5173
+```
+
+The dashboard is never a core dependency: it is not in the uv workspace, no
+core package imports it, and deleting `dashboard/` changes nothing. See the
+[Dashboard runbook](docs/dashboard.md) for the full API + view/empty-state
+walkthrough.
 
 ## Configuration
 
@@ -133,8 +155,8 @@ Spec: [docs/PRD.md](docs/PRD.md) (§127-139). One PR per phase, each judged by t
 | P08 TTL learning | ✅ complete |
 | P09 Route intelligence | ✅ complete |
 | P10 Churn intelligence | ✅ complete |
-| P11 Advanced optimizations (only after measurement) | ⏳ planned |
-| P12 Optional UI dashboard (never a core dependency) | ⏳ planned |
+| P11 Advanced optimizations (only after measurement) | ✅ complete |
+| P12 Optional UI dashboard (never a core dependency) | ✅ complete |
 
 ## License
 
