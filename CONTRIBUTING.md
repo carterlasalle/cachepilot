@@ -93,9 +93,13 @@ install root (`site-packages`), and run `pytest packages/hermes-plugin/tests
   sanctioned dev path)
 
 Each cell also asserts the plugin entry-point group is still
-`hermes_agent.plugins` (drift guard). A weekly scheduled run (Mon 03:00 UTC,
+`hermes_agent.plugins` (drift guard). The weekly scheduled run (Mon 03:00 UTC,
 `0 3 * * 1`) repeats the `current-main` cell to catch Hermes API drift
-between releases; the workflow is also `workflow_dispatch`-able.
+between releases; the workflow is also `workflow_dispatch`-able. `current-main`
+runs on PRs / the cron / manual dispatch but not on push: an upstream
+hermes-main breakage must never block the push fast-gate (ci.yml +
+`latest-release` stay green), while the scheduled job still surfaces drift
+weekly.
 
 Hermes goes into a dedicated venv, not the project `.venv`: the stock-unchanged
 test snapshots the install tree, and its ignore list skips any path containing

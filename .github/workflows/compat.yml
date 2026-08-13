@@ -53,6 +53,12 @@ jobs:
 
   current-main:
     name: Hermes current-main
+    # PRD §140 drift detector: runs on PRs, the weekly cron, and manual
+    # dispatch — NOT on push. An upstream hermes-main breakage (as of
+    # 2026-08-13: hermes_cli.plugins imports registration_lifecycle, missing
+    # from hermes main's own pyproject py-modules) must never block the push
+    # fast-gate; the scheduled run surfaces it weekly.
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
