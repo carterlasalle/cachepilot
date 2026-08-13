@@ -367,3 +367,171 @@ def test_routes_lists_observed_identities_and_instability_stats(tmp_path, capsys
     assert "instability verdicts  1" in out
     assert "short-TTL verdicts    0" in out
     assert "route-aaaa" in out and "route-bbbb" in out  # short route hashes
+
+
+# -- churn (P10, PRD §25/§76) -------------------------------------------------
+
+
+def _seed_churn_events(store: TelemetryStore) -> None:
+    """10 churn events: 8 history, 1 route, 1 system (one without a cause)."""
+    cause = "history-boundary churn (recent conversation tail moved)"
+    for index in range(10):
+        overrides = {
+            "timestamp": datetime(2026, 8, 13, 12, index, 0, tzinfo=UTC),
+            "session_hash": "s1",
+            "previous_cache_fingerprint": f"fp-prev-{index}",
+            "new_cache_fingerprint": f"fp-new-{index}",
+        }
+        if index == 8:
+            store.record_churn(ChurnEvent(route_changed=True, likely_cause="router affinity loss", **overrides))
+        elif index == 9:
+            store.record_churn(ChurnEvent(system_changed=True, **overrides))
+        else:
+            store.record_churn(
+                ChurnEvent(
+                    history_changed=True,
+                    likely_cause=cause,
+                    confidence=0.70,
+                    estimated_prefix_loss_tokens=1200,
+                    first_divergent_offset=9,
+                    first_divergent_layer="recent conversation tail",
+                    **overrides,
+                )
+            )
+
+
+def test_churn_empty_db_says_no_events(tmp_path, capsys):
+    TelemetryStore(tmp_path / "telemetry.db").close()
+    assert main(["churn", "--db", str(tmp_path / "telemetry.db")]) == 0
+    out = capsys.readouterr().out
+    assert "no churn events" in out
+    assert "changed" not in out  # no fabricated frequencies
+
+
+def test_churn_counts_and_most_common_causes(tmp_path, capsys):
+    store = TelemetryStore(tmp_path / "telemetry.db")
+    _seed_churn_events(store)
+    store.close()
+    assert main(["churn", "--db", str(tmp_path / "telemetry.db")]) == 0
+    out = capsys.readouterr().out
+    assert "Cache churn (last 10 churn events, PRD §25 detector)" in out
+    assert "Per-layer change frequency:" in out
+    assert "changed 8/10 churn events" in out  # history
+    assert "changed 1/10 churn events" in out  # route
+    assert "changed 1/10 churn events" in out  # system
+    assert "unchanged in the last 10 churn events" in out  # tools/model/cache key
+    assert "Most common likely causes:" in out
+    assert "8  history-boundary churn (recent conversation tail moved)" in out
+    assert "1  router affinity loss" in out
+
+
+# -- explain-miss (P10, PRD §75/§137) -----------------------------------------
+
+
+def test_explain_miss_empty_db_honest(tmp_path, capsys):
+    TelemetryStore(tmp_path / "telemetry.db").close()
+    assert main(["explain-miss", "--db", str(tmp_path / "telemetry.db")]) == 0
+    out = capsys.readouterr().out
+    assert "no churn events recorded — nothing to explain" in out
+    assert "Likely cause" not in out  # never a fabricated explanation
+
+
+def test_explain_miss_latest_event(tmp_path, capsys):
+    store = TelemetryStore(tmp_path / "telemetry.db")
+    store.record_churn(
+        ChurnEvent(
+            timestamp=datetime(2026, 8, 13, 12, 30, 0, tzinfo=UTC),
+            session_hash="s1",
+            previous_cache_fingerprint="fp-prev-1",
+            new_cache_fingerprint="fp-new-1",
+            history_changed=True,
+            likely_cause="history-boundary churn (recent conversation tail moved)",
+            confidence=0.70,
+            estimated_prefix_loss_tokens=1200,
+            first_divergent_offset=9,
+            first_divergent_layer="recent conversation tail",
+        )
+    )
+    store.record_churn(
+        ChurnEvent(
+            timestamp=datetime(2026, 8, 13, 12, 31, 0, tzinfo=UTC),
+            session_hash="s2",
+            previous_cache_fingerprint="fp-prev-2",
+            new_cache_fingerprint="fp-new-2",
+            route_changed=True,
+            likely_cause="router affinity loss",
+            confidence=0.92,
+        )
+    )
+    store.close()
+    assert main(["explain-miss", "--db", str(tmp_path / "telemetry.db")]) == 0
+    out = capsys.readouterr().out
+    # the LATEST event is explained (s2, route churn)
+    assert "Cache miss — churn event #2 (2026-08-13 12:31:00 UTC)" in out
+    assert "session        s2" in out
+    assert "Changed:" in out and "  route" in out
+    assert "Stable:" in out and "  system" in out and "  history" in out
+    assert "Likely cause:" in out
+    assert "router affinity loss" in out
+    assert "Confidence:" in out and "0.92" in out
+    assert "Estimated reusable prefix lost:" in out
+    assert "n/a (previous request content unavailable)" in out  # honest unknown
+
+
+def test_explain_miss_session_scoped(tmp_path, capsys):
+    store = TelemetryStore(tmp_path / "telemetry.db")
+    store.record_churn(
+        ChurnEvent(
+            timestamp=datetime(2026, 8, 13, 12, 30, 0, tzinfo=UTC),
+            session_hash="s1",
+            previous_cache_fingerprint="fp-prev-1",
+            new_cache_fingerprint="fp-new-1",
+            history_changed=True,
+            likely_cause="history-boundary churn (recent conversation tail moved)",
+            confidence=0.70,
+            estimated_prefix_loss_tokens=1200,
+            first_divergent_offset=9,
+            first_divergent_layer="recent conversation tail",
+        )
+    )
+    store.record_churn(
+        ChurnEvent(
+            timestamp=datetime(2026, 8, 13, 12, 31, 0, tzinfo=UTC),
+            session_hash="s2",
+            previous_cache_fingerprint="fp-prev-2",
+            new_cache_fingerprint="fp-new-2",
+            route_changed=True,
+            likely_cause="router affinity loss",
+            confidence=0.92,
+        )
+    )
+    store.close()
+    db = str(tmp_path / "telemetry.db")
+    assert main(["explain-miss", "--db", db, "--session", "s1"]) == 0
+    out = capsys.readouterr().out
+    assert "session        s1" in out
+    assert "history-boundary churn" in out
+    assert "~1200 tokens" in out
+    assert "offset ~9 within 'recent conversation tail'" in out
+    # unknown session → honest
+    assert main(["explain-miss", "--db", db, "--session", "nope"]) == 0
+    out = capsys.readouterr().out
+    assert "no churn events recorded for this session — nothing to explain" in out
+
+
+def test_explain_miss_unclassified_event_shows_n_a(tmp_path, capsys):
+    store = TelemetryStore(tmp_path / "telemetry.db")
+    store.record_churn(
+        ChurnEvent(
+            timestamp=datetime(2026, 8, 13, 12, 30, 0, tzinfo=UTC),
+            session_hash="s1",
+            previous_cache_fingerprint="fp-prev-1",
+            new_cache_fingerprint="fp-new-1",
+            history_changed=True,
+        )
+    )
+    store.close()
+    assert main(["explain-miss", "--db", str(tmp_path / "telemetry.db")]) == 0
+    out = capsys.readouterr().out
+    assert "n/a (not classified)" in out
+    assert "Confidence:\n  n/a" in out

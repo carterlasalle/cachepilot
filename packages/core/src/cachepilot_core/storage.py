@@ -75,6 +75,41 @@ _REQUEST_EVENT_COLUMNS = (
     "outcome",
 )
 
+#: ``churn_events`` columns in row order (PRD §82; P10 adds the classifier
+#: enrichment columns — PRD §25/§75/§137).
+_CHURN_EVENT_COLUMNS = (
+    "id",
+    "timestamp",
+    "session_hash",
+    "previous_cache_fingerprint",
+    "new_cache_fingerprint",
+    "provider",
+    "model",
+    "route_hash",
+    "system_changed",
+    "tools_changed",
+    "history_changed",
+    "route_changed",
+    "cache_key_changed",
+    "model_changed",
+    "likely_cause",
+    "confidence",
+    "estimated_prefix_loss_tokens",
+    "first_divergent_offset",
+    "first_divergent_layer",
+)
+
+#: P10 columns added to pre-existing ``churn_events`` tables (fresh databases
+#: get them from ``_SCHEMA``; older ones need an ALTER — see
+#: :func:`_ensure_churn_columns`).
+_CHURN_ENRICHMENT_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("likely_cause", "TEXT"),
+    ("confidence", "REAL"),
+    ("estimated_prefix_loss_tokens", "INTEGER"),
+    ("first_divergent_offset", "INTEGER"),
+    ("first_divergent_layer", "TEXT"),
+)
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS request_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -114,7 +149,12 @@ CREATE TABLE IF NOT EXISTS churn_events (
     history_changed INTEGER NOT NULL DEFAULT 0,
     route_changed INTEGER NOT NULL DEFAULT 0,
     cache_key_changed INTEGER NOT NULL DEFAULT 0,
-    model_changed INTEGER NOT NULL DEFAULT 0
+    model_changed INTEGER NOT NULL DEFAULT 0,
+    likely_cause TEXT,
+    confidence REAL,
+    estimated_prefix_loss_tokens INTEGER,
+    first_divergent_offset INTEGER,
+    first_divergent_layer TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_churn_events_timestamp ON churn_events(timestamp);
 
@@ -380,7 +420,28 @@ def _row_to_churn_event(row: tuple[Any, ...]) -> ChurnEvent:
         route_changed=bool(row[11]),
         cache_key_changed=bool(row[12]),
         model_changed=bool(row[13]),
+        likely_cause=row[14],
+        confidence=row[15],
+        estimated_prefix_loss_tokens=row[16],
+        first_divergent_offset=row[17],
+        first_divergent_layer=row[18],
     )
+
+
+def _ensure_churn_columns(conn: sqlite3.Connection) -> None:
+    """Add the P10 classifier columns to pre-existing ``churn_events`` tables.
+
+    ``CREATE TABLE IF NOT EXISTS`` only creates the new shape on fresh
+    databases; an existing table from an earlier phase keeps its old columns,
+    so each P10 column is ALTERed in (idempotent — "duplicate column name" is
+    expected and ignored).
+    """
+    for name, ddl in _CHURN_ENRICHMENT_COLUMNS:
+        try:
+            conn.execute(f"ALTER TABLE churn_events ADD COLUMN {name} {ddl}")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise
 
 
 #: ``provider_profiles`` columns in row order (P08, PRD §82).
@@ -591,6 +652,8 @@ class TelemetryStore:
             conn.execute("PRAGMA busy_timeout=5000")
             self.wal_active = _try_enable_wal(conn)
             conn.executescript(_SCHEMA)
+            # P10: existing churn_events tables predate the classifier columns.
+            _ensure_churn_columns(conn)
         except Exception:
             conn.close()
             raise
@@ -650,8 +713,10 @@ class TelemetryStore:
                     (timestamp, session_hash, previous_cache_fingerprint,
                      new_cache_fingerprint, provider, model, route_hash,
                      system_changed, tools_changed, history_changed,
-                     route_changed, cache_key_changed, model_changed)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     route_changed, cache_key_changed, model_changed,
+                     likely_cause, confidence, estimated_prefix_loss_tokens,
+                     first_divergent_offset, first_divergent_layer)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     churn.timestamp.astimezone(UTC).isoformat(timespec="seconds"),
@@ -667,6 +732,11 @@ class TelemetryStore:
                     int(churn.route_changed),
                     int(churn.cache_key_changed),
                     int(churn.model_changed),
+                    churn.likely_cause,
+                    churn.confidence,
+                    churn.estimated_prefix_loss_tokens,
+                    churn.first_divergent_offset,
+                    churn.first_divergent_layer,
                 ),
             )
             return int(cur.lastrowid or 0)
@@ -757,32 +827,30 @@ class TelemetryStore:
             route_changes=route_changes,
         )
 
-    def churn_list(self, limit: int = 50) -> list[ChurnEvent]:
-        """Most recent churn events, newest first."""
+    def churn_list(self, limit: int = 50, session_hash: str | None = None) -> list[ChurnEvent]:
+        """Most recent churn events, newest first (optionally one session)."""
+        columns = ", ".join(_CHURN_EVENT_COLUMNS)
         with self._lock:
-            rows = self._require_conn().execute(
-                """
-                SELECT id, timestamp, session_hash, previous_cache_fingerprint,
-                       new_cache_fingerprint, provider, model, route_hash,
-                       system_changed, tools_changed, history_changed,
-                       route_changed, cache_key_changed, model_changed
-                FROM churn_events ORDER BY id DESC LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
+            if session_hash is not None:
+                rows = self._require_conn().execute(
+                    f"SELECT {columns} FROM churn_events "
+                    "WHERE session_hash = ? ORDER BY id DESC LIMIT ?",
+                    (session_hash, limit),
+                ).fetchall()
+            else:
+                rows = self._require_conn().execute(
+                    f"SELECT {columns} FROM churn_events ORDER BY id DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
         return [_row_to_churn_event(row) for row in rows]
 
     def route_changes(self, limit: int = 50) -> list[ChurnEvent]:
         """Most recent churn events whose route identity changed."""
+        columns = ", ".join(_CHURN_EVENT_COLUMNS)
         with self._lock:
             rows = self._require_conn().execute(
-                """
-                SELECT id, timestamp, session_hash, previous_cache_fingerprint,
-                       new_cache_fingerprint, provider, model, route_hash,
-                       system_changed, tools_changed, history_changed,
-                       route_changed, cache_key_changed, model_changed
-                FROM churn_events WHERE route_changed = 1 ORDER BY id DESC LIMIT ?
-                """,
+                f"SELECT {columns} FROM churn_events WHERE route_changed = 1 "
+                "ORDER BY id DESC LIMIT ?",
                 (limit,),
             ).fetchall()
         return [_row_to_churn_event(row) for row in rows]

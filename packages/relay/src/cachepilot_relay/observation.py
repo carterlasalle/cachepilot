@@ -37,6 +37,13 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
 
+from cachepilot_core.churn import (
+    ChurnClassification,
+    LayeredHashes,
+    classify,
+    classify_hashes,
+    request_content_from_payload,
+)
 from cachepilot_core.fingerprint import cache_fingerprint, request_fingerprint
 from cachepilot_core.identity import ApiMode, CanonicalRequest, hash_content
 from cachepilot_core.route_intel import (
@@ -87,6 +94,16 @@ _KNOWN_GATEWAYS = {
 _HEADER_UPSTREAM_PROVIDER = ("x-provider", "x-cachepilot-provider")
 _HEADER_REGION = ("x-region", "x-cachepilot-region")
 _HEADER_DEPLOYMENT = ("x-served-by", "x-cachepilot-deployment")
+
+#: P10 churn-classifier inputs (PRD §24-25): the observer keeps the LAST
+#: request body per session IN MEMORY so a fingerprint transition can be
+#: classified against the previous request (first divergent byte, estimated
+#: prefix loss). Memory-only, dies on relay restart (PRD §30), bounded: bodies
+#: larger than the cap are not cached, and only the most recent sessions are
+#: kept — beyond that the classifier falls back to hash-only attribution
+#: (cause + confidence, no offset/loss).
+_BODY_CACHE_MAX_BYTES = 1_048_576  # 1 MiB per body
+_BODY_CACHE_MAX_SESSIONS = 32
 
 
 def strip_correlation_headers(headers: dict[str, str]) -> None:
@@ -294,9 +311,13 @@ class RequestObserver:
         db_path: str | None = None,
         enabled: bool = True,
         route_intel_enabled: bool = True,
+        churn_detection_enabled: bool = True,
     ) -> None:
         self.enabled = enabled
         self.route_intel_enabled = route_intel_enabled
+        #: P10 (PRD §25, §137, §164): churn detection master switch — when
+        #: False the observer records ZERO churn events (``CACHEPILOT_CHURN_DETECTION_ENABLED``).
+        self.churn_detection_enabled = churn_detection_enabled
         self._normalizer = UsageNormalizer()
         #: P09 (PRD UC-5): classifies a miss on a repeated logical request
         #: after a route change as ROUTE_INSTABILITY (never short-TTL
@@ -316,6 +337,10 @@ class RequestObserver:
         #: None when the store is unavailable — learning is best-effort and
         #: never blocks traffic (fail open, invariant 9).
         self._learner = TTLLearner(self.store) if self.store is not None else None
+        #: P10 (PRD §24-25, §30): memory-only per-session cache of the last
+        #: request body, for content-level churn classification. Dies on relay
+        #: restart; bounded (see ``_BODY_CACHE_*``).
+        self._last_body: dict[str, bytes] = {}
 
     def close(self) -> None:
         if self.store is not None:
@@ -376,6 +401,7 @@ class RequestObserver:
             route=route,
             session_header=session_header,
             history_hash=extract_history_hash(request_body),
+            body=request_body,
         )
         return outcome, usage
 
@@ -432,6 +458,7 @@ class RequestObserver:
             route=route,
             session_header=session_header,
             history_hash=extract_history_hash(body),
+            body=body,
         )
         return Outcome.SUCCESS_UNVERIFIED
 
@@ -469,6 +496,7 @@ class RequestObserver:
             route=route,
             session_header=session_header,
             history_hash=extract_history_hash(body),
+            body=body,
         )
         return Outcome.FAILED
 
@@ -484,6 +512,7 @@ class RequestObserver:
         route: RouteIdentity | None,
         session_header: str | None,
         history_hash: str | None,
+        body: bytes | None = None,
     ) -> None:
         if self.store is None:
             return
@@ -507,9 +536,16 @@ class RequestObserver:
         previous = (
             self.store.last_event_for_session(session_hash) if session_hash is not None else None
         )
+        # P10 (PRD §30): keep the last request body per session IN MEMORY so a
+        # fingerprint transition can be classified against the previous
+        # request (first divergent byte / estimated prefix loss). Returns the
+        # previous body before replacing it.
+        previous_body = self._remember_body(session_hash, body)
         self.store.record_request(event)
         if previous is not None and previous.cache_fingerprint != event.cache_fingerprint:
-            self._record_churn(previous, event)
+            self._record_churn(
+                previous, event, previous_body=previous_body, current_body=body
+            )
         # P09 (PRD §71-72, UC-5): classify a miss after a route change as
         # route instability (never short-TTL evidence) and record the
         # route-change event. The instability miss is still fed to the TTL
@@ -627,9 +663,98 @@ class RequestObserver:
         except Exception:
             logger.warning("ttl learning failed (traffic unaffected)", exc_info=True)
 
-    def _record_churn(self, previous: Any, event: TelemetryEvent) -> None:
-        if self.store is None:
+    def _remember_body(self, session_hash: str | None, body: bytes | None) -> bytes | None:
+        """Memory-only per-session cache of the last request body (PRD §30).
+
+        Returns the PREVIOUS body for the session (the classification input),
+        then stores ``body`` as the new "last". Bounded by size and session
+        count; disabled when churn detection is off (no churn recording ⇒ the
+        cache would be dead weight). Dies on relay restart — never persisted.
+        """
+        if session_hash is None or body is None or not self.churn_detection_enabled:
+            return None
+        if len(body) > _BODY_CACHE_MAX_BYTES:
+            return None  # oversized body: hash-only fallback classification
+        previous = self._last_body.get(session_hash)
+        if session_hash not in self._last_body and len(self._last_body) >= _BODY_CACHE_MAX_SESSIONS:
+            # FIFO eviction of the oldest session (dicts preserve insertion order).
+            self._last_body.pop(next(iter(self._last_body)))
+        self._last_body[session_hash] = body
+        return previous
+
+    def _classify_churn(
+        self,
+        previous: Any,
+        event: TelemetryEvent,
+        *,
+        previous_body: bytes | None,
+        current_body: bytes | None,
+    ) -> ChurnClassification:
+        """P10 (PRD §24-25): classify one fingerprint transition.
+
+        Content path (both request bodies available — the usual case): full
+        classification with first-divergent-byte + estimated prefix loss.
+        Hash-only fallback (previous body unavailable, e.g. right after a
+        relay restart): booleans + cause + confidence only — the loss and the
+        hint stay None, never fabricated. Fail-open: any classifier error
+        degrades to an empty classification (booleans/cause still recorded by
+        the caller — traffic unaffected, AGENTS.md invariant 9).
+        """
+        if previous_body is not None and current_body is not None:
+            previous_payload = _json_or_none(previous_body)
+            current_payload = _json_or_none(current_body)
+            if previous_payload is not None and current_payload is not None:
+                try:
+                    return classify(
+                        request_content_from_payload(
+                            previous_payload,
+                            route_hash=previous.route_hash,
+                            model=previous.model,
+                        ),
+                        request_content_from_payload(
+                            current_payload,
+                            route_hash=event.route_hash,
+                            model=event.model,
+                        ),
+                    )
+                except Exception:
+                    logger.warning("churn classification failed (traffic unaffected)", exc_info=True)
+        try:
+            return classify_hashes(
+                LayeredHashes(
+                    system_hash=previous.system_hash,
+                    tools_hash=previous.tools_hash,
+                    history_hash=previous.history_hash,
+                    route_hash=previous.route_hash,
+                    model=previous.model,
+                ),
+                LayeredHashes(
+                    system_hash=event.system_hash,
+                    tools_hash=event.tools_hash,
+                    history_hash=event.history_hash,
+                    route_hash=event.route_hash,
+                    model=event.model,
+                ),
+            )
+        except Exception:
+            logger.warning("hash-only churn classification failed (traffic unaffected)", exc_info=True)
+            return ChurnClassification()
+
+    def _record_churn(
+        self,
+        previous: Any,
+        event: TelemetryEvent,
+        *,
+        previous_body: bytes | None,
+        current_body: bytes | None,
+    ) -> None:
+        # P10 (PRD §164): independent master switch — disabled ⇒ ZERO churn
+        # events recorded (request telemetry is unaffected).
+        if self.store is None or not self.churn_detection_enabled:
             return
+        # The boolean flags below are the pre-P10 computation, kept stable:
+        # the P08 TTL learner and P09 router-miss analysis rely on these exact
+        # hash-equality semantics (PRD §56 clean-check uses history_hash).
         system_changed = previous.system_hash != event.system_hash
         tools_changed = previous.tools_hash != event.tools_hash
         history_changed = previous.history_hash != event.history_hash
@@ -641,6 +766,12 @@ class RequestObserver:
         cache_key_changed = not (
             system_changed or tools_changed or history_changed or route_changed or model_changed
         )
+        # P10 (PRD §25, §137): enrich with the classifier diagnosis when cheap
+        # (only on fingerprint transitions, never per request).
+        classification = self._classify_churn(
+            previous, event, previous_body=previous_body, current_body=current_body
+        )
+        first_divergent = classification.first_divergent_byte
         self.store.record_churn(
             ChurnEvent(
                 timestamp=event.timestamp,
@@ -656,5 +787,10 @@ class RequestObserver:
                 route_changed=route_changed,
                 cache_key_changed=cache_key_changed,
                 model_changed=model_changed,
+                likely_cause=classification.likely_cause,
+                confidence=classification.confidence,
+                estimated_prefix_loss_tokens=classification.estimated_prefix_loss_tokens,
+                first_divergent_offset=first_divergent.offset if first_divergent is not None else None,
+                first_divergent_layer=first_divergent.layer if first_divergent is not None else None,
             )
         )

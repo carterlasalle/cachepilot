@@ -125,6 +125,7 @@ class RelayProxy:
                 db_path=config.telemetry_db_path,
                 enabled=config.observation_enabled,
                 route_intel_enabled=config.route_intel_enabled,
+                churn_detection_enabled=config.churn_detection_enabled,
             )
             if config.observation_enabled
             else None

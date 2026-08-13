@@ -21,6 +21,12 @@ Subcommands:
   switch count, last switch time, instability verdicts count) from the
   ``route_events`` table (PRD §72.1, UC-5). Empty databases say "no
   observed route changes yet" — never fabricated routes.
+- ``churn`` (P10): per-layer change frequency over recorded churn events
+  plus the most common classifier diagnoses (PRD §25, §76). Empty
+  databases say "no churn events" — never fabricated numbers.
+- ``explain-miss`` (P10): explains the latest (or --session-scoped) churn
+  event — layers changed, likely cause, confidence, estimated prefix loss
+  (PRD §75, §137).
 
 The telemetry database comes from ``--db``, else ``CACHEPILOT_TELEMETRY_DB``,
 else ``~/.hermes/cachepilot/cachepilot.db`` (PRD §81).
@@ -45,6 +51,7 @@ from cachepilot_core.telemetry import CacheHealthStats, ChurnEvent
 from cachepilot_relay.config import DEFAULT_LISTEN, ENV_LISTEN, parse_listen
 
 from cachepilot_cli import __version__ as CLI_VERSION
+from cachepilot_cli.churn import cmd_churn, cmd_explain_miss
 
 ENV_PLUGIN_ENABLED = "CACHEPILOT_ENABLED"
 
@@ -106,6 +113,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="observed route identities and instability stats (PRD §71, §76, UC-5)",
     )
     routes_parser.set_defaults(handler=cmd_routes)
+
+    churn_parser = sub.add_parser(
+        "churn",
+        parents=[db_flag],
+        help="per-layer cache churn frequency + most common causes (PRD §25, §76)",
+    )
+    churn_parser.add_argument(
+        "--limit",
+        type=int,
+        default=100,
+        metavar="N",
+        help="most recent churn events to aggregate (default: 100)",
+    )
+    churn_parser.set_defaults(handler=cmd_churn)
+
+    explain_parser = sub.add_parser(
+        "explain-miss",
+        parents=[db_flag],
+        help="explain the latest (or --session-scoped) cache miss (PRD §75, §137)",
+    )
+    explain_parser.add_argument(
+        "--session",
+        default=None,
+        metavar="HASH",
+        help="session hash to scope the explanation to (default: latest overall)",
+    )
+    explain_parser.set_defaults(handler=cmd_explain_miss)
 
     args = parser.parse_args(argv)
     return int(args.handler(args))

@@ -30,6 +30,9 @@ ENV_TELEMETRY_DB = "CACHEPILOT_TELEMETRY_DB"
 ENV_OBSERVATION_ENABLED = "CACHEPILOT_RELAY_OBSERVATION_ENABLED"
 #: P09 (PRD §71-72, UC-5): router-miss analysis master switch (default on).
 ENV_ROUTE_INTEL = "CACHEPILOT_ROUTE_INTEL"
+#: P10 (PRD §25, §137, §164): cache churn detection master switch (default on;
+#: independent toggle — disabling it records ZERO churn events).
+ENV_CHURN_DETECTION = "CACHEPILOT_CHURN_DETECTION_ENABLED"
 #: P09 (PRD §73-74): economic route affinity master switch — OPTIONAL,
 #: never on by default.
 ENV_ROUTE_AFFINITY = "CACHEPILOT_ROUTE_AFFINITY"
@@ -88,6 +91,12 @@ class RelayConfig(BaseModel):
     #: neither classifies misses after route changes nor records route
     #: events (``CACHEPILOT_ROUTE_INTEL``, default true).
     route_intel_enabled: bool = True
+    #: P10 (PRD §25, §137, §164): cache churn detection. When False the
+    #: observer records ZERO churn events — the PRD §164 independent toggle
+    #: (``CACHEPILOT_CHURN_DETECTION_ENABLED``, default true). Boolean flags
+    #: and classifier enrichment both disappear; request telemetry is
+    #: unaffected.
+    churn_detection_enabled: bool = True
     #: P09 (PRD §73-74): economic route affinity. OPTIONAL and never on by
     #: default (``CACHEPILOT_ROUTE_AFFINITY``); even when enabled, affinity
     #: is only applied when the provider adapter reports ``can_pin_route()``
@@ -154,6 +163,7 @@ class RelayConfig(BaseModel):
             telemetry_db_path=env.get(ENV_TELEMETRY_DB) or str(default_db_path()),
             observation_enabled=_env_flag(env.get(ENV_OBSERVATION_ENABLED, "true")),
             route_intel_enabled=_env_flag(env.get(ENV_ROUTE_INTEL, "true")),
+            churn_detection_enabled=_env_flag(env.get(ENV_CHURN_DETECTION, "true")),
             route_affinity_enabled=_env_flag(env.get(ENV_ROUTE_AFFINITY)),
             route_affinity_extra_cost_usd=_env_decimal(
                 env.get(ENV_ROUTE_AFFINITY_EXTRA_COST), Decimal("0.0")

@@ -114,7 +114,17 @@ class TelemetryEvent(BaseModel):
 
 
 class ChurnEvent(BaseModel):
-    """A cache-identity transition for one session (PRD §25, §75, §82 churn_events)."""
+    """A cache-identity transition for one session (PRD §25, §75, §82 churn_events).
+
+    The per-layer boolean flags are the PRD §75 ``FingerprintDelta``. Phase 10
+    (PRD §25, §137) enriches each row with the classifier's diagnosis when it
+    was available at record time: a human-readable likely cause, a confidence
+    0..1, an estimated reusable-prefix loss in tokens, and the first-divergent
+    byte as a storage-safe numeric offset + layer name (the PRD §25 content
+    window is deliberately NOT persisted — AGENTS.md invariant 10). Rows
+    recorded before the classifier was wired (or with content unavailable)
+    carry None for these fields.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -131,6 +141,15 @@ class ChurnEvent(BaseModel):
     route_changed: bool = False
     cache_key_changed: bool = False
     model_changed: bool = False
+    #: P10 (PRD §25, §137): classifier enrichment — None when classification
+    #: was skipped or unavailable.
+    likely_cause: str | None = None
+    confidence: float | None = Field(default=None, ge=0, le=1)
+    estimated_prefix_loss_tokens: int | None = Field(default=None, ge=0)
+    #: First-divergent-byte hint: numeric offset + PRD §24 layer name only
+    #: (invariant 10 — the PRD §25 content window never touches storage).
+    first_divergent_offset: int | None = Field(default=None, ge=0)
+    first_divergent_layer: str | None = None
     #: Row id when read back from storage; None for freshly-built events.
     id: int | None = None
 
