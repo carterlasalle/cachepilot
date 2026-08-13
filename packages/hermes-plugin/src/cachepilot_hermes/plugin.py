@@ -1,8 +1,12 @@
-"""CachePilot Hermes plugin entry point (PRD §125 / §128 — plugin.py).
+"""CachePilot Hermes plugin entry point (PRD §125 / §128-129 — plugin.py).
 
-Phase 1 skeleton: a manifest, a ``create_plugin()``/``register(ctx)`` API,
-and registration of every middleware kind and lifecycle hook as pure
-pass-through observers that only emit structured, level-gated debug logs.
+Phase 1 built the skeleton: a manifest, a ``create_plugin()``/``register(ctx)``
+API, and registration of every middleware kind and lifecycle hook as pure
+pass-through observers with structured, level-gated debug logs. Phase 2 wires
+the long-task runtime into the same registration surface: a shared
+:class:`~cachepilot_hermes.duration_history.CommandDurationHistory` store and
+:class:`~cachepilot_hermes.targets.BackgroundTargetRegistry` feed the
+``tool_request`` middleware and lifecycle hooks.
 
 Hermes integration (v0.20.0, installed source at
 ``hermes_cli/plugins.py``/``hermes_cli/middleware.py``):
@@ -33,11 +37,13 @@ from cachepilot_hermes.config import (
     CachePilotConfig,
     emit_debug,
 )
+from cachepilot_hermes.duration_history import CommandDurationHistory
 from cachepilot_hermes.lifecycle import HOOK_NAMES, make_hook_handlers
 from cachepilot_hermes.llm_middleware import (
     make_llm_execution_middleware,
     make_llm_request_middleware,
 )
+from cachepilot_hermes.targets import BackgroundTargetRegistry
 from cachepilot_hermes.tool_middleware import (
     make_tool_execution_middleware,
     make_tool_request_middleware,
@@ -45,9 +51,10 @@ from cachepilot_hermes.tool_middleware import (
 
 PLUGIN_VERSION = "0.1.0"
 PLUGIN_DESCRIPTION = (
-    "Cost-aware KV-cache lease optimization for stock Hermes Agent — Phase 1 "
-    "skeleton: pass-through middleware + lifecycle hooks with structured debug "
-    "logs. No behavior change to stock Hermes."
+    "Cost-aware KV-cache lease optimization for stock Hermes Agent — long-task "
+    "runtime: deterministic terminal classifier, auto-background promotion with "
+    "completion notifications, subagent target tracking, command duration "
+    "history. No LLM polling, no cache warming."
 )
 PLUGIN_ENTRYPOINT = "cachepilot_hermes.plugin:register"
 
@@ -97,13 +104,24 @@ class CachePilotPlugin:
 
     def __init__(self, config: CachePilotConfig | None = None) -> None:
         self.config = config or CachePilotConfig.from_env()
+        # Shared long-task runtime state (PRD §43, §46). The duration store
+        # is created only when learning is enabled; the target registry is
+        # always present (cheap, in-memory). Both fail open at runtime.
+        self.history: CommandDurationHistory | None = (
+            CommandDurationHistory(db_path=self.config.long_tasks.db_path)
+            if self.config.long_tasks.learn_command_durations
+            else None
+        )
+        self.targets = BackgroundTargetRegistry()
         self.middleware: dict[str, Callable[..., Any]] = {
-            "tool_request": make_tool_request_middleware(self.config),
+            "tool_request": make_tool_request_middleware(self.config, history=self.history),
             "tool_execution": make_tool_execution_middleware(self.config),
             "llm_request": make_llm_request_middleware(self.config),
             "llm_execution": make_llm_execution_middleware(self.config),
         }
-        self.hooks: dict[str, Callable[..., Any]] = dict(make_hook_handlers(self.config))
+        self.hooks: dict[str, Callable[..., Any]] = dict(
+            make_hook_handlers(self.config, history=self.history, targets=self.targets)
+        )
 
     def register(self, ctx: Any) -> None:
         """Register every middleware kind and lifecycle hook on *ctx*.

@@ -16,7 +16,8 @@ AND structure pass through unchanged with the stock call graph intact.
 
 import copy
 
-from cachepilot_hermes.config import CachePilotConfig
+from cachepilot_hermes.config import CachePilotConfig, LongTasksSettings
+from cachepilot_hermes.duration_history import CommandDurationHistory
 from cachepilot_hermes.llm_middleware import (
     make_llm_execution_middleware,
     make_llm_request_middleware,
@@ -80,6 +81,123 @@ def test_tool_request_passes_args_through_unchanged():
 def test_tool_request_returns_none_contract():
     cb = make_tool_request_middleware(CONFIG)
     assert cb(tool_name="terminal", args={}, original_args={}, **SCHEMA_CTX) is None
+
+
+# -- tool_request auto-background promotion (PRD §40, Phase 2) -------------
+
+
+def test_tool_request_backgrounds_long_running_terminal():
+    args = {"command": "uv run pytest -x --tb=short", "timeout": 60}
+    original = copy.deepcopy(args)
+    cb = make_tool_request_middleware(CONFIG)
+    result = cb(
+        tool_name="terminal",
+        args=args,
+        original_args={},
+        **SCHEMA_CTX,
+    )
+    assert result is not None
+    assert result["source"] == "cachepilot"
+    assert result["reason"] == "long-running command"
+    assert result["args"]["command"] == "uv run pytest -x --tb=short"
+    assert result["args"]["background"] is True
+    assert result["args"]["notify_on_complete"] is True
+    # The original args object is never mutated (fail open for the caller).
+    assert args == original
+    assert "background" not in args
+
+
+def test_tool_request_non_terminal_passes_through():
+    cb = make_tool_request_middleware(CONFIG)
+    assert (
+        cb(
+            tool_name="write_file",
+            args={"path": "/tmp/x.py", "content": "print(1)"},
+            original_args={},
+            **SCHEMA_CTX,
+        )
+        is None
+    )
+
+
+def test_tool_request_respects_explicit_foreground():
+    """PRD §44: background=false is respected — no promotion."""
+    cb = make_tool_request_middleware(CONFIG)
+    result = cb(
+        tool_name="terminal",
+        args={"command": "uv run pytest", "background": False},
+        original_args={},
+        **SCHEMA_CTX,
+    )
+    assert result is None
+
+
+def test_tool_request_respects_explicit_background():
+    """PRD §44: an explicit background=true call is completed with the
+    notification flag rather than being left without one."""
+    cb = make_tool_request_middleware(CONFIG)
+    result = cb(
+        tool_name="terminal",
+        args={"command": "pwd", "background": True},
+        original_args={},
+        **SCHEMA_CTX,
+    )
+    assert result is not None
+    assert result["args"]["background"] is True
+    assert result["args"]["notify_on_complete"] is True
+    assert result["args"]["command"] == "pwd"
+
+
+def test_tool_request_disabled_runtime_is_pass_through():
+    off = CachePilotConfig(long_tasks=LongTasksSettings(enabled=False))
+    cb = make_tool_request_middleware(off)
+    assert (
+        cb(
+            tool_name="terminal",
+            args={"command": "uv run pytest"},
+            original_args={},
+            **SCHEMA_CTX,
+        )
+        is None
+    )
+
+
+def test_tool_request_fails_open_on_malformed_args():
+    cb = make_tool_request_middleware(CONFIG)
+    assert cb(tool_name="terminal", args=None, original_args=None, **SCHEMA_CTX) is None
+    assert (
+        cb(tool_name="terminal", args=["not", "a", "dict"], original_args=None, **SCHEMA_CTX)
+        is None
+    )
+
+
+def test_tool_request_promotes_on_learned_duration(tmp_path):
+    """PRD §43: learned p90 promotes a command with no static hint."""
+    history = CommandDurationHistory(tmp_path / "history.db")
+    for _ in range(5):
+        history.record("data-crunch.sh --full", 60.0)
+    cb = make_tool_request_middleware(CONFIG, history=history)
+    result = cb(
+        tool_name="terminal",
+        args={"command": "data-crunch.sh --full"},
+        original_args={},
+        **SCHEMA_CTX,
+    )
+    assert result is not None
+    assert result["args"]["background"] is True
+    assert result["args"]["notify_on_complete"] is True
+
+    # Without learned history the same command stays foreground.
+    cb2 = make_tool_request_middleware(CONFIG)
+    assert (
+        cb2(
+            tool_name="terminal",
+            args={"command": "data-crunch.sh --full"},
+            original_args={},
+            **SCHEMA_CTX,
+        )
+        is None
+    )
 
 
 # -- llm_request ------------------------------------------------------------

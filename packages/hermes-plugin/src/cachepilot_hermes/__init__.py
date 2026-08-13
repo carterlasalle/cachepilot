@@ -1,13 +1,22 @@
-"""CachePilot Hermes plugin — external Hermes Agent plugin skeleton (PRD §125, §128).
+"""CachePilot Hermes plugin — external Hermes Agent plugin (PRD §125, §128-129).
 
-Phase 1 deliverable: a plugin package installed via the ``hermes_agent.plugins``
-entry-point group that registers all four middleware kinds and the PRD §16
-lifecycle hooks. Every callback is a pure pass-through observer emitting
-structured, level-gated debug logs — stock Hermes behavior is identical with
-the plugin installed (enforced by ``tests/test_stock_hermes_unchanged.py``).
+Phase 1 established the skeleton: a plugin package installed via the
+``hermes_agent.plugins`` entry-point group that registers all four middleware
+kinds and the PRD §16 lifecycle hooks.
 
-``targets.py`` and ``relay_client.py`` (PRD §125) belong to later phases and
-are intentionally not created here.
+Phase 2 adds the long-task runtime on top of that skeleton, still without
+touching Hermes source:
+
+- ``classifier.py`` — deterministic terminal long-task classifier (no LLM);
+- ``duration_history.py`` — SQLite command-duration learner (§43, §82);
+- ``targets.py`` — background-target registry with refcounts (§46, §48);
+- ``tool_middleware.py`` — auto-background promotion with completion
+  notifications (§40);
+- ``lifecycle.py`` — duration recording + subagent target tracking.
+
+Stock Hermes behavior is byte-identical for every non-terminal tool and for
+terminal calls that classify foreground (enforced by
+``tests/test_stock_hermes_unchanged.py``).
 """
 
 from cachepilot_hermes.config import PLUGIN_NAME, CachePilotConfig
