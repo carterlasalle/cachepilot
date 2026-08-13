@@ -14,8 +14,10 @@ Subcommands:
   shown when cost data are incomplete (PRD §79, AGENTS.md invariant 4).
 - ``ttl``: route-keyed learned TTL profiles from the telemetry store (PRD
   §76, §82) — estimated TTL, lower/upper bounds, confidence, sample count
-  per route (provider/model/api_mode/endpoint_hash/route_hash). Empty
-  databases say "no TTL profiles yet" — never fabricated profiles.
+  per route (provider/model/api_mode/endpoint_hash/route_hash), plus the P11
+  survival view (PRD §99/§138): P(cache survives) at the estimated TTL and
+  the median survival age from CLEAN observations. Empty databases say "no
+  TTL profiles yet" — never fabricated profiles.
 - ``routes``: observed route identities (gateway/upstream/endpoint/region/
   deployment where observable, PRD §71) with instability stats (route
   switch count, last switch time, instability verdicts count) from the
@@ -27,6 +29,10 @@ Subcommands:
 - ``explain-miss`` (P10): explains the latest (or --session-scoped) churn
   event — layers changed, likely cause, confidence, estimated prefix loss
   (PRD §75, §137).
+- ``topology`` (P11): cross-request prefix topology (PRD §24/§138) — per-
+  layer change frequency, stability % and estimated prefix-token value over
+  consecutive request pairs, plus per-route tool-schema ordering stability.
+  DETECT/measurement-only: nothing here reorders tools or rewrites prompts.
 
 The telemetry database comes from ``--db``, else ``CACHEPILOT_TELEMETRY_DB``,
 else ``~/.hermes/cachepilot/cachepilot.db`` (PRD §81).
@@ -47,7 +53,10 @@ from cachepilot_core.storage import (
     TelemetryStore,
     default_db_path,
 )
+from cachepilot_core.survival import curve_from_profile
 from cachepilot_core.telemetry import CacheHealthStats, ChurnEvent
+from cachepilot_core.topology import topology_from_store
+from cachepilot_core.ttl import TTLProfile
 from cachepilot_relay.config import DEFAULT_LISTEN, ENV_LISTEN, parse_listen
 
 from cachepilot_cli import __version__ as CLI_VERSION
@@ -140,6 +149,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="session hash to scope the explanation to (default: latest overall)",
     )
     explain_parser.set_defaults(handler=cmd_explain_miss)
+
+    topology_parser = sub.add_parser(
+        "topology",
+        parents=[db_flag],
+        help="per-layer prefix stability + tool-ordering stability (PRD §24, §138)",
+    )
+    topology_parser.add_argument(
+        "--limit",
+        type=int,
+        default=500,
+        metavar="N",
+        help="most recent request events to measure (default: 500)",
+    )
+    topology_parser.set_defaults(handler=cmd_topology)
 
     args = parser.parse_args(argv)
     return int(args.handler(args))
@@ -305,28 +328,60 @@ def cmd_ttl(args: argparse.Namespace) -> int:
 
     Rows are whatever the learner actually persisted — never fabricated.
     An empty database says so, and unknown TTL values are shown as
-    ``unknown`` (PRD §59: never silently guess).
+    ``unknown`` (PRD §59: never silently guess). P11 (PRD §99/§138) adds the
+    survival view per profile: P(cache survives) at the estimated TTL and
+    the median survival age, estimated over CLEAN observations — a
+    diagnostic layer, never a warm decision input.
     """
     store = TelemetryStore(args.db)
     try:
         profiles = store.list_profiles(limit=100)
+        if not profiles:
+            print("no TTL profiles yet (learning needs repeated observations of a stable route)")
+            return 0
+        print("TTL profiles (route-keyed, PRD §82)")
+        print()
+        for profile in profiles:
+            print(f"Route: {profile.provider} | {profile.model} | {profile.api_mode}")
+            print(f"  endpoint      {_short_hash(profile.endpoint_hash)}")
+            print(f"  route         {_short_hash(profile.route_hash)}")
+            print(f"  estimated     {_ttl_value(profile.estimated_ttl_s)}")
+            print(f"  lower bound   {_ttl_value(profile.lower_bound_s)}")
+            print(f"  upper bound   {_ttl_value(profile.upper_bound_s)}")
+            print(f"  confidence    {profile.confidence:.2f}")
+            print(f"  samples       {profile.sample_count}")
+            _print_survival(store, profile)
     finally:
         store.close()
-    if not profiles:
-        print("no TTL profiles yet (learning needs repeated observations of a stable route)")
-        return 0
-    print("TTL profiles (route-keyed, PRD §82)")
-    print()
-    for profile in profiles:
-        print(f"Route: {profile.provider} | {profile.model} | {profile.api_mode}")
-        print(f"  endpoint      {_short_hash(profile.endpoint_hash)}")
-        print(f"  route         {_short_hash(profile.route_hash)}")
-        print(f"  estimated     {_ttl_value(profile.estimated_ttl_s)}")
-        print(f"  lower bound   {_ttl_value(profile.lower_bound_s)}")
-        print(f"  upper bound   {_ttl_value(profile.upper_bound_s)}")
-        print(f"  confidence    {profile.confidence:.2f}")
-        print(f"  samples       {profile.sample_count}")
     return 0
+
+
+def _print_survival(store: TelemetryStore, profile: TTLProfile) -> None:
+    """P11 (PRD §99/§138): P(survive) at the profile's estimated TTL.
+
+    Derived on demand from CLEAN ttl_observations (Kaplan-Meier-style) —
+    never fabricated: no clean observations, no estimate. Beyond the observed
+    horizon the CLI says so instead of inventing a probability.
+    """
+    curve = curve_from_profile(store, profile)
+    if curve.empty:
+        print("  survival      no clean observations yet")
+        return
+    ttl = profile.estimated_ttl_s
+    probability = curve.survival_at(ttl) if ttl is not None else None
+    if probability is None:
+        print(
+            f"  survival      P(survive) n/a — beyond observed horizon "
+            f"(n={curve.sample_count} clean observations)"
+        )
+    else:
+        print(
+            f"  survival      P(survive at TTL) = {probability:.2f} "
+            f"(n={curve.sample_count} clean observations)"
+        )
+    median = curve.median_survival_s()
+    if median is not None:
+        print(f"  median        {median:.0f}s")
 
 
 def _short_hash(value: str | None) -> str:
@@ -378,3 +433,88 @@ def cmd_routes(args: argparse.Namespace) -> int:
     print(f"instability verdicts  {stats.instability_verdicts}")
     print(f"short-TTL verdicts    {stats.short_ttl_verdicts}")
     return 0
+
+
+# -- topology (P11, PRD §24/§138) ---------------------------------------------
+
+
+def cmd_topology(args: argparse.Namespace) -> int:
+    """Cross-request prefix topology + tool-ordering stability (PRD §24/§138).
+
+    DETECT/measurement-only view over stored request/churn events: per-layer
+    change frequency, stability % and estimated prefix-token value over
+    consecutive request pairs, plus per-route tool-schema ordering stability.
+    Nothing here reorders tools or rewrites prompts (PRD §138: "Only after
+    measurement"; automatic tool reordering additionally requires proof of
+    semantic safety — this phase only measures). Rows are whatever the relay
+    actually recorded — an empty database says so, never fabricated numbers.
+    """
+    store = TelemetryStore(args.db)
+    try:
+        report = topology_from_store(store, limit=args.limit)
+    finally:
+        store.close()
+    if report.total_pairs == 0:
+        print("no consecutive request pairs recorded yet — nothing to measure")
+        return 0
+    print(
+        f"Cache topology (PRD §24/§138 measurement view) — "
+        f"last {args.limit} requests"
+    )
+    print()
+    print(f"  sessions                  {report.sessions}")
+    print(f"  consecutive pairs         {report.total_pairs}")
+    stability = _pct(report.prefix_stability_pct)
+    print(
+        f"  cache fingerprint churn   {report.churn_pairs}  "
+        f"(prefix stability {stability})"
+    )
+    if report.attribution_gaps:
+        print(
+            f"  attribution gaps          {report.attribution_gaps}  "
+            "(system/history churn without layered attribution)"
+        )
+    if report.unattributed_loss_tokens:
+        print(f"  unattributed loss         ~{report.unattributed_loss_tokens:,} tokens")
+    print()
+    print("Per-layer change frequency (consecutive request pairs):")
+    print(f"  {'layer':<24} {'changed':<34} {'stability':<10} est. prefix loss")
+    for stats in report.layers:
+        marker = "*" if stats.attribution_based else " "
+        loss = _loss_text(stats.estimated_prefix_loss_tokens)
+        print(
+            f"  {stats.layer:<24} {stats.change_frequency:<34} "
+            f"{_pct(stats.stability_pct):<10} {loss}{marker}"
+        )
+    if any(stats.attribution_based for stats in report.layers):
+        print()
+        print("  * layered sub-layer rows are attributed from classified churn")
+        print("    events (exact layered hashes are memory-only, PRD §30)")
+    print()
+    print("Tool-schema ordering stability (per route):")
+    print(
+        f"  {'route':<16} {'pairs':<7} {'set changes':<13} "
+        f"{'order permutations':<20} stability"
+    )
+    if not report.tool_ordering:
+        print(
+            "  no decidable tool-set pairs recorded "
+            "(tools_set_hash missing on pre-P11 rows)"
+        )
+    for stats in report.tool_ordering:
+        print(
+            f"  {_short_hash(stats.route):<16} {stats.pairs:<7} "
+            f"{stats.tool_set_changes:<13} {stats.order_permutations:<20} "
+            f"{_pct(stats.ordering_stability_pct)}"
+        )
+    return 0
+
+
+def _pct(value: float | None) -> str:
+    """Render an optional percentage; unknown stays unknown (never fabricated)."""
+    return "n/a" if value is None else f"{value:.1f}%"
+
+
+def _loss_text(tokens: int | None) -> str:
+    """Render an estimated prefix-token loss; None stays n/a (identity layers)."""
+    return "n/a" if tokens is None else f"~{tokens:,} tokens"

@@ -53,6 +53,23 @@ def _canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
 
 
+def tools_set_hash(tools: Sequence[Mapping[str, Any]] | None) -> str:
+    """Order-independent SHA-256 digest of the tool schemas (PRD §138).
+
+    ``tools_hash`` (cache identity) is order-sensitive: the same tool set in a
+    different order produces a different digest. This digest canonicalizes the
+    SET (sorted, deduplicated member serializations), so a pure ordering
+    permutation is detectable from stored hashes alone — the P11
+    tool-ordering stability measurement. It is derived measurement, never part
+    of cache identity (AGENTS.md invariants 7-8).
+    """
+    if tools is None:
+        return hash_content(None)
+    members = sorted({_canonical_json(tool) for tool in tools})
+    # \\x1f cannot appear unescaped in JSON output, so the join is unambiguous.
+    return hash_content("\x1f".join(members))
+
+
 class CacheIdentity(BaseModel):
     """Physical cache identity — PRD §22 canonical form.
 
@@ -101,6 +118,13 @@ class CanonicalRequest(CacheIdentity):
         gt=0,
         description="Client timeout — NOT part of cache identity.",
     )
+    #: P11 (PRD §138): order-independent digest of the tool schemas — derived
+    #: measurement for the tool-ordering stability view, deliberately absent
+    #: from CACHE_IDENTITY_FIELDS and excluded from ``request_fingerprint``.
+    tools_set_hash: str | None = Field(
+        default=None,
+        description="Order-independent tool-set digest (P11 topology measurement).",
+    )
 
     @classmethod
     def from_content(
@@ -135,6 +159,7 @@ class CanonicalRequest(CacheIdentity):
             prompt_key=hash_content(prompt_prefix),
             system_hash=hash_content(system),
             tools_hash=tools_hash,
+            tools_set_hash=tools_set_hash(tools),
             max_tokens=max_tokens,
             stream=stream,
             timeout_s=timeout_s,

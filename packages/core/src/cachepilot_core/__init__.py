@@ -67,6 +67,14 @@ from cachepilot_core.storage import (
     default_db_path,
     resolve_db_path,
 )
+from cachepilot_core.survival import (
+    SurvivalCurve,
+    SurvivalObservation,
+    SurvivalStep,
+    curve_from_observations,
+    curve_from_profile,
+    estimate_survival,
+)
 from cachepilot_core.telemetry import (
     CacheHealthStats,
     ChurnEvent,
@@ -74,6 +82,13 @@ from cachepilot_core.telemetry import (
     TelemetryEvent,
     classify_outcome,
     usage_has_cache_telemetry,
+)
+from cachepilot_core.topology import (
+    ToolOrderingStats,
+    TopologyLayerStats,
+    TopologyReport,
+    topology_from_snapshots,
+    topology_from_store,
 )
 from cachepilot_core.usage import TokenUsage, UsageNormalizer
 
@@ -116,10 +131,16 @@ __all__ = [
     "RouterMissClassifier",
     "SnapshotStore",
     "StoredRequestEvent",
+    "SurvivalCurve",
+    "SurvivalObservation",
+    "SurvivalStep",
     "TTLHint",
     "TelemetryEvent",
     "TelemetryStore",
     "TokenUsage",
+    "ToolOrderingStats",
+    "TopologyLayerStats",
+    "TopologyReport",
     "UsageNormalizer",
     "WarmAction",
     "WarmDecision",
@@ -130,14 +151,19 @@ __all__ = [
     "classify",
     "classify_hashes",
     "classify_outcome",
+    "curve_from_observations",
+    "curve_from_profile",
     "default_db_path",
     "estimate_cost",
     "estimate_resume_costs",
+    "estimate_survival",
     "hash_content",
     "provider_result_to_http_response",
     "request_content_from_payload",
     "request_fingerprint",
     "resolve_db_path",
     "split_system_layers",
+    "topology_from_snapshots",
+    "topology_from_store",
     "usage_has_cache_telemetry",
 ]

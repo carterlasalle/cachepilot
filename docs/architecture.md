@@ -154,3 +154,43 @@ must never be written to the store.
 `cache.churn_detection.enabled` ↔ `CACHEPILOT_CHURN_DETECTION_ENABLED`
 (default true, independent of observation/route-intel). Disabled ⇒ the
 observer records ZERO churn events; request telemetry is unaffected.
+
+## Phase 11 — Advanced Optimizations (measurement-first)
+
+Phase 11 (PRD §138 — "Only after measurement") ships the four optimization
+candidates as DETECT/measurement-first capabilities. See
+`docs/advanced-optimizations.md` for the runbook; nothing in this phase
+reorders tools, rewrites prompts, or feeds warm decisions.
+
+- **Survival model** (`cachepilot_core.survival`): a non-parametric
+  Kaplan-Meier-style estimator of `P(cache survives | age)` (PRD §99) over
+  CLEAN `ttl_observations` (PRD §56), per route profile key (PRD §82).
+  `CONFIRMED_HIT` = censored "survived to age A"; `MISS_REBUILT` = death
+  "died at age A". The P11 migration adds route-identity columns to
+  `ttl_observations`; the `TTLLearner` persists them on every observation.
+  `cachepilot ttl` displays P(survive) at the estimated TTL + median
+  survival. Diagnostic only — the PRD §59 TTL override hierarchy is
+  untouched.
+- **Cross-request prefix topology** (`cachepilot_core.topology`,
+  `cachepilot topology`): per-layer change frequency / stability % /
+  estimated prefix-token value over consecutive request pairs (PRD §24
+  layers), with layered sub-layer attribution from stored churn events,
+  disclosed attribution gaps, and a per-route tool-ordering stability view.
+  Offline-testable snapshot path + stored-event view.
+- **Volatile prompt isolation** (`cachepilot_core.churn`): churn confined to
+  the dynamic system suffix is classified `system_suffix_churn (volatile
+  value in dynamic system suffix)`; a volatile-looking value inside the
+  static prefix is `volatile_value_in_prefix (volatile value inside static
+  system prefix)` — both distinct from the generic "system prompt changed"
+  and surfaced in `cachepilot churn` / `cachepilot explain-miss`.
+- **Stable tool ordering (measurement only)**: the relay persists an
+  order-independent `tools_set_hash` (same set in a different order hashes
+  the same) alongside the order-sensitive `tools_hash`; `cachepilot
+  topology` counts permutations vs set changes per route. NO automatic
+  reordering (PRD §138: requires proof of semantic safety).
+
+Schema migrations (idempotent ALTERs on connect, the P10 pattern):
+`request_events.tools_set_hash` and the four `ttl_observations` route-identity
+columns. `tools_set_hash` is excluded from `CACHE_IDENTITY_FIELDS` and from
+`request_fingerprint`, so cache identity and stored fingerprint values are
+unchanged.

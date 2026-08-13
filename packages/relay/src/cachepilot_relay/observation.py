@@ -532,6 +532,10 @@ class RequestObserver:
             system_hash=canonical.system_hash,
             tools_hash=canonical.tools_hash,
             history_hash=history_hash,
+            # P11 (PRD §138): order-independent tool-set digest for the
+            # tool-ordering stability view (derived measurement, never cache
+            # identity — fingerprints exclude it).
+            tools_set_hash=canonical.tools_set_hash,
         )
         previous = (
             self.store.last_event_for_session(session_hash) if session_hash is not None else None

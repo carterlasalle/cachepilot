@@ -139,3 +139,83 @@ def test_churn_detection_env_flag_defaults_on():
     env = {"CACHEPILOT_CHURN_DETECTION_ENABLED": "true"}
     config = RelayConfig.from_env(env, upstream="https://fake-provider.invalid/v1")
     assert config.churn_detection_enabled is True
+
+
+# -- P11 (PRD §138): tools_set_hash + volatile-isolation causes -----------------
+
+
+def test_observer_records_tools_set_hash_for_ordering_measurement(tmp_path):
+    """The order-independent tool-set digest is persisted on request_events:
+    the same tool set in a different order keeps the set digest while the
+    order-sensitive tools_hash moves — the tool-ordering stability input."""
+    store = TelemetryStore(tmp_path / "telemetry.db")
+    observer = RequestObserver(store=store)
+    tools = [
+        {"type": "function", "function": {"name": "get_weather"}},
+        {"type": "function", "function": {"name": "get_time"}},
+    ]
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": tools,
+        "stream": False,
+    }
+    permuted = {
+        "model": "gpt-5.2",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": list(reversed(tools)),
+        "stream": False,
+    }
+    try:
+        _observe(observer, payload, session="sess-tools")
+        _observe(observer, permuted, session="sess-tools")
+    finally:
+        observer.close()
+        store.close()
+
+    store = TelemetryStore(tmp_path / "telemetry.db")
+    try:
+        events = store.recent_events(limit=5)
+        assert len(events) == 2
+        first, second = events[1], events[0]
+        assert first.tools_set_hash is not None
+        # set digest is order-independent: identical across the permutation…
+        assert first.tools_set_hash == second.tools_set_hash
+        # …while the order-sensitive tools_hash moved
+        assert first.tools_hash != second.tools_hash
+    finally:
+        store.close()
+
+
+def test_observer_classifies_system_suffix_churn_p11(tmp_path):
+    """P11 volatile prompt isolation through the real relay path: a churn
+    confined to the dynamic system suffix is classified as system_suffix_churn
+    (never the generic 'system prompt changed')."""
+    store = TelemetryStore(tmp_path / "telemetry.db")
+    observer = RequestObserver(store=store)
+    system = "You are helpful.\nCurrent time: 3:14 PM\nBe concise."
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [{"role": "user", "content": "hi"}],
+        "system": system,
+        "stream": False,
+    }
+    try:
+        _observe(observer, payload, session="sess-suffix")
+        _observe(observer, {**payload, "system": system.replace("3:14", "3:15")}, session="sess-suffix")
+    finally:
+        observer.close()
+        store.close()
+
+    store = TelemetryStore(tmp_path / "telemetry.db")
+    try:
+        churn = store.churn_list(limit=5)
+        assert len(churn) == 1
+        event = churn[0]
+        assert event.system_changed is True
+        assert event.likely_cause == "system_suffix_churn (volatile value in dynamic system suffix)"
+        assert event.confidence == 0.85
+        assert event.first_divergent_layer == "dynamic system suffix"
+        assert event.first_divergent_offset is not None
+    finally:
+        store.close()

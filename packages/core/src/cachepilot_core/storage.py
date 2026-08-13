@@ -73,6 +73,7 @@ _REQUEST_EVENT_COLUMNS = (
     "cost_usd",
     "request_kind",
     "outcome",
+    "tools_set_hash",
 )
 
 #: ``churn_events`` columns in row order (PRD §82; P10 adds the classifier
@@ -110,6 +111,23 @@ _CHURN_ENRICHMENT_COLUMNS: tuple[tuple[str, str], ...] = (
     ("first_divergent_layer", "TEXT"),
 )
 
+#: P11 (PRD §138) column added to pre-existing ``request_events`` tables: the
+#: order-independent tool-set digest backing the tool-ordering stability view.
+_REQUEST_ENRICHMENT_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("tools_set_hash", "TEXT"),
+)
+
+#: P11 (PRD §99/§138) identity columns added to pre-existing
+#: ``ttl_observations`` tables so CLEAN observations can be attributed to a
+#: route profile key (PRD §82) for the per-profile survival curve. Older rows
+#: keep NULL and are excluded from per-profile curves (never mis-attributed).
+_TTL_OBSERVATION_ENRICHMENT_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("provider", "TEXT"),
+    ("model", "TEXT"),
+    ("api_mode", "TEXT"),
+    ("endpoint_hash", "TEXT"),
+)
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS request_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -129,7 +147,8 @@ CREATE TABLE IF NOT EXISTS request_events (
     cache_write_tokens INTEGER NOT NULL DEFAULT 0,
     cost_usd TEXT,
     request_kind TEXT NOT NULL DEFAULT 'normal',
-    outcome TEXT NOT NULL
+    outcome TEXT NOT NULL,
+    tools_set_hash TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_request_events_session ON request_events(session_hash);
 CREATE INDEX IF NOT EXISTS idx_request_events_cache_fp ON request_events(cache_fingerprint);
@@ -215,7 +234,11 @@ CREATE TABLE IF NOT EXISTS ttl_observations (
     route_hash TEXT,
     idle_age_s REAL,
     outcome TEXT NOT NULL,
-    clean INTEGER NOT NULL DEFAULT 0
+    clean INTEGER NOT NULL DEFAULT 0,
+    provider TEXT,
+    model TEXT,
+    api_mode TEXT,
+    endpoint_hash TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_ttl_observations_cache_fp
     ON ttl_observations(cache_fingerprint, timestamp);
@@ -263,6 +286,8 @@ class StoredRequestEvent(BaseModel):
     cost_usd: Decimal | None = None
     request_kind: str = "normal"
     outcome: Outcome
+    #: P11 (PRD §138): order-independent tool-set digest (NULL on pre-P11 rows).
+    tools_set_hash: str | None = None
 
 
 #: ``leases`` columns in row order (id first, then the stored lease fields).
@@ -401,6 +426,7 @@ def _row_to_request_event(row: tuple[Any, ...]) -> StoredRequestEvent:
         cost_usd=_text_to_decimal(row[15]),
         request_kind=row[16],
         outcome=Outcome(row[17]),
+        tools_set_hash=row[18],
     )
 
 
@@ -444,6 +470,48 @@ def _ensure_churn_columns(conn: sqlite3.Connection) -> None:
                 raise
 
 
+def _ensure_request_columns(conn: sqlite3.Connection) -> None:
+    """Add the P11 ``tools_set_hash`` column to pre-existing ``request_events``
+    tables (same idempotent ALTER pattern as :func:`_ensure_churn_columns`).
+
+    Hand-crafted databases may lack the table entirely; the sqlite_master
+    check keeps the migration harmless there.
+    """
+    has_table = (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='request_events'"
+        ).fetchone()
+        is not None
+    )
+    if not has_table:
+        return
+    for name, ddl in _REQUEST_ENRICHMENT_COLUMNS:
+        try:
+            conn.execute(f"ALTER TABLE request_events ADD COLUMN {name} {ddl}")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise
+
+
+def _ensure_ttl_observation_columns(conn: sqlite3.Connection) -> None:
+    """Add the P11 route-identity columns to pre-existing ``ttl_observations``
+    tables (idempotent ALTER pattern; see :func:`_ensure_request_columns`)."""
+    has_table = (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ttl_observations'"
+        ).fetchone()
+        is not None
+    )
+    if not has_table:
+        return
+    for name, ddl in _TTL_OBSERVATION_ENRICHMENT_COLUMNS:
+        try:
+            conn.execute(f"ALTER TABLE ttl_observations ADD COLUMN {name} {ddl}")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise
+
+
 #: ``provider_profiles`` columns in row order (P08, PRD §82).
 _PROFILE_COLUMNS = (
     "provider",
@@ -462,7 +530,8 @@ _PROFILE_COLUMNS = (
     "profile_key",
 )
 
-#: ``ttl_observations`` columns in row order (P08, PRD §82).
+#: ``ttl_observations`` columns in row order (P08, PRD §82; P11 adds the
+#: route-identity columns for per-profile survival attribution).
 _TTL_OBSERVATION_COLUMNS = (
     "id",
     "timestamp",
@@ -471,6 +540,10 @@ _TTL_OBSERVATION_COLUMNS = (
     "idle_age_s",
     "outcome",
     "clean",
+    "provider",
+    "model",
+    "api_mode",
+    "endpoint_hash",
 )
 
 #: ``route_events`` columns in row order (P09, PRD §72.1/§75).
@@ -518,6 +591,10 @@ def _row_to_ttl_observation(row: tuple[Any, ...]) -> StoredTTLObservation:
         idle_age_s=row[4],
         outcome=Outcome(row[5]),
         clean=bool(row[6]),
+        provider=row[7],
+        model=row[8],
+        api_mode=row[9],
+        endpoint_hash=row[10],
     )
 
 
@@ -654,6 +731,10 @@ class TelemetryStore:
             conn.executescript(_SCHEMA)
             # P10: existing churn_events tables predate the classifier columns.
             _ensure_churn_columns(conn)
+            # P11: pre-P11 request_events / ttl_observations tables predate
+            # the tool-set digest and the survival identity columns.
+            _ensure_request_columns(conn)
+            _ensure_ttl_observation_columns(conn)
         except Exception:
             conn.close()
             raise
@@ -679,8 +760,8 @@ class TelemetryStore:
                      request_fingerprint, cache_fingerprint, system_hash,
                      tools_hash, history_hash, input_tokens, output_tokens,
                      cache_read_tokens, cache_write_tokens, cost_usd,
-                     request_kind, outcome)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     request_kind, outcome, tools_set_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event.session_hash,
@@ -700,6 +781,7 @@ class TelemetryStore:
                     _decimal_to_text(usage.cost),
                     event.request_kind,
                     event.outcome.value,
+                    event.tools_set_hash,
                 ),
             )
             return int(cur.lastrowid or 0)
@@ -952,15 +1034,26 @@ class TelemetryStore:
         idle_age_s: float | None,
         outcome: Outcome,
         clean: bool,
+        provider: str | None = None,
+        model: str | None = None,
+        api_mode: str | None = None,
+        endpoint_hash: str | None = None,
     ) -> int:
-        """Append one TTL observation row (PRD §82 ``ttl_observations``)."""
+        """Append one TTL observation row (PRD §82 ``ttl_observations``).
+
+        P11 (PRD §99/§138): ``provider`` / ``model`` / ``api_mode`` /
+        ``endpoint_hash`` are the route-identity columns that let the
+        per-profile survival curve attribute CLEAN observations to a PRD §82
+        profile key. They default to None so pre-P11 callers and rows stay
+        valid; rows without identity are excluded from per-profile curves.
+        """
         with self._lock:
             cur = self._require_conn().execute(
                 """
                 INSERT INTO ttl_observations
                     (timestamp, cache_fingerprint, route_hash, idle_age_s,
-                     outcome, clean)
-                VALUES (?, ?, ?, ?, ?, ?)
+                     outcome, clean, provider, model, api_mode, endpoint_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     timestamp.astimezone(UTC).isoformat(timespec="seconds"),
@@ -969,6 +1062,10 @@ class TelemetryStore:
                     idle_age_s,
                     outcome.value,
                     int(clean),
+                    provider,
+                    model,
+                    api_mode,
+                    endpoint_hash,
                 ),
             )
             return int(cur.lastrowid or 0)
@@ -998,6 +1095,31 @@ class TelemetryStore:
                 f"SELECT {', '.join(_TTL_OBSERVATION_COLUMNS)} FROM ttl_observations "
                 "WHERE cache_fingerprint = ? ORDER BY id DESC LIMIT ?",
                 (cache_fingerprint, limit),
+            ).fetchall()
+        return [_row_to_ttl_observation(row) for row in rows]
+
+    def clean_observations_for_profile(
+        self,
+        *,
+        provider: str,
+        model: str,
+        api_mode: str,
+        endpoint_hash: str,
+        route_hash: str | None,
+    ) -> list[StoredTTLObservation]:
+        """CLEAN TTL observations attributed to one route profile key (P11).
+
+        PRD §56 clean flag + the P11 route-identity columns — the input to the
+        per-profile survival curve (PRD §99/§138). Pre-P11 rows (NULL identity)
+        can never match and are excluded, so they are never mis-attributed.
+        ``route_hash`` uses ``IS ?`` so a NULL route key matches correctly.
+        """
+        with self._lock:
+            rows = self._require_conn().execute(
+                f"SELECT {', '.join(_TTL_OBSERVATION_COLUMNS)} FROM ttl_observations "
+                "WHERE clean = 1 AND provider = ? AND model = ? AND api_mode = ? "
+                "AND endpoint_hash = ? AND route_hash IS ? ORDER BY id ASC",
+                (provider, model, api_mode, endpoint_hash, route_hash),
             ).fetchall()
         return [_row_to_ttl_observation(row) for row in rows]
 

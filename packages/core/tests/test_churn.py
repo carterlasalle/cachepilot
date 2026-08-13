@@ -14,8 +14,11 @@ import json
 
 import cachepilot_core.churn as churn_module
 from cachepilot_core.churn import (
+    CAUSE_SYSTEM_SUFFIX_CHURN,
+    CAUSE_VOLATILE_VALUE_IN_PREFIX,
     LAYER_HISTORY_TAIL,
     LAYER_ROUTE,
+    LAYER_SYSTEM_PREFIX,
     LAYER_SYSTEM_SUFFIX,
     LayeredHashes,
     RequestContent,
@@ -173,20 +176,69 @@ def test_classify_route_churn_matches_prd_75_example():
 
 def test_classify_volatile_system_suffix_prd_25_example():
     """PRD §25: a timestamp inside the system prompt churns every request →
-    the dynamic suffix is the culprit, the static prefix stays stable."""
+    the dynamic suffix is the culprit, the static prefix stays stable. P11
+    (PRD §138) classifies the CONFINED divergence as ``system_suffix_churn`` —
+    sharper than the generic suffix cause used when other layers also moved."""
     previous = _content(system="You are helpful.\nCurrent time: 3:14 PM\nBe concise.")
     current = _content(system="You are helpful.\nCurrent time: 3:15 PM\nBe concise.")
     classification = classify(previous, current)
     assert classification.system_changed is True
     assert classification.system_prefix_changed is False
     assert classification.system_suffix_changed is True
-    assert classification.likely_cause == "volatile value inserted into prompt prefix"
+    assert classification.likely_cause == CAUSE_SYSTEM_SUFFIX_CHURN
     assert classification.confidence == 0.85
     hint = classification.first_divergent_byte
     assert hint is not None
     assert hint.layer == LAYER_SYSTEM_SUFFIX
     assert hint.offset == 3  # "3:14 PM" vs "3:15 PM" diverge at the minute digit
     assert hint.snippet is not None and "3:1" in hint.snippet
+
+
+def test_classify_suffix_churn_with_other_layers_keeps_generic_suffix_cause():
+    """When the suffix moved AND another layer moved, the isolation is not
+    proven — the generic PRD §24/§25 suffix cause applies (earliest layer)."""
+    classification = classify(
+        _content(
+            system="You are helpful.\nCurrent time: 3:14 PM",
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+        ),
+        _content(
+            system="You are helpful.\nCurrent time: 3:15 PM",
+            tools=[{"type": "function", "function": {"name": "get_time"}}],
+        ),
+    )
+    assert classification.likely_cause == "volatile value inserted into prompt prefix"
+    assert classification.confidence == 0.75  # 0.85 - 0.10 * (2 - 1)
+
+
+def test_classify_volatile_value_inside_static_prefix():
+    """P11 (PRD §138): a volatile-looking value leaked INTO the static prefix
+    region (the boundary heuristic did not recognise it) gets its own cause —
+    never the generic 'system prompt changed'."""
+    previous = _content(system="Run abc123. Follow the instructions.")
+    current = _content(system="Run xyz789. Follow the instructions.")
+    classification = classify(previous, current)
+    assert classification.system_changed is True
+    assert classification.system_prefix_changed is True
+    assert classification.system_suffix_changed is False
+    assert classification.likely_cause == CAUSE_VOLATILE_VALUE_IN_PREFIX
+    assert classification.confidence == 0.85
+    assert classification.changed_layers == (LAYER_SYSTEM_PREFIX,)
+
+
+def test_classify_prefix_move_without_volatile_marker_stays_memory_prefix():
+    """A plain prefix move (no volatile-looking value near the divergence) is
+    NOT a volatile leak — the memory-prefix cause applies unchanged."""
+    classification = classify(
+        _content(system="Memory block A. Follow the instructions."),
+        _content(system="Memory block B. Follow the instructions."),
+    )
+    assert classification.system_prefix_changed is True
+    assert classification.system_suffix_changed is False
+    assert (
+        classification.likely_cause == "changing memory prefixes (static system prefix moved)"
+    )
+    assert classification.confidence == 0.90
 
 
 def test_classify_changing_memory_prefix():

@@ -111,6 +111,10 @@ class TelemetryEvent(BaseModel):
     system_hash: str | None = None
     tools_hash: str | None = None
     history_hash: str | None = None
+    #: P11 (PRD §138): order-independent tool-set digest (same tool set in a
+    #: different order hashes the same) — powers the tool-ordering stability
+    #: view. Derived measurement, never cache identity.
+    tools_set_hash: str | None = None
 
 
 class ChurnEvent(BaseModel):

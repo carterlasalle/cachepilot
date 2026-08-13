@@ -225,7 +225,13 @@ class TTLObservation:
 
 @dataclass(frozen=True)
 class StoredTTLObservation:
-    """A ``ttl_observations`` row read back from the store."""
+    """A ``ttl_observations`` row read back from the store.
+
+    P11 (PRD §99/§138): the route-identity columns (``provider`` / ``model`` /
+    ``api_mode`` / ``endpoint_hash``) are ``None`` on rows recorded before the
+    P11 schema migration — those rows cannot be attributed to a route profile
+    and are excluded from per-profile survival curves.
+    """
 
     id: int
     timestamp: datetime
@@ -234,6 +240,10 @@ class StoredTTLObservation:
     idle_age_s: float | None
     outcome: Outcome
     clean: bool
+    provider: str | None = None
+    model: str | None = None
+    api_mode: str | None = None
+    endpoint_hash: str | None = None
 
 
 class TTLStore(Protocol):
@@ -258,6 +268,10 @@ class TTLStore(Protocol):
         idle_age_s: float | None,
         outcome: Outcome,
         clean: bool,
+        provider: str | None = None,
+        model: str | None = None,
+        api_mode: str | None = None,
+        endpoint_hash: str | None = None,
     ) -> int: ...
 
     def churn_between(self, cache_fingerprint: str, start: datetime, end: datetime) -> bool: ...
@@ -315,6 +329,14 @@ class TTLLearner:
             idle_age_s=idle_age_s,
             outcome=obs.outcome,
             clean=clean,
+            # P11 (PRD §99/§138): persist the route-identity columns so CLEAN
+            # observations can be attributed to a profile key for the
+            # per-profile survival curve (pre-P11 rows stay NULL and are
+            # excluded from per-profile curves, never mis-attributed).
+            provider=obs.provider,
+            model=obs.model,
+            api_mode=obs.api_mode,
+            endpoint_hash=endpoint_hash(obs.endpoint),
         )
         profile = self._store.profile_for(key)
         if clean and idle_age_s is not None:

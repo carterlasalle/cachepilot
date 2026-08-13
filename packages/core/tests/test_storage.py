@@ -386,3 +386,196 @@ def test_lease_raw_session_and_url_never_in_db_bytes(tmp_path):
             db_bytes += path.read_bytes()
     assert b"sess-SECRET-raw" not in db_bytes
     assert b"https://secret-host.invalid/v1" not in db_bytes
+
+
+# -- P11 (PRD §138): tools_set_hash + ttl_observations identity columns --------
+
+
+def test_request_event_round_trips_tools_set_hash(tmp_path):
+    store = TelemetryStore(tmp_path / "t.db")
+    event = _event(tools_set_hash="set-hash-1")
+    store.record_request(event)
+    row = store.recent_events(limit=10)[0]
+    assert row.tools_set_hash == "set-hash-1"
+    # absent on pre-P11-style rows → None, never fabricated
+    store.record_request(_event(cache_fingerprint="fp-2", tools_set_hash=None))
+    assert store.recent_events(limit=10)[0].tools_set_hash is None
+    store.close()
+
+
+def test_ttl_observation_round_trips_route_identity_columns(tmp_path):
+    store = TelemetryStore(tmp_path / "t.db")
+    store.record_ttl_observation(
+        timestamp=datetime(2026, 8, 13, 12, 0, 0, tzinfo=UTC),
+        cache_fingerprint="fp-1",
+        route_hash="route-1",
+        idle_age_s=183.0,
+        outcome=Outcome.CONFIRMED_HIT,
+        clean=True,
+        provider="openrouter",
+        model="deepseek-v4-flash",
+        api_mode="chat",
+        endpoint_hash="ep-hash-1",
+    )
+    row = store.last_ttl_observation("fp-1")
+    assert row is not None
+    assert row.provider == "openrouter"
+    assert row.model == "deepseek-v4-flash"
+    assert row.api_mode == "chat"
+    assert row.endpoint_hash == "ep-hash-1"
+    store.close()
+
+
+def test_clean_observations_for_profile_filters_clean_and_identity(tmp_path):
+    store = TelemetryStore(tmp_path / "t.db")
+    base: dict[str, Any] = {
+        "timestamp": datetime(2026, 8, 13, 12, 0, 0, tzinfo=UTC),
+        "provider": "openrouter",
+        "model": "deepseek-v4-flash",
+        "api_mode": "chat",
+        "endpoint_hash": "ep-hash-1",
+    }
+    store.record_ttl_observation(
+        cache_fingerprint="fp-clean", route_hash="route-1", idle_age_s=100.0,
+        outcome=Outcome.CONFIRMED_HIT, clean=True, **base,
+    )
+    store.record_ttl_observation(
+        cache_fingerprint="fp-unclean", route_hash="route-1", idle_age_s=100.0,
+        outcome=Outcome.MISS_REBUILT, clean=False, **base,
+    )
+    store.record_ttl_observation(
+        cache_fingerprint="fp-other-route", route_hash="route-2", idle_age_s=100.0,
+        outcome=Outcome.CONFIRMED_HIT, clean=True, **base,
+    )
+    store.record_ttl_observation(
+        cache_fingerprint="fp-other-provider", route_hash="route-1", idle_age_s=100.0,
+        outcome=Outcome.CONFIRMED_HIT, clean=True, **dict(base, provider="anthropic"),
+    )
+    store.record_ttl_observation(
+        # pre-P11-shaped row: no identity columns → NULLs, never matched
+        timestamp=datetime(2026, 8, 13, 12, 0, 0, tzinfo=UTC),
+        cache_fingerprint="fp-legacy", route_hash="route-1", idle_age_s=100.0,
+        outcome=Outcome.CONFIRMED_HIT, clean=True,
+    )
+    rows = store.clean_observations_for_profile(
+        provider="openrouter",
+        model="deepseek-v4-flash",
+        api_mode="chat",
+        endpoint_hash="ep-hash-1",
+        route_hash="route-1",
+    )
+    assert [row.cache_fingerprint for row in rows] == ["fp-clean"]
+    # NULL route keys match only a NULL route_hash
+    no_route = store.clean_observations_for_profile(
+        provider="openrouter",
+        model="deepseek-v4-flash",
+        api_mode="chat",
+        endpoint_hash="ep-hash-1",
+        route_hash=None,
+    )
+    assert no_route == []
+    store.close()
+
+
+def test_pre_p11_request_events_gain_tools_set_hash_column(tmp_path):
+    """A pre-P11 request_events table (no tools_set_hash) migrates on connect
+    and keeps working — the ALTER pattern from P10, applied to request_events."""
+    db = tmp_path / "old.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        """
+        CREATE TABLE request_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_hash TEXT,
+            timestamp TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            route_hash TEXT,
+            request_fingerprint TEXT NOT NULL,
+            cache_fingerprint TEXT NOT NULL,
+            system_hash TEXT,
+            tools_hash TEXT,
+            history_hash TEXT,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+            cost_usd TEXT,
+            request_kind TEXT NOT NULL DEFAULT 'normal',
+            outcome TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = TelemetryStore(db)
+    try:
+        store.record_request(_event(cache_fingerprint="fp-1", tools_set_hash="set-x"))
+        assert store.recent_events(limit=10)[0].tools_set_hash == "set-x"
+        # re-connecting is idempotent
+        store.close()
+        store = TelemetryStore(db)
+        assert store.recent_events(limit=10)[0].tools_set_hash == "set-x"
+    finally:
+        store.close()
+    conn = sqlite3.connect(db)
+    try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(request_events)")}
+    finally:
+        conn.close()
+    assert "tools_set_hash" in columns
+
+
+def test_pre_p11_ttl_observations_gain_identity_columns(tmp_path):
+    """A pre-P11 ttl_observations table (no identity columns) migrates on
+    connect; old rows keep NULL identity and are excluded from profile queries."""
+    db = tmp_path / "old.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        """
+        CREATE TABLE ttl_observations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            cache_fingerprint TEXT NOT NULL,
+            route_hash TEXT,
+            idle_age_s REAL,
+            outcome TEXT NOT NULL,
+            clean INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = TelemetryStore(db)
+    try:
+        store.record_ttl_observation(
+            timestamp=datetime(2026, 8, 13, 12, 0, 0, tzinfo=UTC),
+            cache_fingerprint="fp-1",
+            route_hash="route-1",
+            idle_age_s=183.0,
+            outcome=Outcome.CONFIRMED_HIT,
+            clean=True,
+            provider="openrouter",
+            model="deepseek-v4-flash",
+            api_mode="chat",
+            endpoint_hash="ep-hash-1",
+        )
+        rows = store.clean_observations_for_profile(
+            provider="openrouter",
+            model="deepseek-v4-flash",
+            api_mode="chat",
+            endpoint_hash="ep-hash-1",
+            route_hash="route-1",
+        )
+        assert [row.cache_fingerprint for row in rows] == ["fp-1"]
+        assert rows[0].provider == "openrouter"
+    finally:
+        store.close()
+    conn = sqlite3.connect(db)
+    try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(ttl_observations)")}
+    finally:
+        conn.close()
+    assert {"provider", "model", "api_mode", "endpoint_hash"} <= columns

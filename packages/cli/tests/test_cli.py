@@ -535,3 +535,242 @@ def test_explain_miss_unclassified_event_shows_n_a(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "n/a (not classified)" in out
     assert "Confidence:\n  n/a" in out
+
+
+# -- P11 volatile isolation surfaces in churn / explain-miss -------------------
+
+
+def test_churn_most_common_causes_include_p11_volatile_causes(tmp_path, capsys):
+    store = TelemetryStore(tmp_path / "telemetry.db")
+    store.record_churn(
+        ChurnEvent(
+            timestamp=datetime(2026, 8, 13, 12, 30, 0, tzinfo=UTC),
+            session_hash="s1",
+            previous_cache_fingerprint="fp-a",
+            new_cache_fingerprint="fp-b",
+            system_changed=True,
+            likely_cause="system_suffix_churn (volatile value in dynamic system suffix)",
+            confidence=0.85,
+        )
+    )
+    store.record_churn(
+        ChurnEvent(
+            timestamp=datetime(2026, 8, 13, 12, 31, 0, tzinfo=UTC),
+            session_hash="s1",
+            previous_cache_fingerprint="fp-b",
+            new_cache_fingerprint="fp-c",
+            system_changed=True,
+            likely_cause="volatile_value_in_prefix (volatile value inside static system prefix)",
+            confidence=0.85,
+        )
+    )
+    store.close()
+    assert main(["churn", "--db", str(tmp_path / "telemetry.db")]) == 0
+    out = capsys.readouterr().out
+    assert "1  system_suffix_churn (volatile value in dynamic system suffix)" in out
+    assert "1  volatile_value_in_prefix (volatile value inside static system prefix)" in out
+
+
+def test_explain_miss_surfaces_p11_volatile_cause(tmp_path, capsys):
+    store = TelemetryStore(tmp_path / "telemetry.db")
+    store.record_churn(
+        ChurnEvent(
+            timestamp=datetime(2026, 8, 13, 12, 30, 0, tzinfo=UTC),
+            session_hash="s1",
+            previous_cache_fingerprint="fp-a",
+            new_cache_fingerprint="fp-b",
+            system_changed=True,
+            likely_cause="system_suffix_churn (volatile value in dynamic system suffix)",
+            confidence=0.85,
+            estimated_prefix_loss_tokens=22400,
+            first_divergent_offset=19,
+            first_divergent_layer="dynamic system suffix",
+        )
+    )
+    store.close()
+    assert main(["explain-miss", "--db", str(tmp_path / "telemetry.db")]) == 0
+    out = capsys.readouterr().out
+    assert "system_suffix_churn (volatile value in dynamic system suffix)" in out
+    assert "~22400 tokens" in out
+    assert "offset ~19 within 'dynamic system suffix'" in out
+
+
+# -- topology (P11, PRD §24/§138) ----------------------------------------------
+
+
+def _seed_topology_events(store: TelemetryStore) -> None:
+    """Session s1 with 3 requests → 2 consecutive pairs:
+
+    - e1→e2: dynamic system suffix churn (loss 8000, attributed);
+    - e2→e3: same tool set in a different order (order permutation).
+    """
+    suffix_old = "You are helpful.\nCurrent time: 3:14 PM\nBe concise."
+    suffix_new = "You are helpful.\nCurrent time: 3:15 PM\nBe concise."
+    tools = [
+        {"type": "function", "function": {"name": "get_weather"}},
+        {"type": "function", "function": {"name": "get_time"}},
+    ]
+
+    def event(fp: str, system: str, tool_list) -> None:
+        from cachepilot_core.churn import request_content_from_payload
+
+        content = request_content_from_payload(
+            {"model": "gpt-5.2", "system": system, "messages": [], "tools": tool_list},
+            route_hash="route-abc",
+        )
+        hashes = content.to_hashes()
+        store.record_request(
+            TelemetryEvent(
+                request_fingerprint=f"req-{fp}",
+                cache_fingerprint=fp,
+                provider="openai",
+                model="gpt-5.2",
+                route_hash="route-abc",
+                outcome=Outcome.CONFIRMED_HIT,
+                session_hash="s1",
+                timestamp=datetime(2026, 8, 13, 12, 0, 0, tzinfo=UTC),
+                system_hash=hashes.system_hash,
+                tools_hash=hashes.tools_hash,
+                history_hash=hashes.history_hash,
+                tools_set_hash=hashes.tools_set_hash,
+            )
+        )
+
+    event("fp-1", suffix_old, tools)
+    event("fp-2", suffix_new, tools)
+    event("fp-3", suffix_new, list(reversed(tools)))
+    store.record_churn(
+        ChurnEvent(
+            timestamp=datetime(2026, 8, 13, 12, 1, 0, tzinfo=UTC),
+            session_hash="s1",
+            previous_cache_fingerprint="fp-1",
+            new_cache_fingerprint="fp-2",
+            system_changed=True,
+            likely_cause="system_suffix_churn (volatile value in dynamic system suffix)",
+            confidence=0.85,
+            estimated_prefix_loss_tokens=8000,
+            first_divergent_offset=19,
+            first_divergent_layer="dynamic system suffix",
+        )
+    )
+    store.record_churn(
+        ChurnEvent(
+            timestamp=datetime(2026, 8, 13, 12, 2, 0, tzinfo=UTC),
+            session_hash="s1",
+            previous_cache_fingerprint="fp-2",
+            new_cache_fingerprint="fp-3",
+            tools_changed=True,
+            likely_cause="tool list mutation",
+            confidence=0.80,
+            estimated_prefix_loss_tokens=0,
+            first_divergent_offset=3,
+            first_divergent_layer="tool schemas",
+        )
+    )
+
+
+def test_topology_empty_db_says_nothing_to_measure(tmp_path, capsys):
+    TelemetryStore(tmp_path / "telemetry.db").close()
+    assert main(["topology", "--db", str(tmp_path / "telemetry.db")]) == 0
+    out = capsys.readouterr().out
+    assert "no consecutive request pairs recorded yet — nothing to measure" in out
+    assert "per-layer" not in out.lower()  # no fabricated table
+
+
+def test_topology_reports_layers_stability_loss_and_ordering(tmp_path, capsys):
+    store = TelemetryStore(tmp_path / "telemetry.db")
+    _seed_topology_events(store)
+    store.close()
+    assert main(["topology", "--db", str(tmp_path / "telemetry.db")]) == 0
+    out = capsys.readouterr().out
+    assert "Cache topology (PRD §24/§138 measurement view) — last 500 requests" in out
+    assert "sessions                  1" in out
+    assert "consecutive pairs         2" in out
+    assert "cache fingerprint churn   2  (prefix stability 0.0%)" in out
+    # the dynamic system suffix is attributed as the destructive layer
+    assert "dynamic system suffix" in out
+    assert "changed 1/2 requests" in out
+    assert "~8,000 tokens" in out
+    assert "static system prefix" in out
+    # tools moved (permutation) → tools layer churn + ordering stats
+    assert "tool schemas" in out
+    assert "Tool-schema ordering stability (per route):" in out
+    assert "order permutations" in out
+    # the attribution disclosure footnote
+    assert "* layered sub-layer rows are attributed from classified churn" in out
+
+
+# -- P11 survival in `cachepilot ttl` (PRD §99/§138) ---------------------------
+
+
+def _seed_survival(store: TelemetryStore) -> None:
+    from cachepilot_core.ttl import endpoint_hash
+
+    ep_hash = endpoint_hash("https://openrouter.ai/api/v1")
+    store.upsert_profile(
+        TTLProfile(
+            provider="openrouter",
+            model="deepseek-v4-flash",
+            api_mode="chat",
+            endpoint_hash=ep_hash,
+            route_hash="route-abc",
+            lower_bound_s=183.0,
+            upper_bound_s=302.0,
+            estimated_ttl_s=224.65,
+            confidence=0.7,
+            sample_count=5,
+        )
+    )
+    for age, outcome in (
+        (100.0, Outcome.CONFIRMED_HIT),
+        (200.0, Outcome.CONFIRMED_HIT),
+        (250.0, Outcome.MISS_REBUILT),
+        (300.0, Outcome.CONFIRMED_HIT),
+    ):
+        store.record_ttl_observation(
+            timestamp=datetime(2026, 8, 13, 12, 0, 0, tzinfo=UTC),
+            cache_fingerprint=f"fp-{int(age)}",
+            route_hash="route-abc",
+            idle_age_s=age,
+            outcome=outcome,
+            clean=True,
+            provider="openrouter",
+            model="deepseek-v4-flash",
+            api_mode="chat",
+            endpoint_hash=ep_hash,
+        )
+
+
+def test_ttl_shows_survival_at_estimated_ttl(tmp_path, capsys):
+    store = TelemetryStore(tmp_path / "telemetry.db")
+    _seed_survival(store)
+    store.close()
+    assert main(["ttl", "--db", str(tmp_path / "telemetry.db")]) == 0
+    out = capsys.readouterr().out
+    # hits at 100/200 left the risk set; the death at 250 had 2 at risk →
+    # S = 0.5; the estimated TTL 224.65s sits below it → P(survive) = 1.00
+    assert "P(survive at TTL) = 1.00 (n=4 clean observations)" in out
+    assert "median        250s" in out  # first step at or below 0.5
+
+
+def test_ttl_survival_honest_without_clean_observations(tmp_path, capsys):
+    store = TelemetryStore(tmp_path / "telemetry.db")
+    from cachepilot_core.ttl import endpoint_hash
+
+    store.upsert_profile(
+        TTLProfile(
+            provider="openrouter",
+            model="deepseek-v4-flash",
+            api_mode="chat",
+            endpoint_hash=endpoint_hash("https://openrouter.ai/api/v1"),
+            route_hash="route-abc",
+            estimated_ttl_s=300.0,
+            confidence=0.5,
+            sample_count=1,
+        )
+    )
+    store.close()
+    assert main(["ttl", "--db", str(tmp_path / "telemetry.db")]) == 0
+    out = capsys.readouterr().out
+    assert "survival      no clean observations yet" in out
+    assert "P(survive" not in out  # never fabricated

@@ -48,8 +48,15 @@ def _sha256_hex(data: bytes) -> str:
 
 
 def request_fingerprint(request: CanonicalRequest) -> str:
-    """Hash of the entire canonical request (PRD §23 'Full request fingerprint')."""
-    return _sha256_hex(_canonical_bytes(request.model_dump(mode="json")))
+    """Hash of the entire canonical request (PRD §23 'Full request fingerprint').
+
+    ``tools_set_hash`` (P11) is excluded: it is derived measurement carrying
+    no identity information beyond ``tools_hash``, and excluding it keeps
+    fingerprint values stable across the P11 schema addition.
+    """
+    dump = request.model_dump(mode="json")
+    dump.pop("tools_set_hash", None)
+    return _sha256_hex(_canonical_bytes(dump))
 
 
 def cache_fingerprint(request: CanonicalRequest) -> str:
