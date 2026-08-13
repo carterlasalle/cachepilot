@@ -66,6 +66,54 @@ Notes:
   mypy per-file with `--follow-imports=skip` when the whole-tree run fails
   for that reason.
 
+## CI (GitHub Actions)
+
+Two workflows run on every push to `main` (and on PRs) —
+`.github/workflows/`:
+
+**ci.yml** — per-push quality gate (PRD §140):
+
+| Job | Command |
+|---|---|
+| lint | `uv run --group dev ruff check .` |
+| typecheck | `uvx mypy --python-executable .venv/bin/python --native-parser --python-version 3.12 --follow-imports=skip src packages` |
+| test | `uv run --group dev pytest -x --tb=short` — the suite includes the race tests (lease/warm-executor interleavings) and the relay differential integration tests, so PRD §140's race/integration requirement runs here |
+| coverage | `uv run --group dev pytest --cov=cachepilot_core --cov=cachepilot_hermes --cov=cachepilot_relay --cov=cachepilot_cli --cov-fail-under=90 --cov-report=term-missing` |
+| audit | `uv audit` (uv 0.12 prints an experimental warning on stderr; exit 0 still means the lockfile is clean) |
+
+**compat.yml** — Hermes compatibility matrix (PRD §140). Two cells install a
+real Hermes agent into a dedicated venv, set `HERMES_AGENT_DIR` to that
+install root (`site-packages`), and run `pytest packages/hermes-plugin/tests
+-q` so `test_stock_hermes_unchanged.py` actually runs instead of skipping:
+
+- `latest-release` — `pip install hermes-agent` from PyPI (currently 0.19.0)
+- `current-main` — editable install of a fresh clone of
+  `https://github.com/NousResearch/hermes-agent.git` (hermes-agent's build
+  backend refuses wheel/sdist builds by design; `pip install -e` is the
+  sanctioned dev path)
+
+Each cell also asserts the plugin entry-point group is still
+`hermes_agent.plugins` (drift guard). A weekly scheduled run (Mon 03:00 UTC,
+`0 3 * * 1`) repeats the `current-main` cell to catch Hermes API drift
+between releases; the workflow is also `workflow_dispatch`-able.
+
+Hermes goes into a dedicated venv, not the project `.venv`: the stock-unchanged
+test snapshots the install tree, and its ignore list skips any path containing
+`.venv` — pointing `HERMES_AGENT_DIR` at the project venv's site-packages
+would produce an empty snapshot and fail the test outright. As of 2026-08-13
+the `current-main` cell's entry-point check is red upstream: hermes main's
+`hermes_cli/plugins.py` imports `registration_lifecycle`, a top-level module
+missing from its own `pyproject.toml` `py-modules` list — exactly the drift
+this job exists to surface.
+
+Notes:
+
+- The typecheck job requires `--native-parser --python-version 3.12`:
+  mypy's default parser rejects the pre-existing PEP-695 `type X =` aliases
+  in `packages/core/src/cachepilot_core/adapters.py:57` (mypy 2.3.0).
+- `mypy` and `pytest-cov` are pinned in the `[dependency-groups] dev` group
+  so every CI command is reproducible locally with `uv sync --group dev`.
+
 ## Task lifecycle (GitReins)
 
 Every change is a GitReins task; every commit is judged by the Tier-2 LLM

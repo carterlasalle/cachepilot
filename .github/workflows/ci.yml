@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - name: Ruff check
+        run: uv run --group dev ruff check .
+
+  typecheck:
+    name: Typecheck (mypy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - name: Sync environment
+        run: uv sync --group dev
+      # --native-parser + --python-version 3.12 are required: mypy's default
+      # parser rejects the PEP-695 `type X =` aliases in
+      # packages/core/src/cachepilot_core/adapters.py:57 (mypy 2.3.0).
+      - name: Mypy (src + packages)
+        run: uvx mypy --python-executable .venv/bin/python --native-parser --python-version 3.12 --follow-imports=skip src packages
+
+  test:
+    name: Tests (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      # PRD §140 race/integration tests: the suite includes race tests
+      # (lease/warm-executor interleavings) and relay differential integration
+      # tests — both run on every push.
+      - name: Pytest
+        run: uv run --group dev pytest -x --tb=short
+
+  coverage:
+    name: Coverage (>=90%)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - name: Coverage
+        run: uv run --group dev pytest --cov=cachepilot_core --cov=cachepilot_hermes --cov=cachepilot_relay --cov=cachepilot_cli --cov-fail-under=90 --cov-report=term-missing
+
+  audit:
+    name: Dependency audit (uv audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      # uv 0.12 prints an experimental warning on stderr; exit code 0 means
+      # the lockfile has no known-vulnerable packages.
+      - name: uv audit
+        run: uv audit

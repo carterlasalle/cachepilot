@@ -370,6 +370,7 @@ async def _scenario_streaming(tmp_path) -> None:
         payload = {"model": "gpt-5.2", "messages": [{"role": "user", "content": "stream"}], "stream": True}
 
         async def collect(base_url: str) -> bytes:
+            assert harness.client is not None
             chunks: list[bytes] = []
             async with harness.client.stream("POST", base_url + "/v1/chat/completions", json=payload) as resp:
                 assert resp.status_code == 200

@@ -118,9 +118,11 @@ def _build_proxy(
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured.append(json.loads(request.content))
+        model = _BODY["model"]
+        assert isinstance(model, str)
         canonical = CanonicalRequest.from_content(
             provider="fake-provider",
-            model=_BODY["model"],
+            model=model,
             api_mode=ApiMode.CHAT,
             endpoint=UPSTREAM_URL,
             auth_scope="test-scope",

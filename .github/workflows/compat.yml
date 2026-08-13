@@ -1,0 +1,71 @@
+name: Hermes Compatibility
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly Monday 03:00 UTC — PRD §140 scheduled compatibility job.
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compat:
+    name: Hermes ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: latest-release
+            hermes_spec: hermes-agent
+          - name: current-main
+            # hermes-agent's build backend refuses wheel/sdist builds; this
+            # cell clones main and editable-installs it (see install step).
+            hermes_spec: git+https://github.com/NousResearch/hermes-agent.git
+    # Push/PR: both cells. Weekly schedule: current-main only (the drift
+    # detector per PRD §140).
+    if: github.event_name != 'schedule' || matrix.name == 'current-main'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - name: Sync workspace
+        run: uv sync --group dev
+      # Hermes is installed into a DEDICATED venv (not the project .venv):
+      # test_stock_hermes_unchanged.py snapshots the install tree and its
+      # ignore list excludes any path containing `.venv` — pointing
+      # HERMES_AGENT_DIR at the project venv's site-packages yields an empty
+      # snapshot and a hard failure instead of a meaningful comparison.
+      # current-main needs an editable install: hermes-agent's build backend
+      # refuses wheel/sdist builds by design (shell installer / Docker / Nix
+      # only) and directs dev installs to `uv pip install -e`.
+      - name: Install Hermes (${{ matrix.name }})
+        run: |
+          uv venv /tmp/hermes-agent-venv
+          if [ "${{ matrix.name }}" = "current-main" ]; then
+            git clone --depth 1 https://github.com/NousResearch/hermes-agent.git /tmp/hermes-agent-src
+            uv pip install --python /tmp/hermes-agent-venv/bin/python -e /tmp/hermes-agent-src
+          else
+            uv pip install --python /tmp/hermes-agent-venv/bin/python "${{ matrix.hermes_spec }}"
+          fi
+      # HERMES_AGENT_DIR must point at the installed hermes tree so
+      # packages/hermes-plugin/tests/test_stock_hermes_unchanged.py RUNS
+      # (it skips when the tree is absent) — dirname(dirname(hermes_cli
+      # .__file__)) is site-packages for the wheel cell and the source
+      # checkout for the editable cell.
+      - name: Locate Hermes install
+        id: hermes-dir
+        run: |
+          hermes_dir="$(/tmp/hermes-agent-venv/bin/python -c 'import hermes_cli, os; print(os.path.dirname(os.path.dirname(hermes_cli.__file__)))')"
+          echo "dir=$hermes_dir" >> "$GITHUB_OUTPUT"
+      - name: Verify plugin entry-point group
+        run: /tmp/hermes-agent-venv/bin/python -c "from hermes_cli.plugins import ENTRY_POINTS_GROUP; assert ENTRY_POINTS_GROUP=='hermes_agent.plugins', ENTRY_POINTS_GROUP"
+      - name: Run hermes-plugin tests against installed Hermes
+        env:
+          HERMES_AGENT_DIR: ${{ steps.hermes-dir.outputs.dir }}
+        run: uv run --group dev pytest packages/hermes-plugin/tests -q

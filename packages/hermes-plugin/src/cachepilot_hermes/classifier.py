@@ -31,10 +31,10 @@ from typing import Any, Literal
 from cachepilot_hermes.config import CachePilotConfig
 from cachepilot_hermes.duration_history import CommandDurationStats
 
-FOREGROUND = "foreground"
-LONG_RUNNING = "long_running"
-
 Decision = Literal["foreground", "long_running"]
+
+FOREGROUND: Decision = "foreground"
+LONG_RUNNING: Decision = "long_running"
 
 # A single observation is noise; require at least two historical samples
 # before learned durations may promote a command (PRD §43).

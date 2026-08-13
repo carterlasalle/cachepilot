@@ -224,6 +224,7 @@ async def _scenario_sse() -> None:
         assert harness.upstream is not None and harness.relay is not None
 
         async def collect(base_url: str) -> tuple[httpx.Response, list[bytes]]:
+            assert harness.client is not None
             chunks: list[bytes] = []
             async with harness.client.stream("POST", base_url + "/v1/chat/completions", json=payload) as response:
                 assert response.status_code == 200
