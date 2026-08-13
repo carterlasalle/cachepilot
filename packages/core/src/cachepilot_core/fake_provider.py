@@ -49,6 +49,10 @@ class FakeProviderConfig(BaseModel):
 
     provider: str = "fake-provider"
     route: str = "fake-route-1"
+    #: Deployment identity echoed as ``x-served-by`` (PRD §71 deployment
+    #: field) — lets tests simulate OpenRouter-style route switches by
+    #: changing it between requests.
+    deployment: str = "edge-fake-1"
     ttl_s: float = Field(default=300.0, gt=0, description="Simulated cache TTL in seconds.")
     prefix_tokens: int = Field(default=4000, ge=1, description="Simulated prefix size.")
     latency_base_ms: float = Field(default=100.0, ge=0)
@@ -71,6 +75,7 @@ class FakeProviderResult(BaseModel):
     usage: TokenUsage
     latency_ms: float
     route: str
+    deployment: str
     cache_hit: bool
     expires_at: datetime | None
 
@@ -135,6 +140,7 @@ class FakeProvider:
             usage=usage,
             latency_ms=latency_ms,
             route=self.config.route,
+            deployment=self.config.deployment,
             cache_hit=hit,
             expires_at=expires_at,
         )
@@ -196,6 +202,10 @@ def provider_result_to_http_response(result: FakeProviderResult) -> httpx.Respon
         "x-cachepilot-route": result.route,
         "x-cachepilot-latency-ms": f"{result.latency_ms:.3f}",
         "x-cachepilot-cache-fingerprint": result.cache_fingerprint,
+        # PRD §71 route identity the relay's observation layer reads:
+        # upstream provider label + deployment host (OpenRouter-style).
+        "x-provider": result.provider,
+        "x-served-by": result.deployment,
     }
     return httpx.Response(
         200,

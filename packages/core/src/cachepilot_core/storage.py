@@ -33,6 +33,11 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict
 
 from cachepilot_core.leases import CacheLease
+from cachepilot_core.route_intel import (
+    RouteChangeEvent,
+    RouteIntelStats,
+    RouteMissVerdict,
+)
 from cachepilot_core.telemetry import (
     CacheHealthStats,
     ChurnEvent,
@@ -174,6 +179,24 @@ CREATE TABLE IF NOT EXISTS ttl_observations (
 );
 CREATE INDEX IF NOT EXISTS idx_ttl_observations_cache_fp
     ON ttl_observations(cache_fingerprint, timestamp);
+
+CREATE TABLE IF NOT EXISTS route_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    session_hash TEXT,
+    cache_fingerprint TEXT NOT NULL,
+    request_fingerprint TEXT,
+    previous_route_hash TEXT,
+    new_route_hash TEXT,
+    gateway TEXT,
+    upstream_provider TEXT,
+    endpoint TEXT,
+    region TEXT,
+    deployment TEXT,
+    verdict TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_route_events_timestamp ON route_events(timestamp);
+CREATE INDEX IF NOT EXISTS idx_route_events_session ON route_events(session_hash);
 """
 
 
@@ -389,6 +412,23 @@ _TTL_OBSERVATION_COLUMNS = (
     "clean",
 )
 
+#: ``route_events`` columns in row order (P09, PRD §72.1/§75).
+_ROUTE_EVENT_COLUMNS = (
+    "id",
+    "timestamp",
+    "session_hash",
+    "cache_fingerprint",
+    "request_fingerprint",
+    "previous_route_hash",
+    "new_route_hash",
+    "gateway",
+    "upstream_provider",
+    "endpoint",
+    "region",
+    "deployment",
+    "verdict",
+)
+
 
 def _row_to_profile(row: tuple[Any, ...]) -> TTLProfile:
     return TTLProfile(
@@ -417,6 +457,24 @@ def _row_to_ttl_observation(row: tuple[Any, ...]) -> StoredTTLObservation:
         idle_age_s=row[4],
         outcome=Outcome(row[5]),
         clean=bool(row[6]),
+    )
+
+
+def _row_to_route_event(row: tuple[Any, ...]) -> RouteChangeEvent:
+    return RouteChangeEvent(
+        id=row[0],
+        timestamp=datetime.fromisoformat(row[1]),
+        session_hash=row[2],
+        cache_fingerprint=row[3],
+        request_fingerprint=row[4],
+        previous_route_hash=row[5],
+        new_route_hash=row[6],
+        gateway=row[7],
+        upstream_provider=row[8],
+        endpoint=row[9],
+        region=row[10],
+        deployment=row[11],
+        verdict=RouteMissVerdict(row[12]),
     )
 
 
@@ -903,6 +961,110 @@ class TelemetryStore:
                 ),
             ).fetchone()
         return row is not None
+
+    # -- route intelligence (P09: PRD §71-72, §75, UC-5) ---------------------
+
+    def record_route_event(self, event: RouteChangeEvent) -> int:
+        """Insert one route-change event (PRD §72.1, §75); returns its row id.
+
+        Only route identities (whitelisted by AGENTS.md invariant 10),
+        hashes, timestamps and the verdict are stored — never prompts or
+        auth material.
+        """
+        with self._lock:
+            cur = self._require_conn().execute(
+                """
+                INSERT INTO route_events
+                    (timestamp, session_hash, cache_fingerprint,
+                     request_fingerprint, previous_route_hash, new_route_hash,
+                     gateway, upstream_provider, endpoint, region, deployment,
+                     verdict)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event.timestamp.astimezone(UTC).isoformat(timespec="seconds"),
+                    event.session_hash,
+                    event.cache_fingerprint,
+                    event.request_fingerprint,
+                    event.previous_route_hash,
+                    event.new_route_hash,
+                    event.gateway,
+                    event.upstream_provider,
+                    event.endpoint,
+                    event.region,
+                    event.deployment,
+                    event.verdict.value,
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+    def recent_route_events(self, limit: int = 100) -> list[RouteChangeEvent]:
+        """Most recent route-change events, newest first (PRD §76
+        ``cachepilot routes``)."""
+        with self._lock:
+            rows = self._require_conn().execute(
+                f"SELECT {', '.join(_ROUTE_EVENT_COLUMNS)} FROM route_events "
+                "ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [_row_to_route_event(row) for row in rows]
+
+    def last_route_event_for_session(
+        self,
+        session_hash: str,
+        *,
+        since: float | None = None,
+    ) -> RouteChangeEvent | None:
+        """Newest route event for one session, optionally only events recorded
+        after ``since`` (epoch seconds — the lease's current request start).
+
+        The relay controller uses ``since`` to only see the instability event
+        recorded DURING the current request, never a stale one from an
+        earlier request (the affinity must react to fresh evidence only).
+        """
+        if since is not None:
+            since_iso = datetime.fromtimestamp(since, tz=UTC).isoformat(
+                timespec="seconds"
+            )
+            sql = (
+                f"SELECT {', '.join(_ROUTE_EVENT_COLUMNS)} FROM route_events "
+                "WHERE session_hash = ? AND timestamp >= ? ORDER BY id DESC LIMIT 1"
+            )
+            params: tuple[Any, ...] = (session_hash, since_iso)
+        else:
+            sql = (
+                f"SELECT {', '.join(_ROUTE_EVENT_COLUMNS)} FROM route_events "
+                "WHERE session_hash = ? ORDER BY id DESC LIMIT 1"
+            )
+            params = (session_hash,)
+        with self._lock:
+            row = self._require_conn().execute(sql, params).fetchone()
+        return _row_to_route_event(row) if row is not None else None
+
+    def route_intel_stats(self) -> RouteIntelStats:
+        """Route-switch and instability aggregates (PRD §76 ``cachepilot routes``)."""
+        with self._lock:
+            conn = self._require_conn()
+            switches = conn.execute("SELECT COUNT(*) FROM route_events").fetchone()[0]
+            instability = conn.execute(
+                "SELECT COUNT(*) FROM route_events WHERE verdict = ?",
+                (RouteMissVerdict.ROUTE_INSTABILITY.value,),
+            ).fetchone()[0]
+            short_ttl = conn.execute(
+                "SELECT COUNT(*) FROM route_events WHERE verdict = ?",
+                (RouteMissVerdict.SHORT_TTL.value,),
+            ).fetchone()[0]
+            last = conn.execute(
+                "SELECT timestamp FROM route_events ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        return RouteIntelStats(
+            route_switches=switches,
+            instability_verdicts=instability,
+            short_ttl_verdicts=short_ttl,
+            last_switch_at=(
+                datetime.fromisoformat(last[0]) if last is not None else None
+            ),
+        )
 
     # -- internals ----------------------------------------------------------
 

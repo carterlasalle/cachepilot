@@ -16,6 +16,11 @@ Subcommands:
   §76, §82) — estimated TTL, lower/upper bounds, confidence, sample count
   per route (provider/model/api_mode/endpoint_hash/route_hash). Empty
   databases say "no TTL profiles yet" — never fabricated profiles.
+- ``routes``: observed route identities (gateway/upstream/endpoint/region/
+  deployment where observable, PRD §71) with instability stats (route
+  switch count, last switch time, instability verdicts count) from the
+  ``route_events`` table (PRD §72.1, UC-5). Empty databases say "no
+  observed route changes yet" — never fabricated routes.
 
 The telemetry database comes from ``--db``, else ``CACHEPILOT_TELEMETRY_DB``,
 else ``~/.hermes/cachepilot/cachepilot.db`` (PRD §81).
@@ -94,6 +99,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="route-keyed learned TTL profiles from the telemetry store (PRD §76, §82)",
     )
     ttl_parser.set_defaults(handler=cmd_ttl)
+
+    routes_parser = sub.add_parser(
+        "routes",
+        parents=[db_flag],
+        help="observed route identities and instability stats (PRD §71, §76, UC-5)",
+    )
+    routes_parser.set_defaults(handler=cmd_routes)
 
     args = parser.parse_args(argv)
     return int(args.handler(args))
@@ -291,3 +303,44 @@ def _short_hash(value: str | None) -> str:
 def _ttl_value(value: float | None) -> str:
     """Display a TTL bound; unknown stays unknown (PRD §59)."""
     return "unknown" if value is None else f"{value:.0f}s"
+
+
+# -- routes (P09, PRD §71, §76, UC-5) ----------------------------------------
+
+
+def cmd_routes(args: argparse.Namespace) -> int:
+    """Observed route identities + instability stats (PRD §71, §76, UC-5).
+
+    Rows are whatever the relay's route intelligence actually recorded —
+    never fabricated. Route identities show only the observable fields
+    (gateway / upstream / endpoint / region / deployment); an empty
+    database says so.
+    """
+    store = TelemetryStore(args.db)
+    try:
+        events = store.recent_route_events(limit=100)
+        stats = store.route_intel_stats()
+    finally:
+        store.close()
+    if not events:
+        print("no observed route changes yet (route intelligence records switches between repeated logical requests)")
+        return 0
+    print("Observed routes (PRD §71 identity, UC-5 instability)")
+    print()
+    for event in events:
+        when = event.timestamp.strftime("%Y-%m-%d %H:%M:%S")
+        print(f"{when} UTC  verdict={event.verdict.value}")
+        print(f"  route      {_short_hash(event.previous_route_hash)} -> {_short_hash(event.new_route_hash)}")
+        print(f"  gateway    {event.gateway or 'n/a'}")
+        print(f"  upstream   {event.upstream_provider or 'n/a'}")
+        print(f"  endpoint   {event.endpoint or 'n/a'}")
+        print(f"  region     {event.region or 'n/a'}")
+        print(f"  deployment {event.deployment or 'n/a'}")
+    print()
+    print(f"route switches        {stats.route_switches}")
+    if stats.last_switch_at is not None:
+        last = stats.last_switch_at.strftime("%Y-%m-%d %H:%M:%S")
+        print(f"last switch           {last} UTC")
+    print(f"instability verdicts  {stats.instability_verdicts}")
+    print(f"short-TTL verdicts    {stats.short_ttl_verdicts}")
+    return 0

@@ -22,11 +22,13 @@ a warning and never breaks forwarding (AGENTS.md invariant 9).
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Mapping
 
 import httpx
-from cachepilot_core.adapters import OpenAICompatibleAdapter
+from cachepilot_core.adapters import CacheProviderAdapter, OpenAICompatibleAdapter
+from cachepilot_core.route_affinity import AffinityConfig
 from cachepilot_core.snapshots import SnapshotStore
 from cachepilot_core.telemetry import Outcome
 from cachepilot_core.usage import TokenUsage
@@ -102,13 +104,27 @@ def should_stream(upstream: httpx.Response) -> bool:
 class RelayProxy:
     """Forward one incoming request to the upstream, verbatim + observed."""
 
-    def __init__(self, config: RelayConfig, client: httpx.AsyncClient) -> None:
+    def __init__(
+        self,
+        config: RelayConfig,
+        client: httpx.AsyncClient,
+        *,
+        adapter: CacheProviderAdapter | None = None,
+        lease_controller: LeaseController | None = None,
+    ) -> None:
         self.config = config
         self._client = client
+        #: The provider adapter (PRD §34) powers warm-building, route
+        #: affinity application (``can_pin_route`` / ``apply_route_affinity``)
+        #: and outcome classification. Injectable for tests; the generic
+        #: OpenAI-compatible adapter reports no pinning capability, so route
+        #: affinity never activates without a capable adapter.
+        self._adapter = adapter or OpenAICompatibleAdapter()
         self.observer = (
             RequestObserver(
                 db_path=config.telemetry_db_path,
                 enabled=config.observation_enabled,
+                route_intel_enabled=config.route_intel_enabled,
             )
             if config.observation_enabled
             else None
@@ -117,28 +133,32 @@ class RelayProxy:
         # store and turns the observed request + X-CachePilot-Targets header
         # into lease lifecycle events (PRD §132, §148). Phase 6 adds the
         # memory-only snapshot store (PRD §30) and the HTTP warm executor
-        # (transport + OpenAI-compatible adapter, PRD §147) — warm requests
-        # are sent DIRECTLY to the upstream and never re-enter this proxy's
-        # forwarding/observation path. Fail-open: a controller problem never
+        # (transport + adapter, PRD §147) — warm requests are sent DIRECTLY
+        # to the upstream and never re-enter this proxy's
+        # forwarding/observation path. Phase 9 adds the economic route
+        # affinity wiring (PRD §73-74). Fail-open: a controller problem never
         # breaks forwarding (AGENTS.md invariant 9).
-        self.lease_controller = (
-            LeaseController(
+        self.lease_controller = lease_controller
+        if self.lease_controller is None and config.observation_enabled:
+            self.lease_controller = LeaseController(
                 settings=config.lease_settings,
                 store=self.observer.store if self.observer is not None else None,
                 enabled=config.observation_enabled,
                 snapshot_store=SnapshotStore(),
                 warm_executor=HttpWarmExecutor(
                     self._client,
-                    OpenAICompatibleAdapter(),
+                    self._adapter,
                     # P07: the warm's cost is estimated from the configured
                     # pricing snapshot (PRD §65 priority 2) so warm costs are
                     # visible (invariant 4) and the economic gate sees them.
                     pricing=config.lease_settings.pricing,
                 ),
+                affinity_config=AffinityConfig(
+                    enabled=config.route_affinity_enabled,
+                    safety_margin=config.route_affinity_safety_margin_usd,
+                ),
+                affinity_extra_cost_usd=config.route_affinity_extra_cost_usd,
             )
-            if config.observation_enabled
-            else None
-        )
 
     def close(self) -> None:
         """Release the telemetry store (safe when observation is disabled)."""
@@ -168,14 +188,18 @@ class RelayProxy:
         # for the fingerprints (observation is read-only over the bytes).
         body = await request.body()
         lease_ctx = self._lease_start(request, url, body)
+        # P09 (PRD §72.4, §73-74): when the lease holds an active, economic
+        # route affinity and the adapter can pin, the forwarded body carries
+        # the pin. Fail-open: any affinity error leaves the body verbatim.
+        forward_body = self._apply_affinity(request, body, lease_ctx)
         upstream_request = self._client.build_request(
-            request.method, url, headers=headers, content=body
+            request.method, url, headers=headers, content=forward_body
         )
         try:
             upstream = await self._client.send(upstream_request, stream=True)
         except httpx.HTTPError as exc:
             logger.warning("upstream request failed for %s %s: %s", request.method, url, exc)
-            outcome = self._observe_failure(request, url, body)
+            outcome = self._observe_failure(request, url, forward_body)
             # §148: a failed call must never be treated as a cache refresh.
             self._lease_end(lease_ctx, outcome or Outcome.FAILED)
             return Response(b"", status_code=502)
@@ -183,7 +207,7 @@ class RelayProxy:
         # aiter_raw() keeps the body byte-exact (no transparent decompression).
         if should_stream(upstream):
             response_headers.pop("content-length", None)
-            outcome = self._observe_streaming(request, url, body, upstream)
+            outcome = self._observe_streaming(request, url, forward_body, upstream)
             self._lease_end(
                 lease_ctx,
                 outcome or Outcome.SUCCESS_UNVERIFIED,
@@ -195,7 +219,7 @@ class RelayProxy:
                 headers=response_headers,
             )
         response_body = b"".join([chunk async for chunk in upstream.aiter_raw()])
-        outcome, usage = self._observe_bounded(request, url, body, response_body, upstream)
+        outcome, usage = self._observe_bounded(request, url, forward_body, response_body, upstream)
         self._lease_end(
             lease_ctx,
             outcome or Outcome.SUCCESS_UNVERIFIED,
@@ -233,6 +257,45 @@ class RelayProxy:
         if ctx is None or self.lease_controller is None:
             return
         self.lease_controller.on_request_end(ctx, outcome, usage=usage, route_hash=route_hash)
+
+    # -- route affinity (P09: PRD §72.4, §73-74; fail open) ------------------
+
+    def _apply_affinity(self, request: Request, body: bytes, lease_ctx) -> bytes:
+        """Apply an active economic route affinity to the forwarded body.
+
+        Only when affinity is enabled, the adapter reports ``can_pin_route()``
+        and the lease's registry holds an unexpired, generation-valid pin.
+        The adapter's :meth:`apply_route_affinity` returns the modified
+        :class:`~cachepilot_core.adapters.PhysicalRequest` (or the same object
+        when the user's global routing must not be overwritten — PRD §74).
+        Fail-open: any error returns the body verbatim (AGENTS.md invariant 9).
+        """
+        if (
+            lease_ctx is None
+            or self.lease_controller is None
+            or not self.config.route_affinity_enabled
+        ):
+            return body
+        if not self._adapter.can_pin_route():
+            return body
+        try:
+            route = self.lease_controller.active_affinity_route(lease_ctx.lease_id)
+        except Exception:
+            logger.warning("route affinity lookup failed (traffic unaffected)", exc_info=True)
+            return body
+        if route is None:
+            return body
+        try:
+            parsed = json.loads(body) if body else None
+            if not isinstance(parsed, dict):
+                return body
+            modified = self._adapter.apply_route_affinity(parsed, route)
+            if modified is parsed:
+                return body
+            return json.dumps(modified, separators=(",", ":")).encode("utf-8")
+        except Exception:
+            logger.warning("route affinity application failed (traffic unaffected)", exc_info=True)
+            return body
 
     # -- observation (fail open: never breaks forwarding) -------------------
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
+from decimal import Decimal
 from typing import Self
 from urllib.parse import urlsplit
 
@@ -27,6 +28,13 @@ ENV_UPSTREAM = "CACHEPILOT_UPSTREAM"
 ENV_ALLOW_EXTERNAL_BIND = "CACHEPILOT_RELAY_ALLOW_EXTERNAL_BIND"
 ENV_TELEMETRY_DB = "CACHEPILOT_TELEMETRY_DB"
 ENV_OBSERVATION_ENABLED = "CACHEPILOT_RELAY_OBSERVATION_ENABLED"
+#: P09 (PRD §71-72, UC-5): router-miss analysis master switch (default on).
+ENV_ROUTE_INTEL = "CACHEPILOT_ROUTE_INTEL"
+#: P09 (PRD §73-74): economic route affinity master switch — OPTIONAL,
+#: never on by default.
+ENV_ROUTE_AFFINITY = "CACHEPILOT_ROUTE_AFFINITY"
+ENV_ROUTE_AFFINITY_EXTRA_COST = "CACHEPILOT_ROUTE_AFFINITY_EXTRA_COST_USD"
+ENV_ROUTE_AFFINITY_MARGIN = "CACHEPILOT_ROUTE_AFFINITY_SAFETY_MARGIN_USD"
 
 #: Wildcard bind hosts refused without an explicit override (PRD §26).
 WILDCARD_HOSTS = frozenset({"0.0.0.0", "::"})
@@ -76,6 +84,20 @@ class RelayConfig(BaseModel):
     allow_external_bind: bool = False
     telemetry_db_path: str | None = None
     observation_enabled: bool = True
+    #: P09 (PRD §71-72, UC-5): router-miss analysis. When False the observer
+    #: neither classifies misses after route changes nor records route
+    #: events (``CACHEPILOT_ROUTE_INTEL``, default true).
+    route_intel_enabled: bool = True
+    #: P09 (PRD §73-74): economic route affinity. OPTIONAL and never on by
+    #: default (``CACHEPILOT_ROUTE_AFFINITY``); even when enabled, affinity
+    #: is only applied when the provider adapter reports ``can_pin_route()``
+    #: and the PRD §73 economic gate approves.
+    route_affinity_enabled: bool = False
+    #: Per-request premium of pinning to the previous route (PRD §73 "extra
+    #: route cost"), compared against the expected cache recompute savings.
+    route_affinity_extra_cost_usd: Decimal = Field(default=Decimal("0.0"), ge=0)
+    #: Extra margin on top of the strict savings > cost comparison (PRD §73).
+    route_affinity_safety_margin_usd: Decimal = Field(default=Decimal("0.0"), ge=0)
     #: Lease scheduling settings (PRD §53-54, §84 cache.scheduling; Phase 5
     #: dry-run defaults). Read from ``CACHEPILOT_LEASE_*`` by
     #: :meth:`LeaseSettings.from_env`.
@@ -131,9 +153,28 @@ class RelayConfig(BaseModel):
             allow_external_bind=allow_external_bind,
             telemetry_db_path=env.get(ENV_TELEMETRY_DB) or str(default_db_path()),
             observation_enabled=_env_flag(env.get(ENV_OBSERVATION_ENABLED, "true")),
+            route_intel_enabled=_env_flag(env.get(ENV_ROUTE_INTEL, "true")),
+            route_affinity_enabled=_env_flag(env.get(ENV_ROUTE_AFFINITY)),
+            route_affinity_extra_cost_usd=_env_decimal(
+                env.get(ENV_ROUTE_AFFINITY_EXTRA_COST), Decimal("0.0")
+            ),
+            route_affinity_safety_margin_usd=_env_decimal(
+                env.get(ENV_ROUTE_AFFINITY_MARGIN), Decimal("0.0")
+            ),
             lease_settings=LeaseSettings.from_env(env),
         )
 
 
 def _env_flag(raw: str | None) -> bool:
     return raw is not None and raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_decimal(raw: str | None, default: Decimal) -> Decimal:
+    """Parse a non-negative decimal env var; malformed values fall back to
+    the default so a bad variable can never break the relay (fail open)."""
+    if raw is None:
+        return default
+    try:
+        return max(Decimal(raw.strip()), Decimal(0))
+    except (TypeError, ValueError, ArithmeticError):
+        return default

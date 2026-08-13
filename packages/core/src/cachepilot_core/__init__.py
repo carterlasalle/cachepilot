@@ -35,6 +35,19 @@ from cachepilot_core.pricing import (
     estimate_cost,
     estimate_resume_costs,
 )
+from cachepilot_core.route_affinity import (
+    AffinityConfig,
+    AffinityDecision,
+    RouteAffinityPolicy,
+    RouteAffinityRegistry,
+)
+from cachepilot_core.route_intel import (
+    RouteChangeEvent,
+    RouteIdentity,
+    RouteIntelStats,
+    RouteMissVerdict,
+    RouterMissClassifier,
+)
 from cachepilot_core.snapshots import RequestSnapshot, SnapshotStore
 from cachepilot_core.storage import (
     ENV_TELEMETRY_DB,
@@ -58,6 +71,8 @@ __version__ = "0.1.0"
 __all__ = [
     "CACHE_IDENTITY_FIELDS",
     "ENV_TELEMETRY_DB",
+    "AffinityConfig",
+    "AffinityDecision",
     "ApiMode",
     "CacheCapabilities",
     "CacheHealthStats",
@@ -77,6 +92,13 @@ __all__ = [
     "Outcome",
     "PricingTable",
     "RequestSnapshot",
+    "RouteAffinityPolicy",
+    "RouteAffinityRegistry",
+    "RouteChangeEvent",
+    "RouteIdentity",
+    "RouteIntelStats",
+    "RouteMissVerdict",
+    "RouterMissClassifier",
     "SnapshotStore",
     "StoredRequestEvent",
     "TTLHint",

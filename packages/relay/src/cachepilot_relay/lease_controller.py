@@ -30,15 +30,24 @@ are memory-only (they die with the relay — leases become non-warmable, PRD
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from decimal import Decimal
 
 from cachepilot_core.adapters import WarmExecutor
 from cachepilot_core.fingerprint import cache_fingerprint, request_fingerprint
 from cachepilot_core.leases import CacheLease, LeaseDecision, LeaseManager, LeaseSettings
+from cachepilot_core.pricing import estimate_resume_costs
+from cachepilot_core.route_affinity import (
+    AffinityConfig,
+    RouteAffinityPolicy,
+    RouteAffinityRegistry,
+)
+from cachepilot_core.route_intel import RouteMissVerdict
 from cachepilot_core.snapshots import RequestSnapshot, SnapshotStore
 from cachepilot_core.storage import TelemetryStore
 from cachepilot_core.telemetry import Outcome
@@ -89,6 +98,9 @@ class LeaseController:
         enabled: bool = True,
         snapshot_store: SnapshotStore | None = None,
         warm_executor: WarmExecutor | None = None,
+        affinity_config: AffinityConfig | None = None,
+        affinity_extra_cost_usd: Decimal | float = Decimal("0.0"),
+        affinity_registry: RouteAffinityRegistry | None = None,
     ) -> None:
         self.settings = settings or LeaseSettings()
         #: Memory-only request snapshots (PRD §30). A controller constructed
@@ -120,12 +132,43 @@ class LeaseController:
             ttl_resolver=self.ttl_resolver,
         )
         self.enabled = enabled
+        #: P09 (PRD §73-74): economic route affinity. The registry is
+        #: memory-only and the policy gate is fail-open — an affinity error
+        #: never blocks the normal request path (AGENTS.md invariant 9).
+        self.affinity_config = affinity_config or AffinityConfig()
+        self.affinity_extra_cost_usd = (
+            affinity_extra_cost_usd
+            if isinstance(affinity_extra_cost_usd, Decimal)
+            else Decimal(str(affinity_extra_cost_usd))
+        )
+        self.affinity_registry = affinity_registry or RouteAffinityRegistry()
+        self.affinity_policy = RouteAffinityPolicy(self.affinity_config)
         #: Synthetic target ids per lease, reconciling the plugin's per-session
         #: COUNT header with the manager's per-target-id API (PRD §149).
         self._target_ids: dict[str, set[str]] = {}
         self._scheduler_task: asyncio.Task[None] | None = None
 
     # -- request wiring (PRD §148) ------------------------------------------
+
+    def active_affinity_route(self, lease_id: str) -> str | None:
+        """PRD §73-74: the economically-pinned route for this lease's request.
+
+        None unless affinity is enabled, the lease still exists and the
+        registry holds an unexpired, generation-valid entry. Fail-open: a
+        registry error logs and returns None — traffic is never blocked.
+        """
+        if not self.affinity_config.enabled:
+            return None
+        lease = self.manager.get(lease_id)
+        if lease is None:
+            return None
+        try:
+            return self.affinity_registry.active_route_for(
+                lease_id, generation=lease.generation
+            )
+        except Exception:
+            logger.warning("route affinity lookup failed (traffic unaffected)", exc_info=True)
+            return None
 
     def on_request_start(
         self,
@@ -225,6 +268,11 @@ class LeaseController:
                 self._persist(lease)
                 if outcome is Outcome.FAILED and self.snapshot_store is not None:
                     self.snapshot_store.drop(lease.cache_fingerprint)
+                # P09 (PRD §73-74): keep affinity reversible (cleared on
+                # FAILED / generation advance / lease end), then set a fresh
+                # pin when the just-recorded router-miss event says
+                # instability AND the economic gate approves.
+                self._reconcile_affinity(ctx.lease_id, lease, outcome)
         except Exception:
             logger.warning("lease request completion failed (traffic unaffected)", exc_info=True)
 
@@ -304,6 +352,111 @@ class LeaseController:
             for lease_id, targets in self._target_ids.items()
             if lease_id in self.manager.lease_ids
         }
+        # P09 (PRD §74): affinity is lease-scoped — entries for leases that
+        # no longer exist are dropped (lease end ⇒ reversible).
+        self.affinity_registry.prune(self.manager.lease_ids)
+
+    # -- route affinity (P09: PRD §72.4, §73-74) -----------------------------
+
+    def _reconcile_affinity(
+        self, lease_id: str, lease: CacheLease, outcome: Outcome
+    ) -> None:
+        """Keep affinity reversible, then set a fresh pin when warranted.
+
+        Clearing (PRD §74 reversible): a FAILED call never refreshes the
+        cache (pinning is pointless), and an entry created by an EARLIER
+        request whose generation has since advanced was consumed by the
+        current request — both clear it. Setting only happens when the
+        just-recorded route event for this request verdicts
+        ROUTE_INSTABILITY and the PRD §73 economic gate approves.
+        Fail-open: an affinity error never breaks traffic.
+        """
+        if not self.affinity_config.enabled or self.store is None:
+            return
+        try:
+            if outcome is Outcome.FAILED:
+                self.affinity_registry.clear(lease_id)
+                return
+            entry_generation = self.affinity_registry.generation_for(lease_id)
+            if entry_generation is not None and entry_generation < lease.generation:
+                self.affinity_registry.clear(lease_id)
+            self._maybe_set_affinity(lease)
+        except Exception:
+            logger.warning("route affinity reconcile failed (traffic unaffected)", exc_info=True)
+
+    def _maybe_set_affinity(self, lease: CacheLease) -> None:
+        """Set a lease-scoped, temporary affinity to the PREVIOUS route.
+
+        Triggers only on a ROUTE_INSTABILITY event recorded DURING the
+        current request (fresh evidence — ``since`` guards against stale
+        events from earlier requests). The pin is temporary (expires at the
+        lease's TTL window) and consumed by the next request's generation
+        advance. Unknown pricing never claims savings (invariant 4).
+        """
+        if self.store is None:
+            return
+        session_hash = hashlib.sha256(lease.session_id.encode("utf-8")).hexdigest()
+        event = self.store.last_route_event_for_session(
+            session_hash, since=lease.last_real_request_at
+        )
+        if event is None or event.verdict is not RouteMissVerdict.ROUTE_INSTABILITY:
+            return
+        if not event.previous_route_hash or not event.new_route_hash:
+            return
+        savings = self._affinity_savings(lease)
+        if savings is None:
+            logger.debug(
+                "route affinity skipped for lease %s: pricing unknown (never claim savings)",
+                lease.lease_id,
+            )
+            return
+        decision = self.affinity_policy.evaluate(
+            cache_recompute_savings=savings,
+            extra_route_cost=self.affinity_extra_cost_usd,
+            resume_probability=self.settings.resume_probability,
+        )
+        if not decision.apply:
+            logger.debug(
+                "route affinity refused for lease %s: %s (savings=%s cost=%s)",
+                lease.lease_id,
+                decision.reason,
+                decision.expected_savings,
+                decision.extra_route_cost,
+            )
+            return
+        expires_at = time.time() + max(lease.estimated_ttl_s, 0.0)
+        self.affinity_registry.set(
+            lease_id=lease.lease_id,
+            route=event.previous_route_hash,
+            expires_at=expires_at,
+            generation=lease.generation,
+        )
+        logger.info(
+            "route affinity set for lease %s: pin to %s (savings %s > cost %s)",
+            lease.lease_id,
+            event.previous_route_hash[:12],
+            decision.expected_savings,
+            decision.extra_route_cost,
+        )
+
+    def _affinity_savings(self, lease: CacheLease) -> Decimal | None:
+        """Expected cache recompute savings (PRD §73): the avoidable loss of
+        recomputing the prefix, from the lease's P07 cost estimates or the
+        configured pricing table. None when pricing is unknown.
+        """
+        if (
+            lease.estimated_cold_resume_cost_usd is not None
+            and lease.estimated_cached_resume_cost_usd is not None
+        ):
+            return Decimal(str(lease.estimated_cold_resume_cost_usd)) - Decimal(
+                str(lease.estimated_cached_resume_cost_usd)
+            )
+        if self.settings.pricing is not None and lease.prefix_tokens:
+            cold, cached = estimate_resume_costs(
+                lease.prefix_tokens, self.settings.pricing
+            )
+            return cold - cached
+        return None
 
     def _store_snapshot(
         self,

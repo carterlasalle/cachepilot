@@ -10,6 +10,7 @@ from decimal import Decimal
 import pytest
 from cachepilot_cli.main import main
 from cachepilot_core.leases import CacheLease, LeaseState
+from cachepilot_core.route_intel import RouteChangeEvent, RouteMissVerdict
 from cachepilot_core.storage import ENV_TELEMETRY_DB, TelemetryStore
 from cachepilot_core.telemetry import ChurnEvent, Outcome, TelemetryEvent
 from cachepilot_core.ttl import TTLProfile, endpoint_hash
@@ -320,3 +321,49 @@ def test_ttl_unknown_values_stay_unknown(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "unknown" in out  # never silently guess (PRD §59)
     assert "route         none" in out
+
+
+# -- routes (P09, PRD §71/§76, UC-5) ------------------------------------------
+
+
+def test_routes_empty_db_says_no_route_changes(tmp_path, capsys):
+    TelemetryStore(tmp_path / "telemetry.db").close()
+    assert main(["routes", "--db", str(tmp_path / "telemetry.db")]) == 0
+    out = capsys.readouterr().out
+    assert "no observed route changes yet" in out
+    assert "route switches" not in out  # no fabricated stats
+
+
+def test_routes_lists_observed_identities_and_instability_stats(tmp_path, capsys):
+    store = TelemetryStore(tmp_path / "telemetry.db")
+    store.record_route_event(
+        RouteChangeEvent(
+            timestamp=datetime(2026, 8, 13, 12, 3, 0, tzinfo=UTC),
+            session_hash="s1",
+            cache_fingerprint="fp-1",
+            request_fingerprint="req-1",
+            previous_route_hash="route-aaaa",
+            new_route_hash="route-bbbb",
+            gateway="openrouter",
+            upstream_provider="provider-x",
+            endpoint="https://openrouter.ai/api/v1",
+            region="us-west",
+            deployment="edge-x",
+            verdict=RouteMissVerdict.ROUTE_INSTABILITY,
+        )
+    )
+    store.close()
+    assert main(["routes", "--db", str(tmp_path / "telemetry.db")]) == 0
+    out = capsys.readouterr().out
+    assert "Observed routes (PRD §71 identity, UC-5 instability)" in out
+    assert "verdict=route_instability" in out
+    assert "gateway    openrouter" in out
+    assert "upstream   provider-x" in out
+    assert "endpoint   https://openrouter.ai/api/v1" in out
+    assert "region     us-west" in out
+    assert "deployment edge-x" in out
+    assert "route switches        1" in out
+    assert "last switch           2026-08-13 12:03:00 UTC" in out
+    assert "instability verdicts  1" in out
+    assert "short-TTL verdicts    0" in out
+    assert "route-aaaa" in out and "route-bbbb" in out  # short route hashes

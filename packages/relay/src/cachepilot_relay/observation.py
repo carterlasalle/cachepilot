@@ -16,7 +16,13 @@ The relay observes WITHOUT changing pass-through behaviour (Phase 3 gate):
 - P08 (PRD §55-56): every recorded outcome is fed to the TTL learner, which
   pairs consecutive same-fingerprint observations into idle ages and
   refines route-keyed TTL bounds (only CLEAN observations — stable cache
-  identity and route — are applied).
+  identity and route — are applied);
+- P09 (PRD §71-72, UC-5): route identity comes from the core
+  :class:`~cachepilot_core.route_intel.RouteIdentity` model, and a miss on
+  a repeated logical request whose physical route changed is classified
+  ROUTE_INSTABILITY (recorded in ``route_events``) instead of short-TTL
+  evidence — the learner's §56 clean-check keeps the instability miss out
+  of TTL refinement.
 
 Only hashes, timestamps, usage, prices, route identities and outcomes are
 persisted (AGENTS.md invariant 10, PRD §30, §83).
@@ -33,6 +39,11 @@ from typing import Any
 
 from cachepilot_core.fingerprint import cache_fingerprint, request_fingerprint
 from cachepilot_core.identity import ApiMode, CanonicalRequest, hash_content
+from cachepilot_core.route_intel import (
+    RouteChangeEvent,
+    RouteIdentity,
+    RouterMissClassifier,
+)
 from cachepilot_core.storage import TelemetryStore
 from cachepilot_core.telemetry import (
     ChurnEvent,
@@ -43,7 +54,6 @@ from cachepilot_core.telemetry import (
 )
 from cachepilot_core.ttl import TTLLearner, TTLObservation
 from cachepilot_core.usage import TokenUsage, UsageNormalizer
-from pydantic import BaseModel, ConfigDict
 
 logger = logging.getLogger("cachepilot_relay.observation")
 
@@ -89,29 +99,6 @@ def strip_correlation_headers(headers: dict[str, str]) -> None:
     for name in list(headers):
         if name.lower() in CORRELATION_HEADERS:
             del headers[name]
-
-
-class RouteIdentity(BaseModel):
-    """Cache route identity — PRD §71.
-
-    Only fields actually observable from the physical request/connection and
-    the response are populated; the rest stay None.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    gateway: str | None = None
-    upstream_provider: str | None = None
-    endpoint: str | None = None
-    region: str | None = None
-    deployment: str | None = None
-
-    def route_hash(self) -> str | None:
-        """Stable hash of the observable route identity; None when nothing is observable."""
-        if not any((self.gateway, self.upstream_provider, self.endpoint, self.region, self.deployment)):
-            return None
-        payload = json.dumps(self.model_dump(), sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def provider_from_upstream(url: str) -> str:
@@ -306,9 +293,15 @@ class RequestObserver:
         store: TelemetryStore | None = None,
         db_path: str | None = None,
         enabled: bool = True,
+        route_intel_enabled: bool = True,
     ) -> None:
         self.enabled = enabled
+        self.route_intel_enabled = route_intel_enabled
         self._normalizer = UsageNormalizer()
+        #: P09 (PRD UC-5): classifies a miss on a repeated logical request
+        #: after a route change as ROUTE_INSTABILITY (never short-TTL
+        #: evidence). Gated by ``CACHEPILOT_ROUTE_INTEL`` (default true).
+        self._classifier = RouterMissClassifier()
         self.store = store
         if self.store is None and enabled:
             # Fail open at construction too: an unusable telemetry path must
@@ -380,6 +373,7 @@ class RequestObserver:
             usage=usage,
             outcome=outcome,
             route_hash=route_hash,
+            route=route,
             session_header=session_header,
             history_hash=extract_history_hash(request_body),
         )
@@ -435,6 +429,7 @@ class RequestObserver:
             usage=TokenUsage(),
             outcome=Outcome.SUCCESS_UNVERIFIED,
             route_hash=route_hash,
+            route=route,
             session_header=session_header,
             history_hash=extract_history_hash(body),
         )
@@ -471,6 +466,7 @@ class RequestObserver:
             usage=TokenUsage(),
             outcome=Outcome.FAILED,
             route_hash=route_hash,
+            route=route,
             session_header=session_header,
             history_hash=extract_history_hash(body),
         )
@@ -485,6 +481,7 @@ class RequestObserver:
         usage: TokenUsage,
         outcome: Outcome,
         route_hash: str | None,
+        route: RouteIdentity | None,
         session_header: str | None,
         history_hash: str | None,
     ) -> None:
@@ -513,6 +510,11 @@ class RequestObserver:
         self.store.record_request(event)
         if previous is not None and previous.cache_fingerprint != event.cache_fingerprint:
             self._record_churn(previous, event)
+        # P09 (PRD §71-72, UC-5): classify a miss after a route change as
+        # route instability (never short-TTL evidence) and record the
+        # route-change event. The instability miss is still fed to the TTL
+        # learner, whose §56 clean-check guarantees it never refines bounds.
+        self._run_route_intel(previous, event, route)
         # P08: the learner pairs consecutive same-fingerprint observations
         # into idle ages and refines route TTL bounds (PRD §55-56). Best
         # effort — a learner error never breaks traffic (fail open).
@@ -523,6 +525,72 @@ class RequestObserver:
             route_hash=route_hash,
             timestamp=timestamp,
         )
+
+    def _run_route_intel(
+        self,
+        previous: Any,
+        event: TelemetryEvent,
+        route: RouteIdentity | None,
+    ) -> None:
+        """P09 (PRD §72.1, UC-5): record a route-change event and classify it.
+
+        Called for every recorded request whose route identity differs from
+        the session's previous observation. The verdict is ROUTE_INSTABILITY
+        when the same logical request (stable system/tools/history/model)
+        proved warm on the old route and missed after the switch — so the
+        miss is never misread as an extremely short TTL. TTL refinement is
+        protected structurally by the learner's §56 clean-check (a route
+        change never yields a CLEAN pair), so no extra gate is needed here.
+
+        Gated by ``CACHEPILOT_ROUTE_INTEL``; fail-open (a route-intel error
+        never breaks traffic — AGENTS.md invariant 9).
+        """
+        if not self.route_intel_enabled or self.store is None or previous is None:
+            return
+        if previous.route_hash == event.route_hash:
+            return  # no route change — nothing to record
+        try:
+            identity_stable = (
+                previous.system_hash == event.system_hash
+                and previous.tools_hash == event.tools_hash
+                and previous.history_hash == event.history_hash
+                and previous.model == event.model
+                and previous.provider == event.provider
+            )
+            verdict = self._classifier.classify(
+                previous_outcome=previous.outcome,
+                previous_route_hash=previous.route_hash,
+                current_outcome=event.outcome,
+                current_route_hash=event.route_hash,
+                identity_stable=identity_stable,
+            )
+            self.store.record_route_event(
+                RouteChangeEvent(
+                    timestamp=event.timestamp,
+                    session_hash=event.session_hash,
+                    cache_fingerprint=event.cache_fingerprint,
+                    request_fingerprint=event.request_fingerprint,
+                    previous_route_hash=previous.route_hash,
+                    new_route_hash=event.route_hash,
+                    gateway=route.gateway if route is not None else None,
+                    upstream_provider=(
+                        route.upstream_provider if route is not None else None
+                    ),
+                    endpoint=route.endpoint if route is not None else None,
+                    region=route.region if route is not None else None,
+                    deployment=route.deployment if route is not None else None,
+                    verdict=verdict,
+                )
+            )
+            logger.debug(
+                "route change observed: %s -> %s verdict=%s (session=%s)",
+                previous.route_hash,
+                event.route_hash,
+                verdict.value,
+                event.session_hash,
+            )
+        except Exception:
+            logger.warning("route-intel analysis failed (traffic unaffected)", exc_info=True)
 
     def _feed_ttl_learner(
         self,
