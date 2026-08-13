@@ -108,5 +108,7 @@ without waking the LLM unnecessarily.**
 - `docs/PRD.md` — the complete PRD/architecture/technical specification
 - `docs/architecture.md`, `docs/provider-adapters.md`,
   `docs/cache-economics.md`, `docs/threat-model.md`,
-  `docs/hermes-integration.md` — built per phase
+  `docs/hermes-integration.md` — current runbooks (updated per phase)
+- `CONTRIBUTING.md` — dev setup, quality gate, GitReins task lifecycle
+- `SECURITY.md` — vulnerability reporting + security posture
 - `AGENTS.md` — this file
