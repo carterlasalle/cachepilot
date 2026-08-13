@@ -95,20 +95,19 @@ install root (`site-packages`), and run `pytest packages/hermes-plugin/tests
 Each cell also asserts the plugin entry-point group is still
 `hermes_agent.plugins` (drift guard). The weekly scheduled run (Mon 03:00 UTC,
 `0 3 * * 1`) repeats the `current-main` cell to catch Hermes API drift
-between releases; the workflow is also `workflow_dispatch`-able. `current-main`
-runs on PRs / the cron / manual dispatch but not on push: an upstream
-hermes-main breakage must never block the push fast-gate (ci.yml +
-`latest-release` stay green), while the scheduled job still surfaces drift
-weekly.
+between releases; the workflow is also `workflow_dispatch`-able. The matrix
+runs both cells on push and PR.
 
 Hermes goes into a dedicated venv, not the project `.venv`: the stock-unchanged
 test snapshots the install tree, and its ignore list skips any path containing
 `.venv` — pointing `HERMES_AGENT_DIR` at the project venv's site-packages
-would produce an empty snapshot and fail the test outright. As of 2026-08-13
-the `current-main` cell's entry-point check is red upstream: hermes main's
-`hermes_cli/plugins.py` imports `registration_lifecycle`, a top-level module
-missing from its own `pyproject.toml` `py-modules` list — exactly the drift
-this job exists to surface.
+would produce an empty snapshot and fail the test outright. The `current-main`
+editable install must pass `--config-settings editable_mode=compat`: setuptools'
+default strict mode only exposes the `py-modules` declared in hermes main's
+pyproject, which omits the top-level `registration_lifecycle` module that
+`hermes_cli/plugins.py` imports — without compat mode the entry-point check
+fails with `ModuleNotFoundError: registration_lifecycle` (an install-mode
+artifact, not upstream drift).
 
 Notes:
 

@@ -53,12 +53,14 @@ jobs:
 
   current-main:
     name: Hermes current-main
-    # PRD §140 drift detector: runs on PRs, the weekly cron, and manual
-    # dispatch — NOT on push. An upstream hermes-main breakage (as of
-    # 2026-08-13: hermes_cli.plugins imports registration_lifecycle, missing
-    # from hermes main's own pyproject py-modules) must never block the push
-    # fast-gate; the scheduled run surfaces it weekly.
-    if: github.event_name != 'push'
+    # PRD §140 matrix cell — runs on push/PR alongside latest-release; the
+    # weekly cron (schedule) is the drift detector. Editable install uses
+    # setuptools editable_mode=compat: the default strict mode only exposes
+    # py-modules declared in hermes main's pyproject, hiding the top-level
+    # registration_lifecycle module that hermes_cli.plugins imports (the
+    # "ModuleNotFoundError: registration_lifecycle" seen on 2026-08-13 was
+    # an install-mode artifact, NOT upstream drift — verified locally:
+    # compat mode + HERMES_AGENT_DIR=clone runs the full plugin suite green).
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -74,7 +76,7 @@ jobs:
         run: |
           uv venv /tmp/hermes-agent-venv
           git clone --depth 1 https://github.com/NousResearch/hermes-agent.git /tmp/hermes-agent-src
-          uv pip install --python /tmp/hermes-agent-venv/bin/python -e /tmp/hermes-agent-src
+          uv pip install --python /tmp/hermes-agent-venv/bin/python -e /tmp/hermes-agent-src --config-settings editable_mode=compat
       # Editable install: hermes_cli.__file__ lives in the source checkout,
       # so HERMES_AGENT_DIR is the clone root — the stock-unchanged test
       # snapshots the hermes source tree itself.
