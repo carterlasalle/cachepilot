@@ -18,6 +18,8 @@ Design:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import sqlite3
@@ -30,6 +32,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
+from cachepilot_core.leases import CacheLease
 from cachepilot_core.telemetry import (
     CacheHealthStats,
     ChurnEvent,
@@ -108,6 +111,37 @@ CREATE TABLE IF NOT EXISTS churn_events (
     model_changed INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_churn_events_timestamp ON churn_events(timestamp);
+
+CREATE TABLE IF NOT EXISTS leases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lease_id TEXT NOT NULL UNIQUE,
+    session_hash TEXT,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    api_mode TEXT NOT NULL,
+    base_url_hash TEXT NOT NULL,
+    auth_scope_hash TEXT NOT NULL,
+    route_fingerprint TEXT,
+    request_fingerprint TEXT NOT NULL,
+    cache_fingerprint TEXT NOT NULL,
+    system_fingerprint TEXT NOT NULL,
+    tools_fingerprint TEXT NOT NULL,
+    history_prefix_fingerprint TEXT NOT NULL,
+    last_real_request_at REAL NOT NULL,
+    last_cache_touch_at REAL,
+    last_confirmed_hit_at REAL,
+    estimated_ttl_s REAL NOT NULL,
+    ttl_confidence REAL NOT NULL,
+    active_targets_json TEXT NOT NULL DEFAULT '[]',
+    generation INTEGER NOT NULL DEFAULT 0,
+    warm_count INTEGER NOT NULL DEFAULT 0,
+    warm_cost_usd TEXT NOT NULL DEFAULT '0',
+    estimated_cold_resume_cost_usd TEXT,
+    estimated_cached_resume_cost_usd TEXT,
+    state TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_leases_session_cache ON leases(session_hash, cache_fingerprint);
 """
 
 
@@ -134,6 +168,79 @@ class StoredRequestEvent(BaseModel):
     cost_usd: Decimal | None = None
     request_kind: str = "normal"
     outcome: Outcome
+
+
+#: ``leases`` columns in row order (id first, then the stored lease fields).
+_LEASE_COLUMNS = (
+    "id",
+    "lease_id",
+    "session_hash",
+    "provider",
+    "model",
+    "api_mode",
+    "base_url_hash",
+    "auth_scope_hash",
+    "route_fingerprint",
+    "request_fingerprint",
+    "cache_fingerprint",
+    "system_fingerprint",
+    "tools_fingerprint",
+    "history_prefix_fingerprint",
+    "last_real_request_at",
+    "last_cache_touch_at",
+    "last_confirmed_hit_at",
+    "estimated_ttl_s",
+    "ttl_confidence",
+    "active_targets_json",
+    "generation",
+    "warm_count",
+    "warm_cost_usd",
+    "estimated_cold_resume_cost_usd",
+    "estimated_cached_resume_cost_usd",
+    "state",
+    "updated_at",
+)
+
+
+class StoredLease(BaseModel):
+    """A ``leases`` row read back from storage.
+
+    Mirrors :class:`~cachepilot_core.leases.CacheLease` with the invariant-10
+    transforms applied: ``session_id`` → ``session_hash``, ``base_url`` →
+    ``base_url_hash``, and the target-id set serialized as a JSON tuple.
+    Prices read back as ``Decimal`` (the TEXT-storage convention used by
+    ``request_events.cost_usd``).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: int
+    lease_id: str
+    session_hash: str | None = None
+    provider: str
+    model: str
+    api_mode: str
+    base_url_hash: str
+    auth_scope_hash: str
+    route_fingerprint: str | None = None
+    request_fingerprint: str
+    cache_fingerprint: str
+    system_fingerprint: str
+    tools_fingerprint: str
+    history_prefix_fingerprint: str
+    last_real_request_at: float
+    last_cache_touch_at: float | None = None
+    last_confirmed_hit_at: float | None = None
+    estimated_ttl_s: float
+    ttl_confidence: float
+    active_targets: tuple[str, ...] = ()
+    generation: int = 0
+    warm_count: int = 0
+    warm_cost_usd: Decimal = Decimal(0)
+    estimated_cold_resume_cost_usd: Decimal | None = None
+    estimated_cached_resume_cost_usd: Decimal | None = None
+    state: str
+    updated_at: datetime
 
 
 def default_db_path() -> Path:
@@ -218,6 +325,82 @@ def _row_to_churn_event(row: tuple[Any, ...]) -> ChurnEvent:
         route_changed=bool(row[11]),
         cache_key_changed=bool(row[12]),
         model_changed=bool(row[13]),
+    )
+
+
+def _lease_row_values(lease: CacheLease) -> tuple[Any, ...]:
+    """Serialize a live lease for the ``leases`` table (invariant 10).
+
+    Only hashes/timestamps/usage/prices/state are stored: ``session_id`` is
+    hashed to ``session_hash``, ``base_url`` to ``base_url_hash``, and the
+    active target ids are stored as a JSON array (they are internal ids,
+    never secrets — PRD §83).
+    """
+    session_hash = (
+        hashlib.sha256(lease.session_id.encode("utf-8")).hexdigest() if lease.session_id else None
+    )
+    base_url_hash = hashlib.sha256(lease.base_url.encode("utf-8")).hexdigest()
+    return (
+        lease.lease_id,
+        session_hash,
+        lease.provider,
+        lease.model,
+        lease.api_mode,
+        base_url_hash,
+        lease.auth_scope_hash,
+        lease.route_fingerprint,
+        lease.request_fingerprint,
+        lease.cache_fingerprint,
+        lease.system_fingerprint,
+        lease.tools_fingerprint,
+        lease.history_prefix_fingerprint,
+        lease.last_real_request_at,
+        lease.last_cache_touch_at,
+        lease.last_confirmed_hit_at,
+        lease.estimated_ttl_s,
+        lease.ttl_confidence,
+        json.dumps(sorted(lease.active_targets)),
+        lease.generation,
+        lease.warm_count,
+        str(lease.warm_cost_usd),
+        None if lease.estimated_cold_resume_cost_usd is None else str(lease.estimated_cold_resume_cost_usd),
+        None if lease.estimated_cached_resume_cost_usd is None else str(lease.estimated_cached_resume_cost_usd),
+        lease.state.value,
+        datetime.now(UTC).isoformat(timespec="seconds"),
+    )
+
+
+def _row_to_lease(row: tuple[Any, ...]) -> StoredLease:
+    return StoredLease(
+        id=row[0],
+        lease_id=row[1],
+        session_hash=row[2],
+        provider=row[3],
+        model=row[4],
+        api_mode=row[5],
+        base_url_hash=row[6],
+        auth_scope_hash=row[7],
+        route_fingerprint=row[8],
+        request_fingerprint=row[9],
+        cache_fingerprint=row[10],
+        system_fingerprint=row[11],
+        tools_fingerprint=row[12],
+        history_prefix_fingerprint=row[13],
+        last_real_request_at=row[14],
+        last_cache_touch_at=row[15],
+        last_confirmed_hit_at=row[16],
+        estimated_ttl_s=row[17],
+        ttl_confidence=row[18],
+        active_targets=tuple(json.loads(row[19])),
+        generation=row[20],
+        warm_count=row[21],
+        # The column is NOT NULL DEFAULT '0', but keep the type honest: a
+        # NULL read can never happen and still coerces to zero.
+        warm_cost_usd=_text_to_decimal(row[22]) or Decimal(0),
+        estimated_cold_resume_cost_usd=_text_to_decimal(row[23]),
+        estimated_cached_resume_cost_usd=_text_to_decimal(row[24]),
+        state=row[25],
+        updated_at=datetime.fromisoformat(row[26]),
     )
 
 
@@ -337,6 +520,48 @@ class TelemetryStore:
                 ),
             )
             return int(cur.lastrowid or 0)
+
+    # -- leases (PRD §132 Phase 5) ------------------------------------------
+
+    def record_lease(self, lease: CacheLease) -> int:
+        """Insert one lease snapshot; returns its row id.
+
+        Only hashes/timestamps/usage/prices/state are written (invariant
+        10): ``session_id`` → ``session_hash``, ``base_url`` →
+        ``base_url_hash``, target ids as a JSON array.
+        """
+        with self._lock:
+            return self._insert_lease(self._require_conn(), lease)
+
+    def update_lease(self, lease: CacheLease) -> None:
+        """Replace the stored snapshot for ``lease.lease_id`` (insert on first write).
+
+        The ``leases`` table is a snapshot table — one row per live lease,
+        keyed by ``lease_id`` — so an update is a delete + insert under the
+        same lock.
+        """
+        with self._lock:
+            conn = self._require_conn()
+            conn.execute("DELETE FROM leases WHERE lease_id = ?", (lease.lease_id,))
+            self._insert_lease(conn, lease)
+
+    def list_leases(self, limit: int = 50) -> list[StoredLease]:
+        """Most recent lease snapshots, newest first (PRD §78 ``cachepilot leases``)."""
+        with self._lock:
+            rows = self._require_conn().execute(
+                f"SELECT {', '.join(_LEASE_COLUMNS)} FROM leases ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [_row_to_lease(row) for row in rows]
+
+    def _insert_lease(self, conn: sqlite3.Connection, lease: CacheLease) -> int:
+        columns = ", ".join(_LEASE_COLUMNS[1:])
+        placeholders = ", ".join("?" for _ in _LEASE_COLUMNS[1:])
+        cur = conn.execute(
+            f"INSERT INTO leases ({columns}) VALUES ({placeholders})",
+            _lease_row_values(lease),
+        )
+        return int(cur.lastrowid or 0)
 
     # -- reads --------------------------------------------------------------
 

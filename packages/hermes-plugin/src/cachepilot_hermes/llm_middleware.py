@@ -36,19 +36,24 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from cachepilot_hermes.config import PLUGIN_LOGGER_NAME, CachePilotConfig, emit_debug
+from cachepilot_hermes.targets import BackgroundTargetRegistry
 
 logger = logging.getLogger(PLUGIN_LOGGER_NAME)
 
 #: Correlation headers (PRD §29 primary mechanism). The relay strips these
 #: before forwarding upstream — they must never affect provider cache
-#: identity.
+#: identity. ``X-CachePilot-Targets`` (Phase 5, PRD §46/§132) carries the
+#: session's active background-target COUNT so the relay can keep the cache
+#: lease armed while background work may still need the same prefix.
 CORRELATION_HEADER_SESSION = "X-CachePilot-Session"
 CORRELATION_HEADER_REQUEST = "X-CachePilot-Request"
 CORRELATION_HEADER_TURN = "X-CachePilot-Turn"
+CORRELATION_HEADER_TARGETS = "X-CachePilot-Targets"
 CORRELATION_HEADERS: tuple[str, ...] = (
     CORRELATION_HEADER_SESSION,
     CORRELATION_HEADER_REQUEST,
     CORRELATION_HEADER_TURN,
+    CORRELATION_HEADER_TARGETS,
 )
 
 #: Fixed namespace (uuid.NAMESPACE_URL) so turn ids are deterministic for a
@@ -85,10 +90,17 @@ def make_correlation_headers(session_id: str, request_id: str) -> dict[str, str]
     }
 
 
-def attach_correlation_headers(request: Any, session_id: str, request_id: str) -> dict[str, Any] | None:
+def attach_correlation_headers(
+    request: Any,
+    session_id: str,
+    request_id: str,
+    *,
+    extra_headers: Mapping[str, str] | None = None,
+) -> dict[str, Any] | None:
     """Merge the correlation headers into a copy of *request*.
 
-    Returns a shallow copy of ``request`` with the three headers merged into
+    Returns a shallow copy of ``request`` with the three correlation headers
+    (plus any ``extra_headers``, e.g. ``X-CachePilot-Targets``) merged into
     its ``headers`` mapping, or None when they cannot be attached (fail
     open). Existing headers are never clobbered (the caller's values win)
     and the original dicts are never mutated.
@@ -98,7 +110,7 @@ def attach_correlation_headers(request: Any, session_id: str, request_id: str) -
     headers = request.get("headers")
     if not isinstance(headers, Mapping):
         return None
-    merged = {**make_correlation_headers(session_id, request_id), **headers}
+    merged = {**make_correlation_headers(session_id, request_id), **(extra_headers or {}), **headers}
     return {**request, "headers": merged}
 
 
@@ -107,6 +119,7 @@ def make_llm_request_middleware(
     *,
     session_id_provider: Callable[[], str] = process_session_id,
     request_id_provider: Callable[[], str] = lambda: str(uuid.uuid4()),
+    targets_registry: BackgroundTargetRegistry | None = None,
 ) -> Callable[..., Any]:
     """Return the ``llm_request`` middleware callback.
 
@@ -115,6 +128,12 @@ def make_llm_request_middleware(
         session_id_provider: session id source (default: per-process cached).
         request_id_provider: per-call request id source (default: fresh
             uuid4). Both are injectable so tests are deterministic.
+        targets_registry: optional background-target registry (PRD §46).
+            When present, the session's active target COUNT is attached as
+            ``X-CachePilot-Targets`` so the relay keeps the cache lease armed
+            while background work may still need the same prefix (Phase 5,
+            PRD §132). Fail-open: no registry, or a registry error, → the
+            header is simply omitted.
     """
 
     def _llm_request_middleware(
@@ -134,8 +153,21 @@ def make_llm_request_middleware(
             # Hermes treats None as "no change" — pure observer.
             return None
         try:
+            session_id = session_id_provider()
+            extra_headers: dict[str, str] = {}
+            if targets_registry is not None:
+                try:
+                    extra_headers[CORRELATION_HEADER_TARGETS] = str(
+                        targets_registry.active_count(session_id)
+                    )
+                except Exception:
+                    # Fail open: a registry hiccup must not drop the other
+                    # correlation headers, let alone the request.
+                    logger.debug(
+                        "cachepilot targets header skipped (registry error)", exc_info=True
+                    )
             attached = attach_correlation_headers(
-                request, session_id_provider(), request_id_provider()
+                request, session_id, request_id_provider(), extra_headers=extra_headers
             )
         except Exception:
             logger.debug("cachepilot correlation headers skipped (unexpected error)", exc_info=True)

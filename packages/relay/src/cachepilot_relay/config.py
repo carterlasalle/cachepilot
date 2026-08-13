@@ -14,8 +14,9 @@ from collections.abc import Mapping
 from typing import Self
 from urllib.parse import urlsplit
 
+from cachepilot_core.leases import LeaseSettings
 from cachepilot_core.storage import default_db_path
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 #: Default listen address (PRD §26).
 DEFAULT_LISTEN = "127.0.0.1:8787"
@@ -75,6 +76,10 @@ class RelayConfig(BaseModel):
     allow_external_bind: bool = False
     telemetry_db_path: str | None = None
     observation_enabled: bool = True
+    #: Lease scheduling settings (PRD §53-54, §84 cache.scheduling; Phase 5
+    #: dry-run defaults). Read from ``CACHEPILOT_LEASE_*`` by
+    #: :meth:`LeaseSettings.from_env`.
+    lease_settings: LeaseSettings = Field(default_factory=LeaseSettings)
 
     @field_validator("listen")
     @classmethod
@@ -126,6 +131,7 @@ class RelayConfig(BaseModel):
             allow_external_bind=allow_external_bind,
             telemetry_db_path=env.get(ENV_TELEMETRY_DB) or str(default_db_path()),
             observation_enabled=_env_flag(env.get(ENV_OBSERVATION_ENABLED, "true")),
+            lease_settings=LeaseSettings.from_env(env),
         )
 
 

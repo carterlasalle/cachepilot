@@ -37,6 +37,7 @@ from cachepilot_relay.observation import (
     build_canonical_request,
     derive_auth_scope,
     extract_route_identity,
+    parse_targets_count,
     provider_from_upstream,
     strip_correlation_headers,
 )
@@ -196,6 +197,7 @@ async def _scenario_strip(tmp_path) -> None:
                 "X-CachePilot-Session": "sess-abc",
                 "X-CachePilot-Request": "req-1",
                 "X-CachePilot-Turn": "turn-1",
+                "X-CachePilot-Targets": "2",
                 "x-test-header": "keep-me",
             },
         )
@@ -208,6 +210,7 @@ async def _scenario_strip(tmp_path) -> None:
         assert "x-cachepilot-session" not in seen
         assert "x-cachepilot-request" not in seen
         assert "x-cachepilot-turn" not in seen
+        assert "x-cachepilot-targets" not in seen
         # everything else passed through untouched
         assert seen["x-test-header"] == "keep-me"
         assert seen["content-type"] == "application/json"
@@ -522,6 +525,7 @@ def test_strip_correlation_headers_removes_only_correlation_names():
         "X-CachePilot-Session": "s",
         "X-CachePilot-Request": "r",
         "X-CachePilot-Turn": "t",
+        "X-CachePilot-Targets": "2",
         "authorization": "Bearer x",
         "content-type": "application/json",
         "x-test-header": "keep",
@@ -531,7 +535,17 @@ def test_strip_correlation_headers_removes_only_correlation_names():
     assert "x-cachepilot-session" not in lowered
     assert "x-cachepilot-request" not in lowered
     assert "x-cachepilot-turn" not in lowered
+    assert "x-cachepilot-targets" not in lowered
     assert lowered == {"authorization", "content-type", "x-test-header"}
+
+
+def test_parse_targets_count_fails_open():
+    assert parse_targets_count("3") == 3
+    assert parse_targets_count(" 0 ") == 0
+    assert parse_targets_count("-2") == 0
+    assert parse_targets_count("many") == 0
+    assert parse_targets_count("") == 0
+    assert parse_targets_count(None) == 0
 
 
 def test_build_canonical_request_api_mode_from_path():

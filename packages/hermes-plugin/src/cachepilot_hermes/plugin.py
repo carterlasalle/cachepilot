@@ -116,7 +116,10 @@ class CachePilotPlugin:
         self.middleware: dict[str, Callable[..., Any]] = {
             "tool_request": make_tool_request_middleware(self.config, history=self.history),
             "tool_execution": make_tool_execution_middleware(self.config),
-            "llm_request": make_llm_request_middleware(self.config),
+            # Phase 5 (PRD §132): the target registry feeds the active
+            # background-target COUNT into the X-CachePilot-Targets header so
+            # the relay keeps the session's cache lease armed.
+            "llm_request": make_llm_request_middleware(self.config, targets_registry=self.targets),
             "llm_execution": make_llm_execution_middleware(self.config),
         }
         self.hooks: dict[str, Callable[..., Any]] = dict(

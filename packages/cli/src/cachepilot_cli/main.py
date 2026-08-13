@@ -6,8 +6,9 @@ Subcommands:
   aggregated from the telemetry store (request count, hit %, per-outcome
   counts, churn events, route changes). Empty databases say "no telemetry
   recorded yet" — never fabricated numbers.
-- ``leases``: honest Phase 5 placeholder (the lease manager does not exist
-  yet, so no lease rows are invented).
+- ``leases``: real lease rows from the telemetry store (PRD §78) — the
+  relay persists a snapshot per lease, and empty databases say so (never
+  fabricated rows).
 - ``costs``: recorded provider-returned cost from ``request_events`` (total
   and per provider). Labeled recorded-cost-only: "money saved" is never
   shown when cost data are incomplete (PRD §79, AGENTS.md invariant 4).
@@ -21,10 +22,16 @@ from __future__ import annotations
 import argparse
 import os
 import socket
+import time
 from collections.abc import Sequence
 from decimal import Decimal
 
-from cachepilot_core.storage import ENV_TELEMETRY_DB, TelemetryStore, default_db_path
+from cachepilot_core.storage import (
+    ENV_TELEMETRY_DB,
+    StoredLease,
+    TelemetryStore,
+    default_db_path,
+)
 from cachepilot_core.telemetry import CacheHealthStats, ChurnEvent
 from cachepilot_relay.config import DEFAULT_LISTEN, ENV_LISTEN, parse_listen
 
@@ -66,7 +73,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     leases_parser = sub.add_parser(
         "leases",
         parents=[db_flag],
-        help="active cache leases (lease manager ships in Phase 5)",
+        help="active cache leases from the telemetry store (PRD §78)",
     )
     leases_parser.set_defaults(handler=cmd_leases)
 
@@ -175,10 +182,38 @@ def _plugin_state(stats: CacheHealthStats) -> str:
 
 
 def cmd_leases(args: argparse.Namespace) -> int:
-    # Honest Phase 5 placeholder: the lease manager does not exist yet, so
-    # there are no leases to list and none are fabricated (PRD §78, §132).
-    print("no active leases — lease manager ships in Phase 5")
+    """Real lease listing from the telemetry store (PRD §78, Phase 5).
+
+    Rows are whatever the relay actually persisted — never fabricated
+    (honest by construction; an empty database says so).
+    """
+    store = TelemetryStore(args.db)
+    try:
+        leases = store.list_leases(limit=50)
+    finally:
+        store.close()
+    if not leases:
+        print("no active leases")
+        return 0
+    print(f"{'LEASE':<10} {'TARGETS':<9} {'CACHE AGE':<11} {'TTL':<8} STATE")
+    for lease in leases:
+        print(
+            f"{lease.lease_id[:8]:<10} {len(lease.active_targets):<9} "
+            f"{_lease_age_s(lease):<11} {_lease_ttl_s(lease):<8} {lease.state.upper()}"
+        )
     return 0
+
+
+def _lease_age_s(lease: StoredLease, now: float | None = None) -> str:
+    """Cache age = now - last cache touch (PRD §78 ``CACHE AGE`` column)."""
+    if lease.last_cache_touch_at is None:
+        return "n/a"
+    now = time.time() if now is None else now
+    return f"{max(0, int(now - lease.last_cache_touch_at))}s"
+
+
+def _lease_ttl_s(lease: StoredLease) -> str:
+    return f"{int(lease.estimated_ttl_s)}s"
 
 
 # -- costs ------------------------------------------------------------------

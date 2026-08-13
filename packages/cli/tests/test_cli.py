@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import socket
+import time
 from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
 from cachepilot_cli.main import main
+from cachepilot_core.leases import CacheLease, LeaseState
 from cachepilot_core.storage import ENV_TELEMETRY_DB, TelemetryStore
 from cachepilot_core.telemetry import ChurnEvent, Outcome, TelemetryEvent
 from cachepilot_core.usage import TokenUsage
@@ -182,12 +184,54 @@ def test_status_plugin_state_honest(tmp_path, capsys, monkeypatch):
     assert "Hermes plugin: inactive (CACHEPILOT_ENABLED=false)" in out
 
 
-def test_leases_is_honest_phase5_placeholder(tmp_path, capsys):
+def test_leases_empty_db_says_no_active_leases(tmp_path, capsys):
     _seed_db(tmp_path)
     assert main(["leases", "--db", str(tmp_path / "telemetry.db")]) == 0
     out = capsys.readouterr().out
-    assert "no active leases — lease manager ships in Phase 5" in out
+    assert "no active leases" in out
     assert "LEASE" not in out  # no fabricated lease table
+
+
+def test_leases_lists_real_lease_rows(tmp_path, capsys):
+    store = TelemetryStore(tmp_path / "telemetry.db")
+    store.record_lease(
+        CacheLease(
+            lease_id="lease-11111111",
+            session_id="sess-1",
+            provider="fake-provider",
+            model="gpt-5.2",
+            api_mode="chat",
+            base_url="https://fake-provider.invalid/v1",
+            auth_scope_hash="auth-x",
+            route_fingerprint=None,
+            request_fingerprint="req-fp",
+            cache_fingerprint="cache-fp",
+            system_fingerprint="sys-fp",
+            tools_fingerprint="tools-fp",
+            history_prefix_fingerprint="hist-fp",
+            last_real_request_at=time.time() - 100,
+            last_cache_touch_at=time.time() - 81.25,  # → CACHE AGE 81s
+            last_confirmed_hit_at=None,
+            estimated_ttl_s=300.0,
+            ttl_confidence=0.5,
+            active_targets={"t1", "t2"},
+            generation=3,
+            warm_count=0,
+            warm_cost_usd=0.0,
+            state=LeaseState.ARMED,
+        )
+    )
+    store.close()
+    assert main(["leases", "--db", str(tmp_path / "telemetry.db")]) == 0
+    out = capsys.readouterr().out
+    # PRD §78 header + a real row (never fabricated)
+    assert "LEASE" in out and "TARGETS" in out and "CACHE AGE" in out
+    assert "TTL" in out and "STATE" in out
+    assert "lease-11" in out  # lease id short
+    assert "81s" in out  # cache age
+    assert "300s" in out  # ttl
+    assert "ARMED" in out  # state, upper-cased like the PRD example
+    assert "no active leases" not in out
 
 
 def test_costs_shows_recorded_totals_and_never_money_saved(tmp_path, capsys):

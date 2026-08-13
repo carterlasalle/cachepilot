@@ -52,9 +52,13 @@ def create_app(config: RelayConfig) -> Starlette:
     async def lifespan(app: Starlette):
         client = httpx.AsyncClient(timeout=None, follow_redirects=False)
         app.state.proxy = RelayProxy(config, client)
+        # Phase 5: the lease scheduler runs for the app lifetime and stops
+        # before the proxy closes (PRD §132).
+        await app.state.proxy.start_lease_scheduler()
         try:
             yield
         finally:
+            await app.state.proxy.stop_lease_scheduler()
             app.state.proxy.close()
             await client.aclose()
 

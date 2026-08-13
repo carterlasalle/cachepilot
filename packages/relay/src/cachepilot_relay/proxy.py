@@ -26,10 +26,12 @@ import logging
 from collections.abc import Mapping
 
 import httpx
+from cachepilot_core.telemetry import Outcome
 from starlette.requests import Request
 from starlette.responses import Response, StreamingResponse
 
 from cachepilot_relay.config import RelayConfig
+from cachepilot_relay.lease_controller import LeaseController, LeaseRequestContext
 from cachepilot_relay.observation import RequestObserver, strip_correlation_headers
 
 logger = logging.getLogger("cachepilot_relay.proxy")
@@ -103,11 +105,34 @@ class RelayProxy:
             if config.observation_enabled
             else None
         )
+        # Phase 5: the lease controller shares the observer's telemetry store
+        # and turns the observed request + X-CachePilot-Targets header into
+        # lease lifecycle events (PRD §132, §148). Fail-open: a controller
+        # problem never breaks forwarding (AGENTS.md invariant 9).
+        self.lease_controller = (
+            LeaseController(
+                settings=config.lease_settings,
+                store=self.observer.store if self.observer is not None else None,
+                enabled=config.observation_enabled,
+            )
+            if config.observation_enabled
+            else None
+        )
 
     def close(self) -> None:
         """Release the telemetry store (safe when observation is disabled)."""
         if self.observer is not None:
             self.observer.close()
+
+    async def start_lease_scheduler(self) -> None:
+        """Start the background lease scheduler task (PRD §132)."""
+        if self.lease_controller is not None:
+            await self.lease_controller.start()
+
+    async def stop_lease_scheduler(self) -> None:
+        """Cancel the scheduler task (safe when never started)."""
+        if self.lease_controller is not None:
+            await self.lease_controller.stop()
 
     async def forward(self, request: Request) -> Response:
         url = build_upstream_url(self.config.upstream, request.url.path, request.url.query)
@@ -121,6 +146,7 @@ class RelayProxy:
         # The request body is buffered once: forwarded verbatim AND hashed
         # for the fingerprints (observation is read-only over the bytes).
         body = await request.body()
+        lease_ctx = self._lease_start(request, url, body)
         upstream_request = self._client.build_request(
             request.method, url, headers=headers, content=body
         )
@@ -128,21 +154,49 @@ class RelayProxy:
             upstream = await self._client.send(upstream_request, stream=True)
         except httpx.HTTPError as exc:
             logger.warning("upstream request failed for %s %s: %s", request.method, url, exc)
-            self._observe_failure(request, url, body)
+            outcome = self._observe_failure(request, url, body)
+            # §148: a failed call must never be treated as a cache refresh.
+            self._lease_end(lease_ctx, outcome or Outcome.FAILED)
             return Response(b"", status_code=502)
         response_headers = strip_hop_by_hop(upstream.headers)
         # aiter_raw() keeps the body byte-exact (no transparent decompression).
         if should_stream(upstream):
             response_headers.pop("content-length", None)
-            self._observe_streaming(request, url, body, upstream)
+            outcome = self._observe_streaming(request, url, body, upstream)
+            self._lease_end(lease_ctx, outcome or Outcome.SUCCESS_UNVERIFIED)
             return StreamingResponse(
                 upstream.aiter_raw(),
                 status_code=upstream.status_code,
                 headers=response_headers,
             )
         response_body = b"".join([chunk async for chunk in upstream.aiter_raw()])
-        self._observe_bounded(request, url, body, response_body, upstream)
+        outcome = self._observe_bounded(request, url, body, response_body, upstream)
+        self._lease_end(lease_ctx, outcome or Outcome.SUCCESS_UNVERIFIED)
         return Response(response_body, status_code=upstream.status_code, headers=response_headers)
+
+    # -- lease lifecycle (fail open: never breaks forwarding) ---------------
+
+    def _lease_start(
+        self,
+        request: Request,
+        url: str,
+        body: bytes,
+    ) -> LeaseRequestContext | None:
+        if self.lease_controller is None:
+            return None
+        return self.lease_controller.on_request_start(
+            body=body,
+            path=request.url.path,
+            upstream_url=url,
+            request_headers=request.headers,
+            session_header=request.headers.get("x-cachepilot-session"),
+            targets_header=request.headers.get("x-cachepilot-targets"),
+        )
+
+    def _lease_end(self, ctx: LeaseRequestContext | None, outcome: Outcome) -> None:
+        if ctx is None or self.lease_controller is None:
+            return
+        self.lease_controller.on_request_end(ctx, outcome)
 
     # -- observation (fail open: never breaks forwarding) -------------------
 
@@ -153,13 +207,13 @@ class RelayProxy:
         request_body: bytes,
         response_body: bytes,
         upstream: httpx.Response,
-    ) -> None:
+    ) -> Outcome | None:
         if self.observer is None:
-            return
+            return None
         try:
             # request_body is the buffered client body (fingerprints);
             # response_body is the upstream's buffered body (usage parse).
-            self.observer.observe_bounded(
+            return self.observer.observe_bounded(
                 request_body=request_body,
                 response_body=response_body,
                 path=request.url.path,
@@ -171,12 +225,19 @@ class RelayProxy:
             )
         except Exception as exc:  # noqa: BLE001 — fail open (AGENTS.md invariant 9)
             logger.warning("telemetry observation failed (traffic unaffected): %s", exc)
+            return None
 
-    def _observe_streaming(self, request: Request, url: str, body: bytes, upstream: httpx.Response) -> None:
+    def _observe_streaming(
+        self,
+        request: Request,
+        url: str,
+        body: bytes,
+        upstream: httpx.Response,
+    ) -> Outcome | None:
         if self.observer is None:
-            return
+            return None
         try:
-            self.observer.observe_streaming(
+            return self.observer.observe_streaming(
                 body,
                 path=request.url.path,
                 upstream_url=url,
@@ -187,12 +248,18 @@ class RelayProxy:
             )
         except Exception as exc:  # noqa: BLE001 — fail open (AGENTS.md invariant 9)
             logger.warning("telemetry observation failed (traffic unaffected): %s", exc)
+            return None
 
-    def _observe_failure(self, request: Request, url: str, body: bytes) -> None:
+    def _observe_failure(
+        self,
+        request: Request,
+        url: str,
+        body: bytes,
+    ) -> Outcome | None:
         if self.observer is None:
-            return
+            return None
         try:
-            self.observer.observe_failure(
+            return self.observer.observe_failure(
                 body,
                 path=request.url.path,
                 upstream_url=url,
@@ -201,3 +268,4 @@ class RelayProxy:
             )
         except Exception as exc:  # noqa: BLE001 — fail open (AGENTS.md invariant 9)
             logger.warning("telemetry observation failed (traffic unaffected): %s", exc)
+            return None

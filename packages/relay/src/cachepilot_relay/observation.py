@@ -44,9 +44,17 @@ logger = logging.getLogger("cachepilot_relay.observation")
 
 #: Correlation headers injected by the Hermes plugin (PRD §29 primary
 #: mechanism). The relay MUST strip these before forwarding upstream — they
-#: must never affect provider cache identity.
+#: must never affect provider cache identity. ``x-cachepilot-targets`` is the
+#: Phase 5 addition: the plugin's active background-target COUNT for the
+#: session (PRD §46, §132), which the lease controller feeds into the lease
+#: manager.
 CORRELATION_HEADERS: frozenset[str] = frozenset(
-    {"x-cachepilot-session", "x-cachepilot-request", "x-cachepilot-turn"}
+    {
+        "x-cachepilot-session",
+        "x-cachepilot-request",
+        "x-cachepilot-turn",
+        "x-cachepilot-targets",
+    }
 )
 
 #: Well-known gateway hosts → provider labels. Derivation is physical (the
@@ -125,6 +133,21 @@ def hash_correlation_value(value: str | None) -> str | None:
     if not value:
         return None
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def parse_targets_count(value: str | None) -> int:
+    """Parse the ``X-CachePilot-Targets`` header (active background-target count).
+
+    Fail-open: absent, malformed or negative values parse to 0 (no targets
+    claimed — the lease simply stays unarmed for that request).
+    """
+    if not value:
+        return 0
+    try:
+        count = int(value.strip())
+    except (TypeError, ValueError):
+        return 0
+    return max(0, count)
 
 
 def _canonical_json(value: Any) -> str:
@@ -293,14 +316,18 @@ class RequestObserver:
         response_headers: Mapping[str, str],
         session_header: str | None = None,
         auth_headers: Mapping[str, str] | None = None,
-    ) -> None:
+    ) -> Outcome | None:
         """Record one buffered (non-streaming) request/response pair.
 
         The response body is parsed read-only — the same bytes are returned
         to the client untouched. Streaming responses never reach this path.
+
+        Returns the classified :class:`~cachepilot_core.telemetry.Outcome`
+        (None when observation is disabled) so the proxy can feed it to the
+        lease controller (Phase 5: normal-request-reset, PRD §148).
         """
         if not self.enabled or self.store is None:
-            return
+            return None
         route = extract_route_identity(upstream_url, response_headers)
         route_hash = route.route_hash()
         canonical = build_canonical_request(
@@ -329,6 +356,7 @@ class RequestObserver:
             session_header=session_header,
             history_hash=extract_history_hash(request_body),
         )
+        return outcome
 
     def observe_streaming(
         self,
@@ -340,20 +368,22 @@ class RequestObserver:
         response_headers: Mapping[str, str],
         session_header: str | None = None,
         auth_headers: Mapping[str, str] | None = None,
-    ) -> None:
+    ) -> Outcome | None:
         """Record a streaming request as SUCCESS_UNVERIFIED with zero usage.
 
         The response stream is NEVER consumed or modified — pass-through
         purity first. Streaming usage parsing (e.g. OpenAI ``stream_options``
         final-chunk usage) is deferred to a later phase.
+
+        Returns the classified outcome (None when observation is disabled).
         """
         if not self.enabled or self.store is None:
-            return
+            return None
         if not 200 <= status_code < 300:
             # A non-2xx "streaming" response is simply a failed request; the
             # (never-consumed) response body is irrelevant to the FAILED
             # classification, so only the request body is passed.
-            self.observe_bounded(
+            return self.observe_bounded(
                 body,
                 b"",
                 path=path,
@@ -363,7 +393,6 @@ class RequestObserver:
                 session_header=session_header,
                 auth_headers=auth_headers,
             )
-            return
         route = extract_route_identity(upstream_url, response_headers)
         route_hash = route.route_hash()
         canonical = build_canonical_request(
@@ -381,6 +410,7 @@ class RequestObserver:
             session_header=session_header,
             history_hash=extract_history_hash(body),
         )
+        return Outcome.SUCCESS_UNVERIFIED
 
     def observe_failure(
         self,
@@ -390,10 +420,15 @@ class RequestObserver:
         upstream_url: str,
         session_header: str | None = None,
         auth_headers: Mapping[str, str] | None = None,
-    ) -> None:
-        """Record a request that never produced a provider response (FAILED)."""
+    ) -> Outcome | None:
+        """Record a request that never produced a provider response (FAILED).
+
+        Returns ``Outcome.FAILED`` (None when observation is disabled) so the
+        lease controller can honour §148: a failed call never refreshes the
+        cache.
+        """
         if not self.enabled or self.store is None:
-            return
+            return None
         route = extract_route_identity(upstream_url, {})
         route_hash = route.route_hash()
         canonical = build_canonical_request(
@@ -411,6 +446,7 @@ class RequestObserver:
             session_header=session_header,
             history_hash=extract_history_hash(body),
         )
+        return Outcome.FAILED
 
     # -- internals ----------------------------------------------------------
 

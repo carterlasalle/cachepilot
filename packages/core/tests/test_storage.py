@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Any
 
 import pytest
+from cachepilot_core.leases import CacheLease, LeaseState
 from cachepilot_core.storage import (
     ENV_TELEMETRY_DB,
     TelemetryStore,
@@ -286,3 +289,100 @@ def test_raw_auth_header_never_stored(tmp_path):
         if path.exists():
             db_bytes += path.read_bytes()
     assert auth_token.encode() not in db_bytes
+
+
+# -- leases (PRD §132 Phase 5) ------------------------------------------------
+
+
+def _lease(**overrides: Any) -> CacheLease:
+    lease = CacheLease(
+        lease_id="lease-11111111",
+        session_id="sess-raw-1",
+        provider="fake-provider",
+        model="gpt-5.2",
+        api_mode="chat",
+        base_url="https://fake-provider.invalid/v1",
+        auth_scope_hash="auth-hash-1",
+        route_fingerprint=None,
+        request_fingerprint="req-fp-1",
+        cache_fingerprint="cache-fp-1",
+        system_fingerprint="sys-fp-1",
+        tools_fingerprint="tools-fp-1",
+        history_prefix_fingerprint="hist-fp-1",
+        last_real_request_at=1000.0,
+        last_cache_touch_at=1000.0,
+        last_confirmed_hit_at=None,
+        estimated_ttl_s=300.0,
+        ttl_confidence=0.5,
+        active_targets={"t1", "t2"},
+        generation=3,
+        warm_count=1,
+        warm_cost_usd=0.5,
+        state=LeaseState.ARMED,
+    )
+    for key, value in overrides.items():
+        setattr(lease, key, value)
+    return lease
+
+
+def test_lease_round_trip(tmp_path):
+    store = TelemetryStore(tmp_path / "telemetry.db")
+    lease = _lease()
+    store.record_lease(lease)
+    rows = store.list_leases()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.lease_id == "lease-11111111"
+    # session id / base url stored as hashes, never raw (invariant 10)
+    assert row.session_hash == hashlib.sha256(b"sess-raw-1").hexdigest()
+    assert row.base_url_hash == hashlib.sha256(b"https://fake-provider.invalid/v1").hexdigest()
+    assert row.provider == "fake-provider"
+    assert row.model == "gpt-5.2"
+    assert row.cache_fingerprint == "cache-fp-1"
+    assert row.last_cache_touch_at == 1000.0
+    assert row.estimated_ttl_s == 300.0
+    assert set(row.active_targets) == {"t1", "t2"}
+    assert row.generation == 3
+    assert row.warm_count == 1
+    assert row.warm_cost_usd == Decimal("0.5")
+    assert row.state == "armed"
+    assert row.updated_at is not None
+    store.close()
+
+
+def test_lease_update_replaces_snapshot_in_place(tmp_path):
+    store = TelemetryStore(tmp_path / "telemetry.db")
+    lease = _lease()
+    store.record_lease(lease)
+    lease.generation = 4
+    lease.state = LeaseState.WARM_SCHEDULED
+    lease.active_targets = {"t1"}
+    store.update_lease(lease)
+    rows = store.list_leases()
+    assert len(rows) == 1  # snapshot table: one row per lease_id
+    assert rows[0].generation == 4
+    assert rows[0].state == "warm_scheduled"
+    assert set(rows[0].active_targets) == {"t1"}
+    store.close()
+
+
+def test_lease_listing_newest_first(tmp_path):
+    store = TelemetryStore(tmp_path / "telemetry.db")
+    store.record_lease(_lease(lease_id="lease-aaaaaaaa"))
+    store.record_lease(_lease(lease_id="lease-bbbbbbbb"))
+    store.record_lease(_lease(lease_id="lease-cccccccc"))
+    rows = store.list_leases(limit=2)
+    assert [row.lease_id for row in rows] == ["lease-cccccccc", "lease-bbbbbbbb"]
+    store.close()
+
+
+def test_lease_raw_session_and_url_never_in_db_bytes(tmp_path):
+    store = TelemetryStore(tmp_path / "telemetry.db")
+    store.record_lease(_lease(session_id="sess-SECRET-raw", base_url="https://secret-host.invalid/v1"))
+    store.close()
+    db_bytes = b""
+    for path in (store.db_path, tmp_path / "telemetry.db-wal"):
+        if path.exists():
+            db_bytes += path.read_bytes()
+    assert b"sess-SECRET-raw" not in db_bytes
+    assert b"https://secret-host.invalid/v1" not in db_bytes

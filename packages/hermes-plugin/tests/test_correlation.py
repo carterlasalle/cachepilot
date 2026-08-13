@@ -16,13 +16,16 @@ from cachepilot_hermes.config import CachePilotConfig
 from cachepilot_hermes.llm_middleware import (
     CORRELATION_HEADER_REQUEST,
     CORRELATION_HEADER_SESSION,
+    CORRELATION_HEADER_TARGETS,
     CORRELATION_HEADER_TURN,
+    CORRELATION_HEADERS,
     attach_correlation_headers,
     compute_turn_id,
     make_correlation_headers,
     make_llm_request_middleware,
     process_session_id,
 )
+from cachepilot_hermes.targets import BackgroundTarget, BackgroundTargetRegistry
 
 # Deterministic id providers for the middleware tests.
 SESSION_ID = "00000000-0000-4000-8000-000000000001"
@@ -162,3 +165,77 @@ def test_middleware_config_from_env_flag(monkeypatch):
     assert CachePilotConfig.from_env().correlation_headers is True
     monkeypatch.delenv("CACHEPILOT_CORRELATION_HEADERS")
     assert CachePilotConfig.from_env().correlation_headers is True  # default true
+
+
+# -- X-CachePilot-Targets (Phase 5, PRD §46/§132) -----------------------------
+
+
+def test_correlation_headers_include_targets_name():
+    assert CORRELATION_HEADER_TARGETS in CORRELATION_HEADERS
+
+
+def _targets_middleware(registry):
+    session_provider, _ = _id_providers()
+    return make_llm_request_middleware(
+        CachePilotConfig(),
+        session_id_provider=session_provider,
+        request_id_provider=lambda: "req-1",
+        targets_registry=registry,
+    )
+
+
+def test_middleware_injects_targets_count_with_registry():
+    registry = BackgroundTargetRegistry()
+    registry.register(BackgroundTarget(id="t1", kind="process", session_id=SESSION_ID))
+    registry.register(BackgroundTarget(id="t2", kind="subagent", session_id=SESSION_ID))
+    cb = _targets_middleware(registry)
+    result = cb(request={"model": "gpt-4", "headers": {}}, original_request={})
+    assert result is not None
+    effective = result["request"]
+    assert effective["headers"][CORRELATION_HEADER_TARGETS] == "2"
+    # the three classic correlation headers are still present
+    assert effective["headers"][CORRELATION_HEADER_SESSION] == SESSION_ID
+    assert effective["headers"][CORRELATION_HEADER_REQUEST] == "req-1"
+
+
+def test_middleware_targets_count_tracks_registry_changes():
+    registry = BackgroundTargetRegistry()
+    cb = _targets_middleware(registry)
+    request = {"model": "gpt-4", "headers": {}}
+    assert cb(request=request, original_request={})["request"]["headers"][
+        CORRELATION_HEADER_TARGETS
+    ] == "0"
+    registry.register(BackgroundTarget(id="t1", kind="external", session_id=SESSION_ID))
+    assert cb(request=request, original_request={})["request"]["headers"][
+        CORRELATION_HEADER_TARGETS
+    ] == "1"
+    registry.release("t1")
+    assert cb(request=request, original_request={})["request"]["headers"][
+        CORRELATION_HEADER_TARGETS
+    ] == "0"
+
+
+def test_middleware_omits_targets_header_without_registry():
+    cb = make_llm_request_middleware(
+        CachePilotConfig(),
+        session_id_provider=lambda: SESSION_ID,
+        request_id_provider=lambda: "req-1",
+    )
+    result = cb(request={"model": "gpt-4", "headers": {}}, original_request={})
+    assert result is not None
+    headers = result["request"]["headers"]
+    assert CORRELATION_HEADER_TARGETS not in headers
+    assert CORRELATION_HEADER_SESSION in headers  # fail open: only Targets omitted
+
+
+def test_middleware_targets_registry_error_fails_open():
+    class BrokenRegistry:
+        def active_count(self, session_id):
+            raise RuntimeError("registry boom")
+
+    cb = _targets_middleware(BrokenRegistry())
+    result = cb(request={"model": "gpt-4", "headers": {}}, original_request={})
+    assert result is not None  # the request still flows
+    headers = result["request"]["headers"]
+    assert CORRELATION_HEADER_TARGETS not in headers
+    assert CORRELATION_HEADER_SESSION in headers
