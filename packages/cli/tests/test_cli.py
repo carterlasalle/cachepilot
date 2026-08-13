@@ -854,3 +854,46 @@ def test_ttl_survival_honest_without_clean_observations(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "survival      no clean observations yet" in out
     assert "P(survive" not in out  # never fabricated
+
+
+# -- E2E-004: CLI reads open the DB read-only ---------------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "status",
+        "leases",
+        "costs",
+        "ttl",
+        "routes",
+        "churn",
+        "explain-miss",
+        "topology",
+    ],
+)
+def test_read_command_missing_db_creates_nothing_and_notices(
+    tmp_path, capsys, monkeypatch, command
+):
+    """E2E-004: a missing --db path is never created; the notice names it."""
+    monkeypatch.setenv("CACHEPILOT_RELAY_LISTEN", "127.0.0.1:1")
+    missing = tmp_path / "no-such-dir" / "typo.db"
+    assert main([command, "--db", str(missing)]) == 0
+    out = capsys.readouterr()
+    assert not missing.exists()
+    assert not missing.parent.exists()
+    assert f"no telemetry database at {missing}" in out.err
+    assert "read-only" in out.err
+    if command == "status":
+        assert "no telemetry recorded yet" in out.out  # honest empty output continues
+
+
+def test_status_missing_env_db_notices_resolved_path(tmp_path, capsys, monkeypatch):
+    """E2E-004: a stale CACHEPILOT_TELEMETRY_DB is named, not silently created."""
+    monkeypatch.setenv("CACHEPILOT_RELAY_LISTEN", "127.0.0.1:1")
+    monkeypatch.setenv(ENV_TELEMETRY_DB, str(tmp_path / "stale" / "env.db"))
+    assert main(["status"]) == 0
+    out = capsys.readouterr()
+    assert f"no telemetry database at {tmp_path / 'stale' / 'env.db'}" in out.err
+    assert not (tmp_path / "stale").exists()
+    assert "no telemetry recorded yet" in out.out

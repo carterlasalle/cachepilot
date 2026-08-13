@@ -36,7 +36,9 @@ Subcommands:
   DETECT/measurement-only: nothing here reorders tools or rewrites prompts.
 
 The telemetry database comes from ``--db``, else ``CACHEPILOT_TELEMETRY_DB``,
-else ``~/.hermes/cachepilot/cachepilot.db`` (PRD §81).
+else ``~/.hermes/cachepilot/cachepilot.db`` (PRD §81). Every read command
+opens the store read-only (E2E-004): a missing path is never created — the
+CLI prints a notice naming it and renders the honest empty state.
 """
 
 from __future__ import annotations
@@ -64,7 +66,7 @@ from cachepilot_core.ttl import TTLProfile
 from cachepilot_relay.config import DEFAULT_LISTEN, ENV_LISTEN, RELAY_HEALTH_PATH, parse_listen
 
 from cachepilot_cli import __version__ as CLI_VERSION
-from cachepilot_cli.churn import cmd_churn, cmd_explain_miss
+from cachepilot_cli.churn import cmd_churn, cmd_explain_miss, open_read_only_store
 
 ENV_PLUGIN_ENABLED = "CACHEPILOT_ENABLED"
 
@@ -180,13 +182,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    store = TelemetryStore(args.db)
-    try:
-        stats = store.aggregates()
-        churn = store.churn_list(limit=1)
-        routes = store.route_changes(limit=1)
-    finally:
-        store.close()
+    store = open_read_only_store(args.db)
+    stats = CacheHealthStats()
+    churn: list[ChurnEvent] = []
+    routes: list[ChurnEvent] = []
+    if store is not None:
+        try:
+            stats = store.aggregates()
+            churn = store.churn_list(limit=1)
+            routes = store.route_changes(limit=1)
+        finally:
+            store.close()
 
     print(f"CachePilot {CLI_VERSION}")
     print()
@@ -300,7 +306,10 @@ def cmd_leases(args: argparse.Namespace) -> int:
     Rows are whatever the relay actually persisted — never fabricated
     (honest by construction; an empty database says so).
     """
-    store = TelemetryStore(args.db)
+    store = open_read_only_store(args.db)
+    if store is None:
+        print("no active leases")
+        return 0
     try:
         leases = store.list_leases(limit=50)
     finally:
@@ -333,11 +342,13 @@ def _lease_ttl_s(lease: StoredLease) -> str:
 
 
 def cmd_costs(args: argparse.Namespace) -> int:
-    store = TelemetryStore(args.db)
-    try:
-        totals = store.cost_totals()
-    finally:
-        store.close()
+    store = open_read_only_store(args.db)
+    totals: dict[str, Decimal] = {}
+    if store is not None:
+        try:
+            totals = store.cost_totals()
+        finally:
+            store.close()
     total = sum(totals.values(), Decimal(0))
     print("Recorded costs (from request_events telemetry)")
     print(
@@ -365,7 +376,10 @@ def cmd_ttl(args: argparse.Namespace) -> int:
     the median survival age, estimated over CLEAN observations — a
     diagnostic layer, never a warm decision input.
     """
-    store = TelemetryStore(args.db)
+    store = open_read_only_store(args.db)
+    if store is None:
+        print("no TTL profiles yet (learning needs repeated observations of a stable route)")
+        return 0
     try:
         profiles = store.list_profiles(limit=100)
         if not profiles:
@@ -437,7 +451,12 @@ def cmd_routes(args: argparse.Namespace) -> int:
     (gateway / upstream / endpoint / region / deployment); an empty
     database says so.
     """
-    store = TelemetryStore(args.db)
+    store = open_read_only_store(args.db)
+    if store is None:
+        print(
+            "no observed route changes yet (route intelligence records switches between repeated logical requests)"
+        )
+        return 0
     try:
         events = store.recent_route_events(limit=100)
         stats = store.route_intel_stats()
@@ -485,7 +504,10 @@ def cmd_topology(args: argparse.Namespace) -> int:
     semantic safety — this phase only measures). Rows are whatever the relay
     actually recorded — an empty database says so, never fabricated numbers.
     """
-    store = TelemetryStore(args.db)
+    store = open_read_only_store(args.db)
+    if store is None:
+        print("no consecutive request pairs recorded yet — nothing to measure")
+        return 0
     try:
         report = topology_from_store(store, limit=args.limit)
     finally:

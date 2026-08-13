@@ -60,6 +60,11 @@ Read-only guarantees:
   sidecar files next to a cleanly-closed WAL database — the same artifacts
   any read-only connection (including the CLI's reads) leaves behind. They
   are journal files, not the database.
+- The `cachepilot` CLI opens the telemetry database the same read-only way
+  (`mode=ro`, no schema work): a missing `--db` / `CACHEPILOT_TELEMETRY_DB`
+  path is never created — the CLI prints a notice naming the path and
+  renders the honest empty state (the relay creates the DB on its first
+  write).
 - Endpoints expose the SAME query surface as the `cachepilot` CLI
   (`status`, `leases`, `costs`, `ttl`, `routes`, `churn`, `explain-miss`,
   `topology`). Nothing is invented: a missing/empty DB renders empty states,

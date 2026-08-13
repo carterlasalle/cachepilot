@@ -16,10 +16,11 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from collections import Counter
 
 from cachepilot_core.churn import changed_frequency
-from cachepilot_core.storage import TelemetryStore
+from cachepilot_core.storage import TelemetryStore, resolve_db_path
 from cachepilot_core.telemetry import ChurnEvent
 
 #: PRD §24/§75 layers, in the order the boolean flags live on ChurnEvent.
@@ -33,9 +34,33 @@ _LAYERS = (
 )
 
 
+def open_read_only_store(db_path: str | None) -> TelemetryStore | None:
+    """Open the telemetry store read-only; None for a missing database (E2E-004).
+
+    CLI read commands must never create the database: a typo'd ``--db`` or
+    stale ``CACHEPILOT_TELEMETRY_DB`` used to silently materialize a stray
+    ~84 KB empty store. When the resolved path does not exist, print a
+    notice naming it (reads are read-only; the relay creates the DB on its
+    first write) and return None — the caller renders its honest empty
+    output and exits 0.
+    """
+    path = resolve_db_path(db_path)
+    if not path.is_file():
+        print(
+            f"no telemetry database at {path} — nothing recorded yet "
+            "(CLI reads are read-only; the relay creates the DB on first write)",
+            file=sys.stderr,
+        )
+        return None
+    return TelemetryStore(path, read_only=True)
+
+
 def cmd_churn(args: argparse.Namespace) -> int:
     """Per-layer churn counts + most common likely causes (PRD §76 ``churn``)."""
-    store = TelemetryStore(args.db)
+    store = open_read_only_store(args.db)
+    if store is None:
+        print("no churn events")
+        return 0
     try:
         events = store.churn_list(limit=args.limit)
     finally:
@@ -60,7 +85,13 @@ def cmd_churn(args: argparse.Namespace) -> int:
 
 def cmd_explain_miss(args: argparse.Namespace) -> int:
     """Explain the latest (or --session-scoped) miss (PRD §75, §137)."""
-    store = TelemetryStore(args.db)
+    store = open_read_only_store(args.db)
+    if store is None:
+        if args.session:
+            print("no churn events recorded for this session — nothing to explain")
+        else:
+            print("no churn events recorded — nothing to explain")
+        return 0
     try:
         events = store.churn_list(limit=1, session_hash=args.session)
     finally:

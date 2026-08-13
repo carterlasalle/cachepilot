@@ -706,11 +706,13 @@ class TelemetryStore:
         db_path: str | os.PathLike[str] | None = None,
         *,
         connect: bool = True,
+        read_only: bool = False,
     ) -> None:
         self._path = resolve_db_path(db_path)
         self._lock = threading.Lock()
         self._conn: sqlite3.Connection | None = None
         self.wal_active = False
+        self.read_only = read_only
         if connect:
             self.connect()
 
@@ -720,8 +722,28 @@ class TelemetryStore:
         return self._path
 
     def connect(self) -> None:
-        """Open the database, enable WAL, and ensure the schema exists."""
+        """Open the database, enable WAL, and ensure the schema exists.
+
+        With ``read_only=True`` (CLI reads, E2E-004) the file is opened via
+        SQLite's ``mode=ro`` URI and no schema/migration work runs — a
+        missing file raises ``sqlite3.OperationalError`` instead of being
+        created (mirrors the dashboard's ``ReadOnlyTelemetryStore``).
+        """
         if self._conn is not None:
+            return
+        if self.read_only:
+            conn = sqlite3.connect(
+                f"file:{self._path}?mode=ro",
+                uri=True,
+                check_same_thread=False,
+                isolation_level=None,
+            )
+            try:
+                conn.execute("PRAGMA busy_timeout=5000")
+            except Exception:
+                conn.close()
+                raise
+            self._conn = conn
             return
         self._path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(self._path), check_same_thread=False, isolation_level=None)

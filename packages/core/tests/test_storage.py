@@ -579,3 +579,74 @@ def test_pre_p11_ttl_observations_gain_identity_columns(tmp_path):
     finally:
         conn.close()
     assert {"provider", "model", "api_mode", "endpoint_hash"} <= columns
+
+
+# -- read-only mode (E2E-004) -------------------------------------------------
+
+
+def test_read_only_missing_path_raises_and_creates_nothing(tmp_path):
+    """E2E-004: mode=ro must not create the file or any parent directory."""
+    missing = tmp_path / "no-such-dir" / "typo.db"
+    with pytest.raises(sqlite3.OperationalError):
+        TelemetryStore(missing, read_only=True)
+    assert not missing.exists()
+    assert not missing.parent.exists()
+
+
+def test_read_only_reads_existing_db_identically(tmp_path):
+    """E2E-004: a read-only open reads the same rows as a read-write open."""
+    writer = TelemetryStore(tmp_path / "t.db")
+    writer.record_request(_event(cache_fingerprint="fp-1"))
+    writer.record_request(
+        _event(cache_fingerprint="fp-2", outcome=Outcome.MISS_REBUILT)
+    )
+    writer.record_churn(_churn())
+    writer.close()
+
+    read_write = TelemetryStore(tmp_path / "t.db")
+    read_only = TelemetryStore(tmp_path / "t.db", read_only=True)
+    try:
+        assert read_only.aggregates() == read_write.aggregates()
+        rows = read_only.recent_events(limit=10)
+        assert [row.cache_fingerprint for row in rows] == ["fp-2", "fp-1"]
+        assert len(read_only.churn_list(limit=10)) == 1
+    finally:
+        read_only.close()
+        read_write.close()
+
+
+def test_read_only_store_refuses_writes(tmp_path):
+    """E2E-004: a read-only open can never modify the database."""
+    writer = TelemetryStore(tmp_path / "t.db")
+    writer.record_request(_event(cache_fingerprint="fp-1"))
+    writer.close()
+
+    read_only = TelemetryStore(tmp_path / "t.db", read_only=True)
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            read_only.record_request(_event(cache_fingerprint="fp-2"))
+    finally:
+        read_only.close()
+
+
+def test_default_connect_creates_schema_on_missing_path(tmp_path):
+    """E2E-004: the default read-write mode still bootstraps a fresh DB."""
+    db = tmp_path / "fresh.db"
+    store = TelemetryStore(db)
+    store.close()
+    assert db.is_file()
+    conn = sqlite3.connect(db)
+    try:
+        tables = {
+            row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+    finally:
+        conn.close()
+    assert {
+        "request_events",
+        "churn_events",
+        "leases",
+        "provider_profiles",
+        "ttl_observations",
+        "route_events",
+    } <= tables
