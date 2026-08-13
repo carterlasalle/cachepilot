@@ -14,7 +14,8 @@ every commit to a `gitreins task complete`.
 | ID | Task | Pri | Cpx | Deps | Tags | Model | Reasoning | Fallback |
 |----|------|-----|-----|------|------|-------|-----------|----------|
 
-| E2E-001 | E2E Testing Tick (self-improving loop) — spawn Luna (browser/screenshots) or Step 3.7 Flash (CLI/API). Deploy/build, Playwright, screenshots, endpoints, console. → e2e-output/tasks.md → inject into board. Every 5-10 ticks. Run 1 (2026-08-13, e838b28): 463 pytest pass, smoke 52/52, yarn build ✓, relay pass-through ✓, 4 findings → E2E-002..005. Next run: browser/Luna variant for console+visual checks. | High | 4±1 | P12 | ++testing, +browser, +vision | GPT-5.6 Luna | Visual verification | Step 3.7 Flash |
+| E2E-001 | E2E Testing Tick (self-improving loop) — spawn Luna (browser/screenshots) or Step 3.7 Flash (CLI/API). Deploy/build, Playwright, screenshots, endpoints, console. → e2e-output/tasks.md → inject into board. Every 5-10 ticks. Run 1 (2026-08-13, e838b28): 463 pytest pass, smoke 52/52, yarn build ✓, relay pass-through ✓, 4 findings → E2E-002..005. Run 2 (2026-08-13, 3300078, browser/Luna variant): console clean (0 JS errors), visual checks at 1280/768/320px, live polling ✓, read-only contract ✓, 1 finding → E2E-006. Next run: every 5-10 ticks. | High | 4±1 | P12 | ++testing, +browser, +vision | GPT-5.6 Luna | Visual verification | Step 3.7 Flash |
+| E2E-006 | Fix 320px mobile layout — fixed 230px sidebar leaves ~90px for main content; Overview cards clipped off-screen, no mobile nav/reflow (E2E-001 run 2 finding, evidence e2e-output/run2-screenshots/empty-overview-320-800-settled.png). Add mobile breakpoint: collapse sidebar (drawer/horizontal nav), make card grids + topbar responsive, readable empty-state text at 320px. | Medium | 3±1 | P12 | ++frontend, +css, +browser, -backend | Hy3 | Low | DS-V4-Flash |
 
 ## Completed
 

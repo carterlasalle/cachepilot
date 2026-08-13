@@ -167,7 +167,7 @@ uv run ruff check .       → [] (exit 0)
 uv run pytest -q          → Pytest: 482 passed
 cd dashboard && yarn install → Yarn 4.18.0, done
 cd dashboard && yarn build   → 43 modules transformed; Vite build exit 0
-uv run python dashboard/backend/smoke_test.py → SMOKE TEST PASSED, 52 checks, exit 0
+uv run python dashboard/backend/smoke_test.py → SMOKE TEST PASSED (70 PASS lines), exit 0
 ```
 
 ### Browser setup and seeded data — PASS
