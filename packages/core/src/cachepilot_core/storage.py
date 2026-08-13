@@ -39,6 +39,7 @@ from cachepilot_core.telemetry import (
     Outcome,
     TelemetryEvent,
 )
+from cachepilot_core.ttl import StoredTTLObservation, TTLProfile
 
 logger = logging.getLogger("cachepilot_core.storage")
 
@@ -142,6 +143,37 @@ CREATE TABLE IF NOT EXISTS leases (
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_leases_session_cache ON leases(session_hash, cache_fingerprint);
+
+CREATE TABLE IF NOT EXISTS provider_profiles (
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    api_mode TEXT NOT NULL,
+    endpoint_hash TEXT NOT NULL,
+    route_hash TEXT,
+    ttl_lower_s REAL,
+    ttl_upper_s REAL,
+    ttl_estimate_s REAL,
+    ttl_confidence REAL NOT NULL,
+    latency_p50_ms REAL,
+    latency_p95_ms REAL,
+    sample_count INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    profile_key TEXT NOT NULL UNIQUE
+);
+CREATE INDEX IF NOT EXISTS idx_provider_profiles_route
+    ON provider_profiles(provider, model, api_mode, endpoint_hash, route_hash);
+
+CREATE TABLE IF NOT EXISTS ttl_observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    cache_fingerprint TEXT NOT NULL,
+    route_hash TEXT,
+    idle_age_s REAL,
+    outcome TEXT NOT NULL,
+    clean INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_ttl_observations_cache_fp
+    ON ttl_observations(cache_fingerprint, timestamp);
 """
 
 
@@ -325,6 +357,66 @@ def _row_to_churn_event(row: tuple[Any, ...]) -> ChurnEvent:
         route_changed=bool(row[11]),
         cache_key_changed=bool(row[12]),
         model_changed=bool(row[13]),
+    )
+
+
+#: ``provider_profiles`` columns in row order (P08, PRD §82).
+_PROFILE_COLUMNS = (
+    "provider",
+    "model",
+    "api_mode",
+    "endpoint_hash",
+    "route_hash",
+    "ttl_lower_s",
+    "ttl_upper_s",
+    "ttl_estimate_s",
+    "ttl_confidence",
+    "latency_p50_ms",
+    "latency_p95_ms",
+    "sample_count",
+    "updated_at",
+    "profile_key",
+)
+
+#: ``ttl_observations`` columns in row order (P08, PRD §82).
+_TTL_OBSERVATION_COLUMNS = (
+    "id",
+    "timestamp",
+    "cache_fingerprint",
+    "route_hash",
+    "idle_age_s",
+    "outcome",
+    "clean",
+)
+
+
+def _row_to_profile(row: tuple[Any, ...]) -> TTLProfile:
+    return TTLProfile(
+        provider=row[0],
+        model=row[1],
+        api_mode=row[2],
+        endpoint_hash=row[3],
+        route_hash=row[4],
+        lower_bound_s=row[5],
+        upper_bound_s=row[6],
+        estimated_ttl_s=row[7],
+        confidence=row[8],
+        latency_p50_ms=row[9],
+        latency_p95_ms=row[10],
+        sample_count=row[11],
+        updated_at=datetime.fromisoformat(row[12]),
+    )
+
+
+def _row_to_ttl_observation(row: tuple[Any, ...]) -> StoredTTLObservation:
+    return StoredTTLObservation(
+        id=row[0],
+        timestamp=datetime.fromisoformat(row[1]),
+        cache_fingerprint=row[2],
+        route_hash=row[3],
+        idle_age_s=row[4],
+        outcome=Outcome(row[5]),
+        clean=bool(row[6]),
     )
 
 
@@ -653,6 +745,164 @@ class TelemetryStore:
             if cost is not None:
                 totals[provider] = totals.get(provider, Decimal(0)) + cost
         return totals
+
+    # -- TTL learning (P08: PRD §55-59, §82, §135) --------------------------
+
+    def upsert_profile(self, profile: TTLProfile) -> None:
+        """Insert or update one route profile (PRD §82 ``provider_profiles``).
+
+        Keyed by the derived ``profile_key`` (provider/model/api_mode/
+        endpoint_hash/route_hash — PRD §82); the identity columns are also
+        stored for inspection. TTL/latency values are REAL — the Decimal→
+        TEXT convention is reserved for money (invariant 4), never for TTLs.
+        """
+        with self._lock:
+            self._require_conn().execute(
+                """
+                INSERT INTO provider_profiles
+                    (provider, model, api_mode, endpoint_hash, route_hash,
+                     ttl_lower_s, ttl_upper_s, ttl_estimate_s, ttl_confidence,
+                     latency_p50_ms, latency_p95_ms, sample_count, updated_at,
+                     profile_key)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(profile_key) DO UPDATE SET
+                    ttl_lower_s = excluded.ttl_lower_s,
+                    ttl_upper_s = excluded.ttl_upper_s,
+                    ttl_estimate_s = excluded.ttl_estimate_s,
+                    ttl_confidence = excluded.ttl_confidence,
+                    latency_p50_ms = excluded.latency_p50_ms,
+                    latency_p95_ms = excluded.latency_p95_ms,
+                    sample_count = excluded.sample_count,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    profile.provider,
+                    profile.model,
+                    profile.api_mode,
+                    profile.endpoint_hash,
+                    profile.route_hash,
+                    profile.lower_bound_s,
+                    profile.upper_bound_s,
+                    profile.estimated_ttl_s,
+                    profile.confidence,
+                    profile.latency_p50_ms,
+                    profile.latency_p95_ms,
+                    profile.sample_count,
+                    (
+                        profile.updated_at.astimezone(UTC).isoformat(timespec="seconds")
+                        if profile.updated_at is not None
+                        else datetime.now(UTC).isoformat(timespec="seconds")
+                    ),
+                    profile.profile_key,
+                ),
+            )
+
+    def profile_for(self, key: str) -> TTLProfile | None:
+        """The route profile for one profile_key, or None (PRD §82)."""
+        with self._lock:
+            row = self._require_conn().execute(
+                f"SELECT {', '.join(_PROFILE_COLUMNS)} FROM provider_profiles "
+                "WHERE profile_key = ?",
+                (key,),
+            ).fetchone()
+        return _row_to_profile(row) if row is not None else None
+
+    def list_profiles(self, limit: int = 100) -> list[TTLProfile]:
+        """Route profiles, most recently updated first (PRD §76 ``cachepilot ttl``)."""
+        with self._lock:
+            rows = self._require_conn().execute(
+                f"SELECT {', '.join(_PROFILE_COLUMNS)} FROM provider_profiles "
+                "ORDER BY updated_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [_row_to_profile(row) for row in rows]
+
+    def record_ttl_observation(
+        self,
+        *,
+        timestamp: datetime,
+        cache_fingerprint: str,
+        route_hash: str | None,
+        idle_age_s: float | None,
+        outcome: Outcome,
+        clean: bool,
+    ) -> int:
+        """Append one TTL observation row (PRD §82 ``ttl_observations``)."""
+        with self._lock:
+            cur = self._require_conn().execute(
+                """
+                INSERT INTO ttl_observations
+                    (timestamp, cache_fingerprint, route_hash, idle_age_s,
+                     outcome, clean)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    timestamp.astimezone(UTC).isoformat(timespec="seconds"),
+                    cache_fingerprint,
+                    route_hash,
+                    idle_age_s,
+                    outcome.value,
+                    int(clean),
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+    def last_ttl_observation(self, cache_fingerprint: str) -> StoredTTLObservation | None:
+        """Most recent TTL observation for one cache fingerprint (pairing key)."""
+        with self._lock:
+            row = self._require_conn().execute(
+                f"SELECT {', '.join(_TTL_OBSERVATION_COLUMNS)} FROM ttl_observations "
+                "WHERE cache_fingerprint = ? ORDER BY id DESC LIMIT 1",
+                (cache_fingerprint,),
+            ).fetchone()
+        return _row_to_ttl_observation(row) if row is not None else None
+
+    def recent_ttl_observations(
+        self,
+        cache_fingerprint: str,
+        limit: int = 10,
+    ) -> list[StoredTTLObservation]:
+        """Consecutive observations of one cache fingerprint, newest first.
+
+        The learner's pairing query (PRD §55): idle age is the delta
+        between consecutive rows for the SAME cache fingerprint.
+        """
+        with self._lock:
+            rows = self._require_conn().execute(
+                f"SELECT {', '.join(_TTL_OBSERVATION_COLUMNS)} FROM ttl_observations "
+                "WHERE cache_fingerprint = ? ORDER BY id DESC LIMIT ?",
+                (cache_fingerprint, limit),
+            ).fetchall()
+        return [_row_to_ttl_observation(row) for row in rows]
+
+    def churn_between(
+        self,
+        cache_fingerprint: str,
+        start: datetime,
+        end: datetime,
+    ) -> bool:
+        """True when a churn event touched the fingerprint inside (start, end).
+
+        PRD §56 clean-check: an intervening identity change means the two
+        observations are NOT consecutive with stable cache identity, so the
+        pair must not refine TTL bounds.
+        """
+        with self._lock:
+            row = self._require_conn().execute(
+                """
+                SELECT 1 FROM churn_events
+                WHERE (previous_cache_fingerprint = ? OR new_cache_fingerprint = ?)
+                  AND timestamp > ? AND timestamp < ?
+                LIMIT 1
+                """,
+                (
+                    cache_fingerprint,
+                    cache_fingerprint,
+                    start.astimezone(UTC).isoformat(timespec="seconds"),
+                    end.astimezone(UTC).isoformat(timespec="seconds"),
+                ),
+            ).fetchone()
+        return row is not None
 
     # -- internals ----------------------------------------------------------
 

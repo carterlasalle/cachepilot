@@ -35,7 +35,11 @@ from starlette.responses import Response, StreamingResponse
 
 from cachepilot_relay.config import RelayConfig
 from cachepilot_relay.lease_controller import LeaseController, LeaseRequestContext
-from cachepilot_relay.observation import RequestObserver, strip_correlation_headers
+from cachepilot_relay.observation import (
+    RequestObserver,
+    extract_route_identity,
+    strip_correlation_headers,
+)
 from cachepilot_relay.warm_executor import HttpWarmExecutor
 
 logger = logging.getLogger("cachepilot_relay.proxy")
@@ -180,7 +184,11 @@ class RelayProxy:
         if should_stream(upstream):
             response_headers.pop("content-length", None)
             outcome = self._observe_streaming(request, url, body, upstream)
-            self._lease_end(lease_ctx, outcome or Outcome.SUCCESS_UNVERIFIED)
+            self._lease_end(
+                lease_ctx,
+                outcome or Outcome.SUCCESS_UNVERIFIED,
+                route_hash=extract_route_identity(url, upstream.headers).route_hash(),
+            )
             return StreamingResponse(
                 upstream.aiter_raw(),
                 status_code=upstream.status_code,
@@ -188,7 +196,12 @@ class RelayProxy:
             )
         response_body = b"".join([chunk async for chunk in upstream.aiter_raw()])
         outcome, usage = self._observe_bounded(request, url, body, response_body, upstream)
-        self._lease_end(lease_ctx, outcome or Outcome.SUCCESS_UNVERIFIED, usage=usage)
+        self._lease_end(
+            lease_ctx,
+            outcome or Outcome.SUCCESS_UNVERIFIED,
+            usage=usage,
+            route_hash=extract_route_identity(url, upstream.headers).route_hash(),
+        )
         return Response(response_body, status_code=upstream.status_code, headers=response_headers)
 
     # -- lease lifecycle (fail open: never breaks forwarding) ---------------
@@ -215,10 +228,11 @@ class RelayProxy:
         ctx: LeaseRequestContext | None,
         outcome: Outcome,
         usage: TokenUsage | None = None,
+        route_hash: str | None = None,
     ) -> None:
         if ctx is None or self.lease_controller is None:
             return
-        self.lease_controller.on_request_end(ctx, outcome, usage=usage)
+        self.lease_controller.on_request_end(ctx, outcome, usage=usage, route_hash=route_hash)
 
     # -- observation (fail open: never breaks forwarding) -------------------
 

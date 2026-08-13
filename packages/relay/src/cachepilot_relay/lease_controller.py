@@ -42,12 +42,14 @@ from cachepilot_core.leases import CacheLease, LeaseDecision, LeaseManager, Leas
 from cachepilot_core.snapshots import RequestSnapshot, SnapshotStore
 from cachepilot_core.storage import TelemetryStore
 from cachepilot_core.telemetry import Outcome
+from cachepilot_core.ttl import TTLResolver
 from cachepilot_core.usage import TokenUsage
 
 from cachepilot_relay.observation import (
     build_canonical_request,
     derive_auth_scope,
     parse_targets_count,
+    request_route_identity,
 )
 
 logger = logging.getLogger("cachepilot_relay.lease_controller")
@@ -93,6 +95,17 @@ class LeaseController:
         #: without one never stores snapshots and its leases stay
         #: non-warmable (fail closed for warming, invariant 9).
         self.snapshot_store = snapshot_store
+        self.store = store
+        #: P08 (PRD §59): the TTL override chain — force_seconds >
+        #: high-confidence learned TTL > adapter hint > default. The profile
+        #: lookup is the telemetry store; without a store the resolver falls
+        #: back to the hint/default tiers (never guesses unknown TTLs).
+        self.ttl_resolver = TTLResolver(
+            profile_lookup=self.store.profile_for if self.store is not None else None,
+            force_seconds=self.settings.ttl_force_seconds,
+            default_ttl_s=self.settings.default_ttl_s,
+            minimum_samples=self.settings.ttl_minimum_samples,
+        )
         self.manager = manager or LeaseManager(
             settings=self.settings,
             latency_p95_s=latency_p95_s,
@@ -102,8 +115,10 @@ class LeaseController:
             # (PRD §65 priority 2/3). None → unknown pricing → the economic
             # gate skips with SKIP_UNKNOWN_PRICING (no savings claimed).
             pricing=self.settings.pricing,
+            # P08: new leases resolve their TTL through the §59 hierarchy
+            # instead of the bootstrap default.
+            ttl_resolver=self.ttl_resolver,
         )
-        self.store = store
         self.enabled = enabled
         #: Synthetic target ids per lease, reconciling the plugin's per-session
         #: COUNT header with the manager's per-target-id API (PRD §149).
@@ -130,11 +145,18 @@ class LeaseController:
         if not self.enabled or not session_header:
             return None
         try:
+            # P08 (PRD §82): the route key must be stable across requests to
+            # the same upstream, so a request-time route identity (gateway +
+            # endpoint — the response is not back yet) feeds the canonical
+            # request instead of None. The observer folds any response-header
+            # signals in later; the controller reconciles the lease's route
+            # with the observed one in :meth:`on_request_end`.
+            route_hash = request_route_identity(upstream_url).route_hash()
             canonical = build_canonical_request(
                 body,
                 path=path,
                 upstream_url=upstream_url,
-                route_hash=None,
+                route_hash=route_hash,
                 auth_scope=derive_auth_scope(request_headers or {}),
             )
             lease = self.manager.find_or_create_lease(
@@ -170,6 +192,7 @@ class LeaseController:
         ctx: LeaseRequestContext,
         outcome: Outcome,
         usage: TokenUsage | None = None,
+        route_hash: str | None = None,
     ) -> None:
         """After the response: PRD §148 normal-request-reset with the outcome.
 
@@ -181,6 +204,10 @@ class LeaseController:
         When the observer normalized real usage for this request (P07), the
         lease's resume-cost estimates are refreshed from it (PRD §65) — this
         is the ONLY place cost data is written, never on scheduler ticks.
+
+        P08: the observed route (response headers) is authoritative for the
+        lease's route key (PRD §82), and the lease TTL is re-resolved
+        through the §59 hierarchy so a freshly learned profile takes effect.
         """
         if not self.enabled:
             return
@@ -190,6 +217,11 @@ class LeaseController:
                 self.manager.update_cost_estimates(ctx.lease_id, usage)
             lease = self.manager.get(ctx.lease_id)
             if lease is not None:
+                if route_hash is not None and lease.route_fingerprint != route_hash:
+                    # P08: reconcile the lease's route key with the observed
+                    # route so the resolver finds the learned profile.
+                    lease.route_fingerprint = route_hash
+                self.manager.refresh_ttl(ctx.lease_id)
                 self._persist(lease)
                 if outcome is Outcome.FAILED and self.snapshot_store is not None:
                     self.snapshot_store.drop(lease.cache_fingerprint)

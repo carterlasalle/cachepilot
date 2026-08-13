@@ -12,7 +12,11 @@ The relay observes WITHOUT changing pass-through behaviour (Phase 3 gate):
   SUCCESS_UNVERIFIED without touching the stream (usage parsing for streams
   is deferred to a later phase — pass-through purity comes first);
 - every write is wrapped fail-open: observation errors never break traffic
-  (AGENTS.md invariant 9).
+  (AGENTS.md invariant 9);
+- P08 (PRD §55-56): every recorded outcome is fed to the TTL learner, which
+  pairs consecutive same-fingerprint observations into idle ages and
+  refines route-keyed TTL bounds (only CLEAN observations — stable cache
+  identity and route — are applied).
 
 Only hashes, timestamps, usage, prices, route identities and outcomes are
 persisted (AGENTS.md invariant 10, PRD §30, §83).
@@ -37,6 +41,7 @@ from cachepilot_core.telemetry import (
     classify_outcome,
     usage_has_cache_telemetry,
 )
+from cachepilot_core.ttl import TTLLearner, TTLObservation
 from cachepilot_core.usage import TokenUsage, UsageNormalizer
 from pydantic import BaseModel, ConfigDict
 
@@ -273,6 +278,21 @@ def extract_route_identity(
     )
 
 
+def request_route_identity(upstream_url: str) -> RouteIdentity:
+    """Route identity observable at REQUEST time (before any response).
+
+    Only the request/connection facts are available then — gateway +
+    endpoint. Response-header signals (``x-provider`` etc.) are folded in
+    later by :func:`extract_route_identity`; when none are present the two
+    hashes are identical, keeping the lease's route key in sync with the
+    observed route (P08 TTL route keying, PRD §82).
+    """
+    return RouteIdentity(
+        gateway=provider_from_upstream(upstream_url),
+        endpoint=upstream_url,
+    )
+
+
 class RequestObserver:
     """Observes physical requests/responses and writes telemetry.
 
@@ -298,6 +318,11 @@ class RequestObserver:
             except Exception as exc:  # noqa: BLE001 — fail open: storage must never break the relay
                 logger.warning("telemetry store unavailable; observation disabled: %s", exc)
                 self.store = None
+        #: P08 TTL learner over the same store (PRD §55-56): every recorded
+        #: outcome is fed in; pairing + refinement happen inside the learner.
+        #: None when the store is unavailable — learning is best-effort and
+        #: never blocks traffic (fail open, invariant 9).
+        self._learner = TTLLearner(self.store) if self.store is not None else None
 
     def close(self) -> None:
         if self.store is not None:
@@ -488,6 +513,51 @@ class RequestObserver:
         self.store.record_request(event)
         if previous is not None and previous.cache_fingerprint != event.cache_fingerprint:
             self._record_churn(previous, event)
+        # P08: the learner pairs consecutive same-fingerprint observations
+        # into idle ages and refines route TTL bounds (PRD §55-56). Best
+        # effort — a learner error never breaks traffic (fail open).
+        self._feed_ttl_learner(
+            canonical,
+            cache_fp=event.cache_fingerprint,
+            outcome=outcome,
+            route_hash=route_hash,
+            timestamp=timestamp,
+        )
+
+    def _feed_ttl_learner(
+        self,
+        canonical: CanonicalRequest,
+        *,
+        cache_fp: str,
+        outcome: Outcome,
+        route_hash: str | None,
+        timestamp: datetime,
+    ) -> None:
+        """P08: feed one observed outcome into the TTL learner (PRD §55-56).
+
+        The learner pairs consecutive same-fingerprint observations into
+        idle ages, applies only CLEAN ones (stable cache identity + stable
+        route, no intervening churn — §56), and upserts the route profile.
+        Fail-open: any learner/store error is logged and never breaks
+        traffic (AGENTS.md invariant 9).
+        """
+        if self._learner is None:
+            return
+        try:
+            self._learner.learn(
+                TTLObservation(
+                    outcome=outcome,
+                    cache_fingerprint=cache_fp,
+                    route_hash=route_hash,
+                    provider=canonical.provider,
+                    model=canonical.model,
+                    api_mode=canonical.api_mode.value,
+                    endpoint=canonical.endpoint,
+                    timestamp=timestamp,
+                )
+            )
+        except Exception:
+            logger.warning("ttl learning failed (traffic unaffected)", exc_info=True)
 
     def _record_churn(self, previous: Any, event: TelemetryEvent) -> None:
         if self.store is None:

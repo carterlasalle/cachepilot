@@ -12,6 +12,7 @@ from cachepilot_cli.main import main
 from cachepilot_core.leases import CacheLease, LeaseState
 from cachepilot_core.storage import ENV_TELEMETRY_DB, TelemetryStore
 from cachepilot_core.telemetry import ChurnEvent, Outcome, TelemetryEvent
+from cachepilot_core.ttl import TTLProfile, endpoint_hash
 from cachepilot_core.usage import TokenUsage
 
 
@@ -260,3 +261,62 @@ def test_costs_empty_db_still_never_claims_savings(tmp_path, capsys):
 def test_unknown_subcommand_fails(tmp_path, capsys):
     with pytest.raises(SystemExit):
         main(["frobnicate"])
+
+
+# -- ttl (P08, PRD §76/§82) ---------------------------------------------------
+
+
+def test_ttl_empty_db_says_no_profiles(tmp_path, capsys):
+    TelemetryStore(tmp_path / "telemetry.db").close()
+    assert main(["ttl", "--db", str(tmp_path / "telemetry.db")]) == 0
+    out = capsys.readouterr().out
+    assert "no TTL profiles yet" in out
+    assert "Route:" not in out  # no fabricated profiles
+
+
+def test_ttl_lists_learned_profiles(tmp_path, capsys):
+    store = TelemetryStore(tmp_path / "telemetry.db")
+    store.upsert_profile(
+        TTLProfile(
+            provider="openrouter",
+            model="deepseek-v4-flash",
+            api_mode="chat",
+            endpoint_hash=endpoint_hash("https://openrouter.ai/api/v1"),
+            route_hash="route-abc",
+            lower_bound_s=183.0,
+            upper_bound_s=302.0,
+            estimated_ttl_s=224.65,
+            confidence=0.7,
+            sample_count=5,
+        )
+    )
+    store.close()
+    assert main(["ttl", "--db", str(tmp_path / "telemetry.db")]) == 0
+    out = capsys.readouterr().out
+    assert "TTL profiles (route-keyed, PRD §82)" in out
+    assert "Route: openrouter | deepseek-v4-flash | chat" in out
+    assert "route-abc" in out  # short route hash is shown
+    assert "estimated     225s" in out  # 224.65 → 225s
+    assert "lower bound   183s" in out
+    assert "upper bound   302s" in out
+    assert "confidence    0.70" in out
+    assert "samples       5" in out
+
+
+def test_ttl_unknown_values_stay_unknown(tmp_path, capsys):
+    store = TelemetryStore(tmp_path / "telemetry.db")
+    store.upsert_profile(
+        TTLProfile(
+            provider="openrouter",
+            model="deepseek-v4-flash",
+            api_mode="chat",
+            endpoint_hash=endpoint_hash("https://openrouter.ai/api/v1"),
+            route_hash=None,
+            sample_count=1,
+        )
+    )
+    store.close()
+    assert main(["ttl", "--db", str(tmp_path / "telemetry.db")]) == 0
+    out = capsys.readouterr().out
+    assert "unknown" in out  # never silently guess (PRD §59)
+    assert "route         none" in out

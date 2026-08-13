@@ -58,6 +58,7 @@ from cachepilot_core.economics import EconomicConfig, EconomicController, WarmDe
 from cachepilot_core.pricing import CostResolver, PricingTable, estimate_cost, estimate_resume_costs
 from cachepilot_core.snapshots import SnapshotStore
 from cachepilot_core.telemetry import Outcome
+from cachepilot_core.ttl import TTLResolver
 from cachepilot_core.usage import TokenUsage
 
 logger = logging.getLogger("cachepilot_core.leases")
@@ -70,6 +71,11 @@ ENV_JITTER_FRACTION = "CACHEPILOT_LEASE_JITTER_FRACTION"
 ENV_DEFAULT_TTL_S = "CACHEPILOT_LEASE_DEFAULT_TTL_S"
 ENV_SCHEDULER_INTERVAL_S = "CACHEPILOT_LEASE_SCHEDULER_INTERVAL_S"
 ENV_DRY_RUN = "CACHEPILOT_LEASE_DRY_RUN"
+
+#: Environment variables for TTL learning (P08, PRD §59, §84
+#: ``cache.ttl_learning``).
+ENV_TTL_FORCE_SECONDS = "CACHEPILOT_TTL_FORCE_SECONDS"
+ENV_TTL_MINIMUM_SAMPLES = "CACHEPILOT_TTL_MINIMUM_SAMPLES"
 
 #: Environment variables for the economic controller (PRD §60-61, §63, §84
 #: ``cache.economics`` block).
@@ -193,6 +199,13 @@ class LeaseSettings(BaseModel):
     jitter_fraction: float = Field(default=0.03, ge=0.0, le=1.0)
     default_ttl_s: float = Field(default=300.0, gt=0.0)
     scheduler_interval_s: float = Field(default=1.0, gt=0.0)
+    #: PRD §59 tier 1: an explicit configured TTL overrides everything.
+    #: ``None`` = not set → the learned/hint/default chain applies.
+    ttl_force_seconds: float | None = Field(default=None, gt=0.0)
+    #: PRD §84 ``ttl_learning.minimum_samples``: the learned TTL tier (PRD
+    #: §59 tier 2) also needs at least this many observations, alongside
+    #: confidence ≥ 0.7.
+    ttl_minimum_samples: int = Field(default=3, ge=1)
     #: Phase 5: the warm executor logs ``WOULD WARM`` and never sends a
     #: network request (PRD §132).
     dry_run: bool = True
@@ -222,6 +235,8 @@ class LeaseSettings(BaseModel):
             jitter_fraction=_env_float(env.get(ENV_JITTER_FRACTION), 0.03),
             default_ttl_s=_env_float(env.get(ENV_DEFAULT_TTL_S), 300.0),
             scheduler_interval_s=_env_float(env.get(ENV_SCHEDULER_INTERVAL_S), 1.0),
+            ttl_force_seconds=_env_float_or_none(env.get(ENV_TTL_FORCE_SECONDS)),
+            ttl_minimum_samples=_env_int(env.get(ENV_TTL_MINIMUM_SAMPLES), 3),
             dry_run=_env_flag(env.get(ENV_DRY_RUN, "true"), True),
             economics=EconomicConfig(
                 enabled=_env_flag(env.get(ENV_ECONOMICS_ENABLED, "true"), True),
@@ -323,6 +338,7 @@ class LeaseManager:
         pricing: PricingTable | None = None,
         price_override: Decimal | None = None,
         economic_controller: EconomicController | None = None,
+        ttl_resolver: TTLResolver | None = None,
     ) -> None:
         self.settings = settings or LeaseSettings()
         self.time_fn = time_fn
@@ -339,6 +355,10 @@ class LeaseManager:
         self.economic_controller = economic_controller or EconomicController(
             self.settings.economics
         )
+        #: P08 (PRD §59): resolves the TTL override hierarchy (force_seconds
+        #: > high-confidence learned TTL > adapter hint > default). Without
+        #: one, leases use the configured ``default_ttl_s`` (bootstrap).
+        self.ttl_resolver = ttl_resolver
         self._cost_resolver = CostResolver()
         self._leases: dict[str, CacheLease] = {}
         self._by_cache_fingerprint: dict[str, str] = {}
@@ -395,6 +415,12 @@ class LeaseManager:
           lease is INVALIDATED and a fresh, independent lease is created —
           a model switch must NEVER refresh the old model's lease.
         - Leases for different providers coexist (PRD §21 multi-lease).
+
+        P08 (PRD §59): when no explicit ``estimated_ttl_s`` is supplied and
+        a :class:`TTLResolver` is configured, the new lease's TTL is
+        resolved through the override hierarchy for its route instead of
+        the bootstrap default. An unknown TTL is never guessed — the
+        resolver's chain ends at the configured default.
         """
         existing_id = self._by_cache_fingerprint.get(cache_fingerprint)
         if existing_id is not None and self._leases[existing_id].session_id == session_id:
@@ -413,6 +439,20 @@ class LeaseManager:
                     provider,
                 )
                 self.invalidate(lease_id)
+        ttl_s = estimated_ttl_s
+        ttl_confidence_value = ttl_confidence
+        if ttl_s is None and self.ttl_resolver is not None:
+            # P08 (PRD §59): resolve through the override hierarchy for the
+            # lease's route instead of the bootstrap default.
+            resolution = self.ttl_resolver.resolve(
+                provider=provider,
+                model=model,
+                api_mode=api_mode,
+                endpoint=base_url,
+                route_hash=route_fingerprint,
+            )
+            ttl_s = resolution.ttl_s
+            ttl_confidence_value = resolution.confidence
         lease = CacheLease(
             lease_id=str(uuid.uuid4()),
             session_id=session_id,
@@ -431,9 +471,9 @@ class LeaseManager:
             last_cache_touch_at=None,
             last_confirmed_hit_at=None,
             estimated_ttl_s=(
-                estimated_ttl_s if estimated_ttl_s is not None else self.settings.default_ttl_s
+                ttl_s if ttl_s is not None else self.settings.default_ttl_s
             ),
-            ttl_confidence=ttl_confidence,
+            ttl_confidence=ttl_confidence_value,
         )
         self._leases[lease.lease_id] = lease
         self._by_cache_fingerprint[cache_fingerprint] = lease.lease_id
@@ -549,6 +589,28 @@ class LeaseManager:
             # §47: no watchdog relevance — the final normal request is the
             # last consumer of this cache entry.
             lease.disarm()
+
+    def refresh_ttl(self, lease_id: str) -> CacheLease:
+        """P08: re-resolve the lease's TTL through the configured resolver.
+
+        Called by the relay after every observed request so a freshly
+        learned profile (or a new ``force_seconds``) is picked up. A
+        manager without a :class:`TTLResolver` keeps whatever TTL the lease
+        already carries (bootstrap default or explicit value).
+        """
+        lease = self._require(lease_id)
+        if self.ttl_resolver is None:
+            return lease
+        resolution = self.ttl_resolver.resolve(
+            provider=lease.provider,
+            model=lease.model,
+            api_mode=lease.api_mode,
+            endpoint=lease.base_url,
+            route_hash=lease.route_fingerprint,
+        )
+        lease.estimated_ttl_s = resolution.ttl_s
+        lease.ttl_confidence = resolution.confidence
+        return lease
 
     # -- scheduler -----------------------------------------------------------
 
@@ -959,6 +1021,33 @@ def _env_float(raw: str | None, default: float) -> float:
         return float(raw.strip())
     except ValueError:
         return default
+
+
+def _env_float_or_none(raw: str | None) -> float | None:
+    """Parse an optional positive float env var (PRD §59 ``force_seconds``).
+
+    Absent/blank/malformed/non-positive values resolve to None (not set) —
+    a bad variable can never break the relay (fail open) nor bypass the
+    learned/hint/default chain with a nonsense override.
+    """
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def _env_int(raw: str | None, default: int) -> int:
+    """Parse a positive integer env var, falling back on malformed values."""
+    if raw is None:
+        return default
+    try:
+        value = int(raw.strip())
+    except (TypeError, ValueError):
+        return default
+    return value if value >= 1 else default
 
 
 def _env_flag(raw: str | None, default: bool) -> bool:

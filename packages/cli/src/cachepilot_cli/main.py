@@ -12,6 +12,10 @@ Subcommands:
 - ``costs``: recorded provider-returned cost from ``request_events`` (total
   and per provider). Labeled recorded-cost-only: "money saved" is never
   shown when cost data are incomplete (PRD §79, AGENTS.md invariant 4).
+- ``ttl``: route-keyed learned TTL profiles from the telemetry store (PRD
+  §76, §82) — estimated TTL, lower/upper bounds, confidence, sample count
+  per route (provider/model/api_mode/endpoint_hash/route_hash). Empty
+  databases say "no TTL profiles yet" — never fabricated profiles.
 
 The telemetry database comes from ``--db``, else ``CACHEPILOT_TELEMETRY_DB``,
 else ``~/.hermes/cachepilot/cachepilot.db`` (PRD §81).
@@ -83,6 +87,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="recorded costs from request_events (recorded-cost-only)",
     )
     costs_parser.set_defaults(handler=cmd_costs)
+
+    ttl_parser = sub.add_parser(
+        "ttl",
+        parents=[db_flag],
+        help="route-keyed learned TTL profiles from the telemetry store (PRD §76, §82)",
+    )
+    ttl_parser.set_defaults(handler=cmd_ttl)
 
     args = parser.parse_args(argv)
     return int(args.handler(args))
@@ -238,3 +249,45 @@ def cmd_costs(args: argparse.Namespace) -> int:
         for provider in sorted(totals):
             print(f"    {provider:<{width}}  ${totals[provider]:.6f}")
     return 0
+
+
+# -- ttl -------------------------------------------------------------------
+
+
+def cmd_ttl(args: argparse.Namespace) -> int:
+    """Route-keyed learned TTL profiles (PRD §76 ``cachepilot ttl``, §82).
+
+    Rows are whatever the learner actually persisted — never fabricated.
+    An empty database says so, and unknown TTL values are shown as
+    ``unknown`` (PRD §59: never silently guess).
+    """
+    store = TelemetryStore(args.db)
+    try:
+        profiles = store.list_profiles(limit=100)
+    finally:
+        store.close()
+    if not profiles:
+        print("no TTL profiles yet (learning needs repeated observations of a stable route)")
+        return 0
+    print("TTL profiles (route-keyed, PRD §82)")
+    print()
+    for profile in profiles:
+        print(f"Route: {profile.provider} | {profile.model} | {profile.api_mode}")
+        print(f"  endpoint      {_short_hash(profile.endpoint_hash)}")
+        print(f"  route         {_short_hash(profile.route_hash)}")
+        print(f"  estimated     {_ttl_value(profile.estimated_ttl_s)}")
+        print(f"  lower bound   {_ttl_value(profile.lower_bound_s)}")
+        print(f"  upper bound   {_ttl_value(profile.upper_bound_s)}")
+        print(f"  confidence    {profile.confidence:.2f}")
+        print(f"  samples       {profile.sample_count}")
+    return 0
+
+
+def _short_hash(value: str | None) -> str:
+    """Short display form of a hash (route key component, PRD §82)."""
+    return f"{value[:12]}\u2026" if value else "none"
+
+
+def _ttl_value(value: float | None) -> str:
+    """Display a TTL bound; unknown stays unknown (PRD §59)."""
+    return "unknown" if value is None else f"{value:.0f}s"

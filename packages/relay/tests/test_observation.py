@@ -32,13 +32,16 @@ from cachepilot_core.fingerprint import cache_fingerprint, request_fingerprint
 from cachepilot_core.identity import ApiMode, CanonicalRequest
 from cachepilot_core.storage import TelemetryStore
 from cachepilot_core.telemetry import Outcome
+from cachepilot_core.usage import TokenUsage
 from cachepilot_relay.observation import (
+    RequestObserver,
     RouteIdentity,
     build_canonical_request,
     derive_auth_scope,
     extract_route_identity,
     parse_targets_count,
     provider_from_upstream,
+    request_route_identity,
     strip_correlation_headers,
 )
 from helpers import DifferentialHarness
@@ -567,3 +570,77 @@ def test_build_canonical_request_api_mode_from_path():
         auth_scope="relay-default",
     )
     assert completion.api_mode is ApiMode.COMPLETION
+
+
+def test_request_route_identity_matches_response_route_without_header_signals():
+    """P08: the request-time route key equals the observed one when the
+    response carries no route headers — so the lease resolver finds the
+    learned profile (PRD §82)."""
+    upstream = "https://fake-provider.invalid/v1"
+    request_route = request_route_identity(upstream)
+    response_route = extract_route_identity(upstream, {})
+    assert request_route == response_route
+    assert request_route.route_hash() == response_route.route_hash()
+    assert request_route.route_hash() is not None
+    # a response-header signal changes the observed route, never the
+    # request-time one
+    signalled = extract_route_identity(upstream, {"x-provider": "other"})
+    assert signalled.route_hash() != request_route.route_hash()
+
+
+# -- P08: TTL observation feed (PRD §55-56) -----------------------------------
+
+
+def test_observer_feeds_ttl_learner(tmp_path):
+    asyncio.run(_scenario_observer_feeds_ttl(tmp_path))
+
+
+async def _scenario_observer_feeds_ttl(tmp_path) -> None:
+    store = TelemetryStore(tmp_path / "obs.db")
+    observer = RequestObserver(store=store)
+    try:
+        # One shared fake provider: the first identical request misses
+        # (writes the prefix), the second hits — exactly PRD §55's evidence.
+        provider = FakeProvider(FakeProviderConfig(seed=7, completion_tokens=42))
+        canonical = CanonicalRequest.from_content(
+            provider="fake-provider",
+            model="gpt-5.2",
+            api_mode=ApiMode.CHAT,
+            endpoint="https://fake-provider.invalid/v1",
+            auth_scope="test-scope",
+            prompt_prefix="You are a helpful assistant.",
+            system="system prompt",
+        )
+
+        def _roundtrip() -> tuple[Outcome | None, TokenUsage]:
+            result = provider.complete(canonical)
+            response = provider_result_to_http_response(result)
+            headers = dict(response.headers)
+            headers["x-provider"] = result.provider
+            return observer.observe_bounded(
+                json.dumps(_COMPLETION_REQUEST).encode(),
+                response.content,
+                path="/v1/chat/completions",
+                upstream_url="https://fake-provider.invalid/v1",
+                status_code=response.status_code,
+                response_headers=headers,
+                session_header="sess-ttl-1",
+                auth_headers={"authorization": "Bearer sk-test-short"},
+            )
+
+        first_outcome, _ = _roundtrip()
+        assert first_outcome is Outcome.MISS_REBUILT
+        # ensure a strictly positive idle age between the two observations
+        await asyncio.sleep(0.01)
+        second_outcome, _ = _roundtrip()
+        assert second_outcome is Outcome.CONFIRMED_HIT
+
+        profiles = store.list_profiles()
+        assert len(profiles) == 1
+        profile = profiles[0]
+        assert profile.sample_count == 1  # the hit pair refined the profile
+        assert profile.lower_bound_s is not None and profile.lower_bound_s > 0
+        assert profile.confidence > 0.5  # verified hit raised confidence
+    finally:
+        observer.close()
+        store.close()
