@@ -117,32 +117,6 @@ class ReadOnlyTelemetryStore(TelemetryStore):
             raise
         self._conn: sqlite3.Connection | None = conn
 
-    def provider_summary(self) -> list[dict[str, Any]]:
-        """Per-provider request counts + recorded cost (read-only enrichment).
-
-        Feeds the status view's per-provider table. Both aggregates come
-        straight from ``request_events``; a provider with no recorded cost
-        reports ``recorded_cost_usd=None`` (unknown, never zero — the same
-        convention as the CLI's ``costs`` command).
-        """
-        with self._lock:
-            rows = self._require_conn().execute(
-                "SELECT provider, COUNT(*), SUM(cost_usd) FROM request_events "
-                "GROUP BY provider ORDER BY provider"
-            ).fetchall()
-        summary: list[dict[str, Any]] = []
-        for provider, count, cost_text in rows:
-            cost: float | None = None
-            if cost_text is not None:
-                try:
-                    cost = float(Decimal(str(cost_text)))
-                except (TypeError, ValueError, ArithmeticError):
-                    cost = None
-            summary.append(
-                {"provider": provider, "requests": int(count), "recorded_cost_usd": cost}
-            )
-        return summary
-
 
 def open_store(db_path: str | None = None) -> TelemetryStore | None:
     """Open the telemetry store read-only, or return None for an EMPTY store.

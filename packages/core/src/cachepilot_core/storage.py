@@ -909,6 +909,32 @@ class TelemetryStore:
             route_changes=route_changes,
         )
 
+    def provider_summary(self) -> list[dict[str, Any]]:
+        """Per-provider request counts + recorded cost (PRD §77, §79).
+
+        Both aggregates come straight from ``request_events``; a provider
+        with no recorded cost reports ``recorded_cost_usd=None`` (unknown,
+        never zero — the same convention as the CLI's ``costs`` command).
+        Read-only: never fabricates rows for providers with no telemetry.
+        """
+        with self._lock:
+            rows = self._require_conn().execute(
+                "SELECT provider, COUNT(*), SUM(cost_usd) FROM request_events "
+                "GROUP BY provider ORDER BY provider"
+            ).fetchall()
+        summary: list[dict[str, Any]] = []
+        for provider, count, cost_text in rows:
+            cost: float | None = None
+            if cost_text is not None:
+                try:
+                    cost = float(Decimal(str(cost_text)))
+                except (TypeError, ValueError, ArithmeticError):
+                    cost = None
+            summary.append(
+                {"provider": provider, "requests": int(count), "recorded_cost_usd": cost}
+            )
+        return summary
+
     def churn_list(self, limit: int = 50, session_hash: str | None = None) -> list[ChurnEvent]:
         """Most recent churn events, newest first (optionally one session)."""
         columns = ", ".join(_CHURN_EVENT_COLUMNS)
