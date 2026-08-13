@@ -254,10 +254,10 @@ def _finalize_report(
                 tool_routes, key=lambda key: (key is not None, key or "")
             )
         ]
-        for stats in report.tool_ordering:
-            if stats.pairs > 0:
-                stats.ordering_stability_pct = round(
-                    100.0 * (1 - stats.order_permutations / stats.pairs), 1
+        for tool_stats in report.tool_ordering:
+            if tool_stats.pairs > 0:
+                tool_stats.ordering_stability_pct = round(
+                    100.0 * (1 - tool_stats.order_permutations / tool_stats.pairs), 1
                 )
     return report
 

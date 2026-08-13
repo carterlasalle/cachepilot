@@ -501,11 +501,11 @@ def cmd_topology(args: argparse.Namespace) -> int:
             "  no decidable tool-set pairs recorded "
             "(tools_set_hash missing on pre-P11 rows)"
         )
-    for stats in report.tool_ordering:
+    for tool_stats in report.tool_ordering:
         print(
-            f"  {_short_hash(stats.route):<16} {stats.pairs:<7} "
-            f"{stats.tool_set_changes:<13} {stats.order_permutations:<20} "
-            f"{_pct(stats.ordering_stability_pct)}"
+            f"  {_short_hash(tool_stats.route):<16} {tool_stats.pairs:<7} "
+            f"{tool_stats.tool_set_changes:<13} {tool_stats.order_permutations:<20} "
+            f"{_pct(tool_stats.ordering_stability_pct)}"
         )
     return 0
 
