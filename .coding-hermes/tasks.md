@@ -20,6 +20,7 @@ every commit to a `gitreins task complete`.
 
 | ID | Task | Pri | Cpx | Commit | Model |
 |----|------|-----|-----|--------|-------|
+| DOCS-000 | Documentation gate — Launchpad-style README (badges/nav/diagram/tables, no stale claims), CONTRIBUTING.md, SECURITY.md, LICENSE (Apache-2.0), docs/cache-economics.md + threat-model.md + hermes-integration.md runbooks, AGENTS.md Key Files touch-up (judge PASS 88cab1cf) | High | 3±1 | 6f624ee | DS-V4-Flash |
 | P10 | Churn intelligence — layered prefix hashing (§24), system/tools/cache-key/route/history-boundary diff classification (§25, DETECT-only), likely cause + confidence, `cachepilot churn` + `explain-miss` CLIs, CACHEPILOT_CHURN_DETECTION_ENABLED flag (§164), churn_events schema migration (judge PASS 9241ec69) | Medium | 3±1 | 2bc4986 | DS-V4-Flash |
 | P00 | Research harness — fake provider (KV cache/TTL/usage/pricing simulator), canonical request repr, usage normalization, cache fingerprint, economic calculator; all offline-testable | Critical | 5±1 | 4d8017c | DS-V4-Flash |
 | P01 | Hermes plugin skeleton — manifest, middleware registration, lifecycle hooks, structured debug logs; CI test asserts stock Hermes unchanged (judge PASS ddfc8a00) | Critical | 3±1 | f423a54 (+2795b4b) | DS-V4-Flash |
@@ -32,22 +33,6 @@ every commit to a `gitreins task complete`.
 | P08 | TTL learning — route-aware learned bounds (lower/upper/estimate/confidence), observational refinement, `cachepilot ttl`; route changes must not corrupt bounds. TTLProfile per PRD §55, estimate §57, confidence §58, override hierarchy §59 (force > learned ≥0.7 > adapter hint > default), provider_profiles + ttl_observations tables §82, relay observation feed, lease TTL resolution wired (judge PASS 4a29492b) | High | 4±1 | c4d9b47 | DS-V4-Flash |
 | P09 | Route intelligence — RouteIdentity model (PRD §71: gateway/upstream/endpoint/region/deployment, only observable fields), UC-5 router-miss analysis (ROUTE_INSTABILITY vs SHORT_TTL vs CLEAN, route-change events, instability miss never reaches TTL bounds), optional economic route affinity (§73-74: lease-scoped/temporary/reversible, savings-vs-cost gate, CACHEPILOT_ROUTE_AFFINITY default off, applied only when adapter can_pin_route), `cachepilot routes` CLI with instability stats (judge PASS 720baed0) | Medium | 4±1 | 445c440 | DS-V4-Flash |
 | P-BOOT | Bootstrap — repo, AGENTS.md, docs/PRD.md (full spec), task board, gitreins, hilo, scheduler registration | Critical | 2±1 | — | DS-V4-Flash |
-
-## [ ] DOCS-000 — Documentation gate (completion-phase — do near the end, BEFORE E2E-001 / NEVER-DONE idle)
-
-Final documentation pass per the fleet docs gate. NOT a bootstrap task — this
-runs when implementation is substantially complete (after P10+), so the docs
-describe what was actually built:
-
-- Launchpad-style README: title + badges + nav + diagram + tables (skimmable)
-- CONTRIBUTING.md, SECURITY.md, AGENTS.md current
-- docs/ runbooks: architecture.md, provider-adapters.md, cache-economics.md,
-  threat-model.md, hermes-integration.md
-- GitHub repo description + 3-8 topics via gh repo edit
-- License file (Apache-2.0, per user decision for fleet repos)
-
-A stub/empty README does NOT satisfy this gate. Only when every required doc
-exists and meets the content bar may the project proceed to E2E verify / idle.
 
 ## [ ] NEVER-DONE — Run coding-hermes-never-done 14-point audit
 
