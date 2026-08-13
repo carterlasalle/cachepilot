@@ -1,8 +1,9 @@
 """cachepilot CLI — PRD §76-79, §126 (Phase 4: status/leases/costs).
 
 Subcommands:
-- ``status``: PRD §77-style output — version, mode, relay health (TCP probe
-  of the relay listen address), Hermes plugin state, then cache health
+- ``status``: PRD §77-style output — version, mode, relay health (HTTP
+  probe of the relay's local control endpoint, E2E-002), Hermes plugin
+  state, then cache health
   aggregated from the telemetry store (request count, hit %, per-outcome
   counts, churn events, route changes). Empty databases say "no telemetry
   recorded yet" — never fabricated numbers.
@@ -41,9 +42,12 @@ else ``~/.hermes/cachepilot/cachepilot.db`` (PRD §81).
 from __future__ import annotations
 
 import argparse
+import http.client
+import json
 import os
-import socket
 import time
+import urllib.error
+import urllib.request
 from collections.abc import Sequence
 from decimal import Decimal
 
@@ -57,16 +61,20 @@ from cachepilot_core.survival import curve_from_profile
 from cachepilot_core.telemetry import CacheHealthStats, ChurnEvent
 from cachepilot_core.topology import topology_from_store
 from cachepilot_core.ttl import TTLProfile
-from cachepilot_relay.config import DEFAULT_LISTEN, ENV_LISTEN, parse_listen
+from cachepilot_relay.config import DEFAULT_LISTEN, ENV_LISTEN, RELAY_HEALTH_PATH, parse_listen
 
 from cachepilot_cli import __version__ as CLI_VERSION
 from cachepilot_cli.churn import cmd_churn, cmd_explain_miss
 
 ENV_PLUGIN_ENABLED = "CACHEPILOT_ENABLED"
 
-#: Failure modes that prove a positive plugin-activity claim; the CLI is
-#: honest about the absence of evidence either way.
+#: Failure modes that prove a positive relay-presence claim; the CLI is
+#: honest about the absence of evidence either way (E2E-002).
 _RELAY_PROBE_TIMEOUT_S = 1.0
+
+#: Proxy-less opener: the relay probe targets loopback and must never be
+#: redirected through an http_proxy configured for the shell.
+_RELAY_PROBE_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -225,17 +233,42 @@ def _describe_churn(churn: ChurnEvent) -> str:
 
 
 def _relay_health() -> str:
-    """TCP probe of the relay listen address (PRD §77 'Relay: healthy')."""
+    """HTTP probe of the relay control endpoint (PRD §77 'Relay: healthy').
+
+    Honest by construction (E2E-002): 'healthy' requires the CachePilot
+    relay's own control endpoint to answer with its distinctive body — a
+    bare TCP connect, or ANY other HTTP server on the port, is NOT the
+    relay. A foreign HTTP server (e.g. hermes-webui squatting on
+    HERMES_WEBUI_PORT 8787) reads 'occupied by another service'; a closed
+    port or a listener that never speaks HTTP reads 'unreachable'.
+    """
     listen = os.environ.get(ENV_LISTEN) or DEFAULT_LISTEN
     try:
         host, port = parse_listen(listen)
     except ValueError:
         return f"unreachable (invalid {ENV_LISTEN}={listen!r})"
+    host_part = f"[{host}]" if ":" in host else host
+    url = f"http://{host_part}:{port}{RELAY_HEALTH_PATH}"
     try:
-        with socket.create_connection((host, port), timeout=_RELAY_PROBE_TIMEOUT_S):
-            return "healthy"
-    except OSError:
+        with _RELAY_PROBE_OPENER.open(url, timeout=_RELAY_PROBE_TIMEOUT_S) as response:
+            body = response.read()
+    except urllib.error.HTTPError:
+        # An HTTP server answered — just not the relay.
+        return "occupied by another service"
+    except (OSError, http.client.HTTPException):
         return "unreachable"
+    if response.status == 200 and _is_relay_health_body(body):
+        return "healthy"
+    return "occupied by another service"
+
+
+def _is_relay_health_body(body: bytes) -> bool:
+    """True only for the relay control endpoint's distinctive JSON body."""
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and payload.get("service") == "cachepilot-relay"
 
 
 def _plugin_state(stats: CacheHealthStats) -> str:
@@ -308,8 +341,7 @@ def cmd_costs(args: argparse.Namespace) -> int:
     total = sum(totals.values(), Decimal(0))
     print("Recorded costs (from request_events telemetry)")
     print(
-        "  NOTE: recorded-cost-only — cost data are incomplete; "
-        "net savings are unknown (PRD §79)"
+        "  NOTE: recorded-cost-only — cost data are incomplete; net savings are unknown (PRD §79)"
     )
     print(f"  total recorded      ${total:.6f}")
     if totals:
@@ -412,14 +444,18 @@ def cmd_routes(args: argparse.Namespace) -> int:
     finally:
         store.close()
     if not events:
-        print("no observed route changes yet (route intelligence records switches between repeated logical requests)")
+        print(
+            "no observed route changes yet (route intelligence records switches between repeated logical requests)"
+        )
         return 0
     print("Observed routes (PRD §71 identity, UC-5 instability)")
     print()
     for event in events:
         when = event.timestamp.strftime("%Y-%m-%d %H:%M:%S")
         print(f"{when} UTC  verdict={event.verdict.value}")
-        print(f"  route      {_short_hash(event.previous_route_hash)} -> {_short_hash(event.new_route_hash)}")
+        print(
+            f"  route      {_short_hash(event.previous_route_hash)} -> {_short_hash(event.new_route_hash)}"
+        )
         print(f"  gateway    {event.gateway or 'n/a'}")
         print(f"  upstream   {event.upstream_provider or 'n/a'}")
         print(f"  endpoint   {event.endpoint or 'n/a'}")
@@ -457,18 +493,12 @@ def cmd_topology(args: argparse.Namespace) -> int:
     if report.total_pairs == 0:
         print("no consecutive request pairs recorded yet — nothing to measure")
         return 0
-    print(
-        f"Cache topology (PRD §24/§138 measurement view) — "
-        f"last {args.limit} requests"
-    )
+    print(f"Cache topology (PRD §24/§138 measurement view) — last {args.limit} requests")
     print()
     print(f"  sessions                  {report.sessions}")
     print(f"  consecutive pairs         {report.total_pairs}")
     stability = _pct(report.prefix_stability_pct)
-    print(
-        f"  cache fingerprint churn   {report.churn_pairs}  "
-        f"(prefix stability {stability})"
-    )
+    print(f"  cache fingerprint churn   {report.churn_pairs}  (prefix stability {stability})")
     if report.attribution_gaps:
         print(
             f"  attribution gaps          {report.attribution_gaps}  "
@@ -492,15 +522,9 @@ def cmd_topology(args: argparse.Namespace) -> int:
         print("    events (exact layered hashes are memory-only, PRD §30)")
     print()
     print("Tool-schema ordering stability (per route):")
-    print(
-        f"  {'route':<16} {'pairs':<7} {'set changes':<13} "
-        f"{'order permutations':<20} stability"
-    )
+    print(f"  {'route':<16} {'pairs':<7} {'set changes':<13} {'order permutations':<20} stability")
     if not report.tool_ordering:
-        print(
-            "  no decidable tool-set pairs recorded "
-            "(tools_set_hash missing on pre-P11 rows)"
-        )
+        print("  no decidable tool-set pairs recorded (tools_set_hash missing on pre-P11 rows)")
     for tool_stats in report.tool_ordering:
         print(
             f"  {_short_hash(tool_stats.route):<16} {tool_stats.pairs:<7} "

@@ -59,9 +59,10 @@ Hermes (plugin)          relay (cachepilotd)                provider
   request_kind) and `churn_events` (per-session fingerprint transitions
   with change flags). Only hashes/timestamps/usage/prices/route identities/
   outcomes are persisted (AGENTS.md invariant 10).
-- **CLI** (`packages/cli`): `cachepilot status` (relay health via TCP
-  probe, plugin state, cache health: hit %, per-outcome counts, churn and
-  route changes), `cachepilot leases` (honest Phase 5 placeholder) and
+- **CLI** (`packages/cli`): `cachepilot status` (relay health via HTTP
+  probe of the relay's local control endpoint, plugin state, cache health:
+  hit %, per-outcome counts, churn and route changes), `cachepilot leases`
+  (honest Phase 5 placeholder) and
   `cachepilot costs` (recorded-cost-only totals — never "money saved",
   PRD §79).
 - **Fail open** (AGENTS.md invariant 9): every observation/storage error —

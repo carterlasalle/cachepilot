@@ -78,7 +78,7 @@ uv run cachepilotd --upstream https://api.openai.com/v1   # or CACHEPILOT_UPSTRE
 
 | Command | What it shows |
 |---|---|
-| `cachepilot status` | Relay health (TCP probe), plugin state, cache health: hit %, per-outcome counts (CONFIRMED_HIT / MISS_REBUILT / SUCCESS_UNVERIFIED / FAILED), churn + route-change counts |
+| `cachepilot status` | Relay health (HTTP probe of the relay control endpoint — healthy only when the relay itself answers), plugin state, cache health: hit %, per-outcome counts (CONFIRMED_HIT / MISS_REBUILT / SUCCESS_UNVERIFIED / FAILED), churn + route-change counts |
 | `cachepilot leases` | Real lease rows from the store — targets, cache age, TTL, state |
 | `cachepilot costs` | Recorded-cost-only totals (per provider) — net savings shown only when cost data are complete |
 | `cachepilot ttl` | Route-keyed learned TTL profiles: estimate, lower/upper bounds, confidence, sample count |

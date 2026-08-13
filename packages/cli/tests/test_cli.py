@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-import socket
+import threading
 import time
 from datetime import UTC, datetime
 from decimal import Decimal
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
+import uvicorn
 from cachepilot_cli.main import main
 from cachepilot_core.leases import CacheLease, LeaseState
 from cachepilot_core.route_intel import RouteChangeEvent, RouteMissVerdict
@@ -15,6 +17,8 @@ from cachepilot_core.storage import ENV_TELEMETRY_DB, TelemetryStore
 from cachepilot_core.telemetry import ChurnEvent, Outcome, TelemetryEvent
 from cachepilot_core.ttl import TTLProfile, endpoint_hash
 from cachepilot_core.usage import TokenUsage
+from cachepilot_relay.config import RelayConfig
+from cachepilot_relay.server import create_app
 
 
 def _event(**overrides) -> TelemetryEvent:
@@ -120,16 +124,90 @@ def test_status_shows_version_mode_and_relay_probe(tmp_path, capsys, monkeypatch
     assert "Relay: unreachable" in out
 
 
+def _start_real_relay() -> tuple[uvicorn.Server, threading.Thread, int]:
+    """Boot a real cachepilotd app (``create_app``) on an ephemeral port.
+
+    The relay runs in a daemon thread via uvicorn's blocking ``run()``; the
+    probe only ever touches the local control endpoint, so the upstream
+    (a closed loopback port) is never reached. Returns (server, thread,
+    bound_port).
+    """
+    config = RelayConfig(
+        upstream="http://127.0.0.1:1",
+        listen="127.0.0.1:0",
+        observation_enabled=False,
+    )
+    server = uvicorn.Server(
+        uvicorn.Config(
+            create_app(config),
+            host="127.0.0.1",
+            port=0,
+            log_level="warning",
+            access_log=False,
+        )
+    )
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.time() + 15.0
+    while not server.started:
+        if time.time() > deadline:
+            thread.join(5)
+            raise RuntimeError("relay did not start within 15s")
+        time.sleep(0.01)
+    port = server.servers[0].sockets[0].getsockname()[1]
+    return server, thread, port
+
+
 def test_status_relay_healthy_when_listening(tmp_path, capsys, monkeypatch):
+    """E2E-002: 'healthy' requires the REAL relay's control endpoint."""
     _seed_db(tmp_path)
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        listener.listen(1)
-        port = listener.getsockname()[1]
+    server, thread, port = _start_real_relay()
+    try:
         monkeypatch.setenv("CACHEPILOT_RELAY_LISTEN", f"127.0.0.1:{port}")
         assert main(["status", "--db", str(tmp_path / "telemetry.db")]) == 0
+    finally:
+        server.should_exit = True
+        thread.join(15)
     out = capsys.readouterr().out
     assert "Relay: healthy" in out
+
+
+class _ForeignHttpHandler(BaseHTTPRequestHandler):
+    """Minimal non-relay HTTP server (stands in for hermes-webui on 8787)."""
+
+    def do_GET(self) -> None:
+        body = b"<html><body>hermes web ui</body></html>"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: object) -> None:  # quiet access log
+        pass
+
+
+def test_status_relay_foreign_http_server_is_not_healthy(tmp_path, capsys, monkeypatch):
+    """E2E-002 repro: no cachepilotd, but an HTTP server on the relay port.
+
+    ANY HTTP server on the port must NOT read 'Relay: healthy' — the probe
+    now requires the relay's own control body, so hermes-webui squatting on
+    8787 reads 'occupied by another service' instead.
+    """
+    _seed_db(tmp_path)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _ForeignHttpHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        monkeypatch.setenv("CACHEPILOT_RELAY_LISTEN", f"127.0.0.1:{server.server_address[1]}")
+        assert main(["status", "--db", str(tmp_path / "telemetry.db")]) == 0
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(5)
+    out = capsys.readouterr().out
+    assert "Relay: healthy" not in out
+    assert "Relay: occupied by another service" in out
 
 
 def test_status_cache_health_from_telemetry(tmp_path, capsys):
@@ -383,7 +461,9 @@ def _seed_churn_events(store: TelemetryStore) -> None:
             "new_cache_fingerprint": f"fp-new-{index}",
         }
         if index == 8:
-            store.record_churn(ChurnEvent(route_changed=True, likely_cause="router affinity loss", **overrides))
+            store.record_churn(
+                ChurnEvent(route_changed=True, likely_cause="router affinity loss", **overrides)
+            )
         elif index == 9:
             store.record_churn(ChurnEvent(system_changed=True, **overrides))
         else:

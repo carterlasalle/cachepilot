@@ -132,6 +132,56 @@ yarn build          # tsc --noEmit && vite build
   Python packaging of its own and needs no `__init__.py`.
 - The backend only depends on the workspace `cachepilot_core` (plus the
   Python standard library). It does not import `cachepilot_relay` or the
-  plugin.
-- If port 8788 is taken, pass `--port` and update the Vite proxy in
-  `dashboard/vite.config.ts`.
+  plugin (the relay probe's control path is mirrored here and pinned by the
+  smoke test, which probes a REAL relay).
+- If port 8788 is taken, pass `--port` and update the Vite proxy (see
+  "Stock-Hermes hosts" below).
+
+## Stock-Hermes hosts: default-port overlap (E2E-002)
+
+CachePilot's two default ports are the same ones stock Hermes companion
+processes use, so on a stock Hermes host BOTH defaults may already be taken:
+
+| CachePilot default | Stock-Hermes occupant |
+|---|---|
+| Relay (`cachepilotd`) `127.0.0.1:8787` (PRD §26) | `hermes-webui` — `HERMES_WEBUI_PORT` default 8787 (`hermes-webui/api/config.py:51`) |
+| Dashboard backend `127.0.0.1:8788` | `hermes_cli`'s `mcp serve` companion |
+
+Both servers detect the collision at startup and fail with a clear,
+actionable error naming the occupied address and the override — never a
+bare `OSError: Address already in use`:
+
+```text
+cachepilotd: error: listen address 127.0.0.1:8787 is already in use — another process owns it ...
+[dashboard] error: listen address 127.0.0.1:8788 is already in use — another process owns it ...
+```
+
+Overrides:
+
+- **Relay**: `cachepilotd --listen 127.0.0.1:<free-port>` or
+  `CACHEPILOT_RELAY_LISTEN=127.0.0.1:<free-port>`; Hermes' provider base URL
+  must point at the same address.
+- **Dashboard backend**: `uv run python dashboard/backend/server.py --port <free-port>`
+  AND update the `/api` proxy target in `dashboard/vite.config.ts` (the dev
+  server proxies to `127.0.0.1:8788` by default; production `dist/` is
+  served same-origin by the backend, so only the dev flow needs the proxy
+  change).
+
+## Relay health field
+
+`GET /api/status` → `relay` (and `cachepilot status` → `Relay:`) is an HTTP
+probe of the relay's local control endpoint — `GET /cachepilot/health`, a
+path the relay answers itself and never forwards upstream (a narrow PRD §27
+deviation reserved for liveness). 'healthy' is only reported when that
+endpoint answers with its distinctive body, so the readout reflects actual
+CachePilot relay presence, not "anything listening on the port":
+
+| Value | Meaning |
+|---|---|
+| `healthy` | The CachePilot relay is running on the listen address (control endpoint answered) |
+| `occupied by another service` | An HTTP server answered, but it is NOT the CachePilot relay (e.g. `hermes-webui` on 8787, or the MCP server on 8788) |
+| `unreachable` | Nothing answered: port closed, a listener that never speaks HTTP, or an invalid `CACHEPILOT_RELAY_LISTEN` |
+
+A bare TCP connect no longer counts as healthy: with no `cachepilotd`
+running but `hermes-webui` on 8787, the readout is `occupied by another
+service`, never `healthy`.

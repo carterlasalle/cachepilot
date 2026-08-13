@@ -22,6 +22,15 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 #: Default listen address (PRD §26).
 DEFAULT_LISTEN = "127.0.0.1:8787"
 
+#: Local control endpoint proving CachePilot relay presence (E2E-002).
+#: This one path is answered by the relay itself and NEVER forwarded
+#: upstream (a deliberate PRD §27 deviation; see
+#: ``cachepilot_relay.server.create_app``). The CLI and dashboard relay
+#: probes GET it and require its distinctive JSON body before reporting
+#: 'healthy' — a bare TCP connect or any other HTTP server on the port is
+#: not the relay.
+RELAY_HEALTH_PATH = "/cachepilot/health"
+
 #: Environment variables, following the plugin's ``CACHEPILOT_*`` convention.
 ENV_LISTEN = "CACHEPILOT_RELAY_LISTEN"
 ENV_UPSTREAM = "CACHEPILOT_UPSTREAM"

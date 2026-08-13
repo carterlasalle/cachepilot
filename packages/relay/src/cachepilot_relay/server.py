@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import errno
 import logging
+import socket
 import sys
 import time
 from collections.abc import Sequence
@@ -28,12 +30,13 @@ import httpx
 import uvicorn
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
 
 from cachepilot_relay.config import (
     DEFAULT_LISTEN,
     ENV_LISTEN,
     ENV_UPSTREAM,
+    RELAY_HEALTH_PATH,
     RelayConfig,
     parse_listen,
 )
@@ -43,6 +46,46 @@ logger = logging.getLogger("cachepilot_relay")
 
 #: Every standard method is forwarded (PRD §27: forward EVERY request).
 _ALL_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "CONNECT", "TRACE")
+
+#: Distinctive control body proving CachePilot relay presence (E2E-002).
+#: The CLI and dashboard probes only report 'healthy' when the relay's own
+#: control endpoint answers with exactly this marker — any other HTTP
+#: server on the port (hermes-webui on HERMES_WEBUI_PORT 8787, ...) is
+#: reported as 'occupied by another service', never 'healthy'.
+RELAY_HEALTH_BODY = {"service": "cachepilot-relay", "status": "ok"}
+
+
+class ListenAddressInUseError(RuntimeError):
+    """The relay listen address is already bound by another process."""
+
+
+def check_listen_available(host: str, port: int) -> None:
+    """Fail fast with an actionable error when ``(host, port)`` is occupied.
+
+    E2E-002: the default ``127.0.0.1:8787`` collides with stock-Hermes
+    companion processes (``hermes-webui`` owns ``HERMES_WEBUI_PORT`` 8787 by
+    default), so a bare ``OSError: Address already in use`` traceback is not
+    actionable. Port 0 (OS-assigned ephemeral) can never be occupied in
+    advance and is skipped.
+    """
+    if port == 0:
+        return
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    with socket.socket(family, socket.SOCK_STREAM) as probe:
+        # Match uvicorn's bind semantics (SO_REUSEADDR), so a TIME_WAIT
+        # socket that the real bind could reuse does not false-positive.
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind((host, port))
+        except OSError as exc:
+            if exc.errno == errno.EADDRINUSE:
+                raise ListenAddressInUseError(
+                    f"listen address {host}:{port} is already in use — another "
+                    "process owns it (on a stock Hermes host this is typically "
+                    "hermes-webui, HERMES_WEBUI_PORT default 8787). Pick a free "
+                    f"address with --listen HOST:PORT or {ENV_LISTEN}."
+                ) from exc
+            raise
 
 
 def create_app(config: RelayConfig) -> Starlette:
@@ -63,6 +106,21 @@ def create_app(config: RelayConfig) -> Starlette:
             await client.aclose()
 
     app = Starlette(lifespan=lifespan)
+
+    async def control_health(request: Request) -> Response:
+        """Local control endpoint (E2E-002): proves relay presence.
+
+        Answered locally with a distinctive JSON body so the CLI/dashboard
+        relay probe can distinguish the relay from ANY other process on the
+        port. This one path is deliberately NOT forwarded upstream — a
+        narrow PRD §27 deviation (forward EVERY request) reserved for
+        liveness; every other path still passes through verbatim. The
+        response carries no relay-stamped headers (uvicorn serves it with
+        ``date_header=False``/``server_header=False`` like everything else).
+        """
+        return JSONResponse(RELAY_HEALTH_BODY)
+
+    app.add_route(RELAY_HEALTH_PATH, control_health, methods=["GET"])
 
     async def relay(request: Request) -> Response:
         started = time.monotonic()
@@ -108,13 +166,32 @@ class RelayServer:
         self._task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
-        """Bind and start accepting; raises TimeoutError if startup stalls."""
+        """Bind and start accepting; raises TimeoutError if startup stalls.
+
+        Raises :class:`ListenAddressInUseError` when the listen address is
+        already bound by another process (E2E-002) — checked BEFORE uvicorn
+        binds so the failure is immediate and actionable instead of a 15s
+        stall into a misleading timeout.
+        """
         if self._task is not None:
             return
+        host, port = parse_listen(self.config.listen)
+        check_listen_available(host, port)
         self._task = asyncio.create_task(self._server.serve())
         loop = asyncio.get_running_loop()
         deadline = loop.time() + 15.0
         while not self._server.started:
+            if self._task.done():
+                # Race between the probe and uvicorn's bind (or any other
+                # startup failure): surface the real error, not a timeout.
+                exc = self._task.exception()
+                if isinstance(exc, OSError) and exc.errno == errno.EADDRINUSE:
+                    raise ListenAddressInUseError(
+                        f"listen address {host}:{port} is already in use — another "
+                        "process owns it. Pick a free address with "
+                        f"--listen HOST:PORT or {ENV_LISTEN}."
+                    ) from exc
+                self._task.result()  # re-raise anything else
             if loop.time() > deadline:
                 raise TimeoutError("cachepilotd relay did not start within 15s")
             await asyncio.sleep(0.005)
@@ -197,6 +274,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         asyncio.run(_serve(config))
+    except ListenAddressInUseError as exc:
+        print(f"cachepilotd: error: {exc}", file=sys.stderr)
+        return 2
     except KeyboardInterrupt:
         pass
     return 0

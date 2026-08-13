@@ -35,12 +35,17 @@ Run (from the repo root, so ``uv`` resolves the workspace venv):
 from __future__ import annotations
 
 import argparse
+import errno
+import http.client
 import json
 import mimetypes
 import os
 import socket
 import sqlite3
+import sys
 import time
+import urllib.error
+import urllib.request
 from collections import Counter
 from collections.abc import Mapping
 from datetime import datetime
@@ -66,12 +71,23 @@ from cachepilot_core.topology import topology_from_store
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8788
 
-#: Relay probe (status view): the dashboard mirrors the CLI's honest
-#: "healthy / unreachable" relay check, never asserting more than a TCP
-#: connect proves (AGENTS.md invariant 3).
+#: Relay probe (status view): the dashboard mirrors the CLI's honest relay
+#: check (E2E-002) — 'healthy' requires the relay's own local control
+#: endpoint to answer with its distinctive body; any other HTTP server on
+#: the port reads 'occupied by another service'; nothing answering reads
+#: 'unreachable'. A bare TCP connect no longer proves relay presence.
 ENV_RELAY_LISTEN = "CACHEPILOT_RELAY_LISTEN"
 DEFAULT_RELAY_LISTEN = "127.0.0.1:8787"
+#: Mirror of cachepilot_relay.config.RELAY_HEALTH_PATH — the backend must
+#: not import cachepilot_relay (PRD §139 optionality), so the literal is
+#: pinned here and drift is caught by smoke_test.py, which probes a REAL
+#: relay.
+RELAY_HEALTH_PATH = "/cachepilot/health"
 _RELAY_PROBE_TIMEOUT_S = 1.0
+
+#: Proxy-less opener: the relay probe targets loopback and must never be
+#: redirected through an http_proxy configured for the shell.
+_RELAY_PROBE_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 #: PRD §24/§75 layers, in the order the boolean flags live on ChurnEvent —
 #: the same list the CLI aggregates over.
@@ -157,7 +173,13 @@ def _json(payload: Mapping[str, Any]) -> str:
 
 
 def _relay_health() -> str:
-    """TCP probe of the relay listen address (mirrors ``cachepilot status``)."""
+    """HTTP probe of the relay control endpoint (mirrors ``cachepilot status``).
+
+    E2E-002: 'healthy' requires the CachePilot relay's own control endpoint
+    to answer with its distinctive body — a bare TCP connect, or ANY other
+    HTTP server on the port (e.g. hermes-webui on HERMES_WEBUI_PORT 8787),
+    is NOT the relay and reads 'occupied by another service' / 'unreachable'.
+    """
     listen = os.environ.get(ENV_RELAY_LISTEN, DEFAULT_RELAY_LISTEN)
     host, _, port_text = listen.rpartition(":")
     try:
@@ -165,11 +187,59 @@ def _relay_health() -> str:
     except ValueError:
         return "unknown (invalid CACHEPILOT_RELAY_LISTEN)"
     host = host or "127.0.0.1"
+    host = host.strip("[]")
+    host_part = f"[{host}]" if ":" in host else host
+    url = f"http://{host_part}:{port}{RELAY_HEALTH_PATH}"
     try:
-        with socket.create_connection((host, port), timeout=_RELAY_PROBE_TIMEOUT_S):
-            return "healthy"
-    except OSError:
+        with _RELAY_PROBE_OPENER.open(url, timeout=_RELAY_PROBE_TIMEOUT_S) as response:
+            body = response.read()
+    except urllib.error.HTTPError:
+        # An HTTP server answered — just not the relay.
+        return "occupied by another service"
+    except (OSError, http.client.HTTPException):
         return "unreachable"
+    if response.status == 200 and _is_relay_health_body(body):
+        return "healthy"
+    return "occupied by another service"
+
+
+def _is_relay_health_body(body: bytes) -> bool:
+    """True only for the relay control endpoint's distinctive JSON body."""
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and payload.get("service") == "cachepilot-relay"
+
+
+def _check_listen_available(host: str, port: int) -> None:
+    """Fail fast with an actionable error when ``(host, port)`` is occupied.
+
+    E2E-002: the dashboard backend's default ``127.0.0.1:8788`` collides
+    with stock-Hermes companion processes (``hermes_cli``'s ``mcp serve``
+    owns 8788 on a stock Hermes host), so a bare ``OSError: Address already
+    in use`` traceback is not actionable. Port 0 (ephemeral) can never be
+    occupied in advance and is skipped.
+    """
+    if port == 0:
+        return
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    with socket.socket(family, socket.SOCK_STREAM) as probe:
+        # Match ThreadingHTTPServer's SO_REUSEADDR semantics so a TIME_WAIT
+        # socket the real bind could reuse does not false-positive.
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind((host, port))
+        except OSError as exc:
+            if exc.errno == errno.EADDRINUSE:
+                raise RuntimeError(
+                    f"listen address {host}:{port} is already in use — another "
+                    "process owns it (on a stock Hermes host this is typically "
+                    "hermes_cli's 'mcp serve'). Pick a free port with --port "
+                    "PORT and update the /api proxy target in "
+                    "dashboard/vite.config.ts."
+                ) from exc
+            raise
 
 
 def _plugin_state(total_requests: int) -> str:
@@ -307,10 +377,7 @@ def _payload_churn(store: TelemetryStore | None) -> dict[str, Any]:
     return {
         "events": [event.model_dump() for event in events],
         "layers": layers,
-        "top_causes": [
-            {"cause": cause, "count": count}
-            for cause, count in causes.most_common(5)
-        ],
+        "top_causes": [{"cause": cause, "count": count} for cause, count in causes.most_common(5)],
     }
 
 
@@ -328,9 +395,16 @@ def _payload_miss(store: TelemetryStore | None, session: str | None) -> dict[str
 
 def _payload_topology(store: TelemetryStore | None) -> dict[str, Any]:
     if store is None:
-        return {"sessions": 0, "total_pairs": 0, "churn_pairs": 0,
-                "prefix_stability_pct": None, "attribution_gaps": 0,
-                "unattributed_loss_tokens": 0, "layers": [], "tool_ordering": []}
+        return {
+            "sessions": 0,
+            "total_pairs": 0,
+            "churn_pairs": 0,
+            "prefix_stability_pct": None,
+            "attribution_gaps": 0,
+            "unattributed_loss_tokens": 0,
+            "layers": [],
+            "tool_ordering": [],
+        }
     report = topology_from_store(store, limit=500)
     return report.model_dump()
 
@@ -465,17 +539,37 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--host", default=DEFAULT_HOST, help=f"bind host (default: {DEFAULT_HOST})")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"bind port (default: {DEFAULT_PORT})")
+    parser.add_argument(
+        "--port", type=int, default=DEFAULT_PORT, help=f"bind port (default: {DEFAULT_PORT})"
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    server = DashboardServer(
-        (args.host, args.port),
-        Handler,
-        db_path=args.db,
-    )
+    try:
+        _check_listen_available(args.host, args.port)
+    except RuntimeError as exc:
+        print(f"[dashboard] error: {exc}", file=sys.stderr)
+        return 2
+    try:
+        server = DashboardServer(
+            (args.host, args.port),
+            Handler,
+            db_path=args.db,
+        )
+    except OSError as exc:
+        # Race between the pre-bind check and the real bind: keep the error
+        # actionable, never a bare traceback (E2E-002).
+        if exc.errno == errno.EADDRINUSE:
+            print(
+                f"[dashboard] error: listen address {args.host}:{args.port} is "
+                "already in use — pick a free port with --port PORT and update "
+                "the /api proxy target in dashboard/vite.config.ts.",
+                file=sys.stderr,
+            )
+            return 2
+        raise
     print(f"[dashboard] read-only telemetry backend on http://{args.host}:{args.port}")
     print(f"[dashboard] telemetry DB: {resolve_db_path(args.db)}")
     try:

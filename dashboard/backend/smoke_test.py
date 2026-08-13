@@ -16,6 +16,11 @@ What it verifies:
 3. The backend is read-only: the DB file's SHA-256 is byte-identical before
    and after the whole read session, and no new files appear next to it.
 4. Unknown endpoints 404 and writes 405 (GET-only backend).
+5. E2E-002: the relay health probe is an HTTP confirmation of the relay's
+   local control endpoint (healthy only against a REAL relay; a foreign HTTP
+   server reads 'occupied by another service'; a closed port reads
+   'unreachable'), and startup on an occupied port fails with a clear
+   actionable error instead of a bare EADDRINUSE.
 
 Exit code 0 = everything verified; nonzero with a message otherwise.
 """
@@ -23,23 +28,31 @@ Exit code 0 = everything verified; nonzero with a message otherwise.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
+import os
+import socket
 import sys
 import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
+from contextlib import redirect_stderr
 from datetime import UTC, datetime
 from decimal import Decimal
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+import uvicorn
 from cachepilot_core.leases import CacheLease, LeaseState
 from cachepilot_core.route_intel import RouteChangeEvent, RouteMissVerdict
 from cachepilot_core.storage import TelemetryStore
 from cachepilot_core.telemetry import ChurnEvent, Outcome, TelemetryEvent, TokenUsage
 from cachepilot_core.ttl import TTLProfile
+from cachepilot_relay.config import RelayConfig
+from cachepilot_relay.server import create_app
 
 #: Ensure the repo root is importable (the script may be run from any cwd).
 repo_root = Path(__file__).resolve().parents[2]
@@ -47,6 +60,7 @@ if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
 
 from dashboard.backend.server import DashboardServer, Handler
+from dashboard.backend.server import main as server_main
 
 FAILURES: list[str] = []
 
@@ -241,7 +255,69 @@ def fetch(port: int, path: str) -> tuple[int, Any]:
             return exc.code, body
 
 
+class _ForeignHttpHandler(BaseHTTPRequestHandler):
+    """Minimal non-relay HTTP server (stands in for hermes-webui on 8787)."""
+
+    def do_GET(self) -> None:
+        body = b"<html><body>hermes web ui</body></html>"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: object) -> None:  # quiet access log
+        pass
+
+
+def start_real_relay() -> tuple[Any, threading.Thread, int]:
+    """Boot a REAL cachepilotd app (``create_app``) on an ephemeral port.
+
+    Runs in a daemon thread via uvicorn's blocking ``run()``; the probe only
+    ever touches the local control endpoint, so the upstream (a closed
+    loopback port) is never reached. Returns (server, thread, bound_port).
+    """
+    config = RelayConfig(
+        upstream="http://127.0.0.1:1",
+        listen="127.0.0.1:0",
+        observation_enabled=False,
+    )
+    server = uvicorn.Server(
+        uvicorn.Config(
+            create_app(config),
+            host="127.0.0.1",
+            port=0,
+            log_level="warning",
+            access_log=False,
+        )
+    )
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.time() + 15.0
+    while not server.started:
+        if time.time() > deadline:
+            thread.join(5)
+            raise RuntimeError("real relay did not start within 15s")
+        time.sleep(0.01)
+    port = server.servers[0].sockets[0].getsockname()[1]
+    return server, thread, port
+
+
+def relay_readout(port: int, listen: str) -> str:
+    """Fetch /api/status with CACHEPILOT_RELAY_LISTEN set for one request."""
+    os.environ["CACHEPILOT_RELAY_LISTEN"] = listen
+    try:
+        _, payload = fetch(port, "/api/status")
+        return payload["relay"]
+    finally:
+        del os.environ["CACHEPILOT_RELAY_LISTEN"]
+
+
 def main() -> int:
+    # Deterministic relay probe baseline: point the probe at a closed
+    # loopback port so the seeded-store readout below cannot accidentally
+    # observe whatever happens to be squatting on 127.0.0.1:8787 (E2E-002).
+    os.environ["CACHEPILOT_RELAY_LISTEN"] = "127.0.0.1:1"
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         db_path = tmp_path / "telemetry.db"
@@ -258,62 +334,144 @@ def main() -> int:
             print("== populated store ==")
             status, payload = fetch(port, "/api/status")
             check("status 200", status == 200, str(status))
-            check("status stats.total == 3", payload["stats"]["total"] == 3, str(payload["stats"]["total"]))
-            check("status hit_rate is a number", isinstance(payload["stats"]["hit_rate"], float), str(payload["stats"]["hit_rate"]))
-            check("status providers recorded", len(payload["providers"]) == 2, str(payload["providers"]))
-            check("status relay readout", payload["relay"] in ("healthy", "unreachable"), str(payload["relay"]))
-            check("status plugin readout", payload["plugin"].startswith("active"), str(payload["plugin"]))
+            check(
+                "status stats.total == 3",
+                payload["stats"]["total"] == 3,
+                str(payload["stats"]["total"]),
+            )
+            check(
+                "status hit_rate is a number",
+                isinstance(payload["stats"]["hit_rate"], float),
+                str(payload["stats"]["hit_rate"]),
+            )
+            check(
+                "status providers recorded",
+                len(payload["providers"]) == 2,
+                str(payload["providers"]),
+            )
+            check(
+                "status relay readout",
+                payload["relay"] in ("healthy", "unreachable", "occupied by another service"),
+                str(payload["relay"]),
+            )
+            check(
+                "status plugin readout",
+                payload["plugin"].startswith("active"),
+                str(payload["plugin"]),
+            )
 
             status, payload = fetch(port, "/api/leases")
             check("leases 200", status == 200, str(status))
             check("leases non-empty", len(payload["leases"]) == 1, str(len(payload["leases"])))
             lease = payload["leases"][0]
             check("lease state armed", lease["state"] == "armed", str(lease["state"]))
-            check("lease cache age computed", lease["cache_age_s"] is not None, str(lease["cache_age_s"]))
-            check("lease targets", lease["active_targets"] == ["target-1"], str(lease["active_targets"]))
+            check(
+                "lease cache age computed",
+                lease["cache_age_s"] is not None,
+                str(lease["cache_age_s"]),
+            )
+            check(
+                "lease targets",
+                lease["active_targets"] == ["target-1"],
+                str(lease["active_targets"]),
+            )
 
             status, payload = fetch(port, "/api/costs")
             check("costs 200", status == 200, str(status))
             check("costs total > 0", payload["total_usd"] > 0, str(payload["total_usd"]))
-            check("costs per-provider", payload["per_provider"].get("openai", 0) > 0, str(payload["per_provider"]))
+            check(
+                "costs per-provider",
+                payload["per_provider"].get("openai", 0) > 0,
+                str(payload["per_provider"]),
+            )
             check("costs recent series", len(payload["recent"]) == 2, str(len(payload["recent"])))
             check("costs honest note", "recorded-cost-only" in payload["note"], payload["note"])
 
             status, payload = fetch(port, "/api/ttl")
             check("ttl 200", status == 200, str(status))
-            check("ttl profiles non-empty", len(payload["profiles"]) == 1, str(len(payload["profiles"])))
+            check(
+                "ttl profiles non-empty",
+                len(payload["profiles"]) == 1,
+                str(len(payload["profiles"])),
+            )
             profile = payload["profiles"][0]
-            check("ttl estimate present", profile["estimated_ttl_s"] == 288.0, str(profile["estimated_ttl_s"]))
-            check("ttl survival curve", profile["survival"] is not None and profile["survival"]["sample_count"] == 4, str(profile.get("survival")))
+            check(
+                "ttl estimate present",
+                profile["estimated_ttl_s"] == 288.0,
+                str(profile["estimated_ttl_s"]),
+            )
+            check(
+                "ttl survival curve",
+                profile["survival"] is not None and profile["survival"]["sample_count"] == 4,
+                str(profile.get("survival")),
+            )
             if profile["survival"] is not None:
-                check("ttl survival steps", len(profile["survival"]["steps"]) >= 1, str(len(profile["survival"]["steps"])))
-                check("ttl survival at-ttl defined", profile["survival"]["p_survive_at_ttl"] is not None, str(profile["survival"]["p_survive_at_ttl"]))
+                check(
+                    "ttl survival steps",
+                    len(profile["survival"]["steps"]) >= 1,
+                    str(len(profile["survival"]["steps"])),
+                )
+                check(
+                    "ttl survival at-ttl defined",
+                    profile["survival"]["p_survive_at_ttl"] is not None,
+                    str(profile["survival"]["p_survive_at_ttl"]),
+                )
 
             status, payload = fetch(port, "/api/routes")
             check("routes 200", status == 200, str(status))
-            check("routes events non-empty", len(payload["events"]) == 1, str(len(payload["events"])))
-            check("routes instability verdict", payload["events"][0]["verdict"] == "route_instability", str(payload["events"][0]["verdict"]))
+            check(
+                "routes events non-empty", len(payload["events"]) == 1, str(len(payload["events"]))
+            )
+            check(
+                "routes instability verdict",
+                payload["events"][0]["verdict"] == "route_instability",
+                str(payload["events"][0]["verdict"]),
+            )
             check("routes stats", payload["stats"]["route_switches"] == 1, str(payload["stats"]))
 
             status, payload = fetch(port, "/api/churn")
             check("churn 200", status == 200, str(status))
-            check("churn events non-empty", len(payload["events"]) == 1, str(len(payload["events"])))
+            check(
+                "churn events non-empty", len(payload["events"]) == 1, str(len(payload["events"]))
+            )
             tools = next((layer for layer in payload["layers"] if layer["layer"] == "tools"), None)
-            check("churn tools layer changed", tools is not None and tools["changed"] == 1, str(tools))
-            check("churn top causes", len(payload["top_causes"]) == 1 and payload["top_causes"][0]["cause"] == "tool list mutation", str(payload["top_causes"]))
+            check(
+                "churn tools layer changed", tools is not None and tools["changed"] == 1, str(tools)
+            )
+            check(
+                "churn top causes",
+                len(payload["top_causes"]) == 1
+                and payload["top_causes"][0]["cause"] == "tool list mutation",
+                str(payload["top_causes"]),
+            )
 
             status, payload = fetch(port, "/api/miss")
             check("miss 200", status == 200, str(status))
-            check("miss explains latest", payload["event"] is not None and payload["event"]["likely_cause"] == "tool list mutation", str(payload.get("event")))
-            check("miss changed layers", "tools" in payload["changed"] and "system" in payload["stable"], f"{payload['stable']} / {payload['changed']}")
-            check("miss prefix loss", payload["event"]["estimated_prefix_loss_tokens"] == 1234, str(payload["event"]))
+            check(
+                "miss explains latest",
+                payload["event"] is not None
+                and payload["event"]["likely_cause"] == "tool list mutation",
+                str(payload.get("event")),
+            )
+            check(
+                "miss changed layers",
+                "tools" in payload["changed"] and "system" in payload["stable"],
+                f"{payload['stable']} / {payload['changed']}",
+            )
+            check(
+                "miss prefix loss",
+                payload["event"]["estimated_prefix_loss_tokens"] == 1234,
+                str(payload["event"]),
+            )
 
             status, payload = fetch(port, "/api/miss?session=hash-session-2")
             check("miss unknown session empty", payload["event"] is None, str(payload.get("event")))
 
             status, payload = fetch(port, "/api/topology")
             check("topology 200", status == 200, str(status))
-            check("topology pair measured", payload["total_pairs"] == 1, str(payload["total_pairs"]))
+            check(
+                "topology pair measured", payload["total_pairs"] == 1, str(payload["total_pairs"])
+            )
             check("topology churn pair", payload["churn_pairs"] == 1, str(payload["churn_pairs"]))
 
             status, payload = fetch(port, "/api/health")
@@ -326,7 +484,11 @@ def main() -> int:
             sha_after = file_sha256(db_path)
             files_after = sorted(p.name for p in tmp_path.iterdir())
             new_files = [name for name in files_after if name not in files_before]
-            check("DB bytes unchanged", sha_before == sha_after, f"{sha_before[:12]}… vs {sha_after[:12]}…")
+            check(
+                "DB bytes unchanged",
+                sha_before == sha_after,
+                f"{sha_before[:12]}… vs {sha_after[:12]}…",
+            )
             # SQLite creates empty -wal/-shm journal sidecars when ANY
             # connection (read-only included — the CLI's reads do the same)
             # opens a WAL-mode database that was cleanly closed; they are
@@ -349,16 +511,36 @@ def main() -> int:
                 status, payload = fetch(empty_port, "/api/leases")
                 check("empty leases []", status == 200 and payload == {"leases": []}, str(payload))
                 status, payload = fetch(empty_port, "/api/status")
-                check("empty stats zero", payload["stats"]["total"] == 0 and payload["providers"] == [], str(payload))
-                check("empty plugin honest", "no telemetry recorded yet" in payload["plugin"], str(payload["plugin"]))
+                check(
+                    "empty stats zero",
+                    payload["stats"]["total"] == 0 and payload["providers"] == [],
+                    str(payload),
+                )
+                check(
+                    "empty plugin honest",
+                    "no telemetry recorded yet" in payload["plugin"],
+                    str(payload["plugin"]),
+                )
                 status, payload = fetch(empty_port, "/api/costs")
-                check("empty costs zero", payload["total_usd"] == 0.0 and payload["recent"] == [], str(payload))
+                check(
+                    "empty costs zero",
+                    payload["total_usd"] == 0.0 and payload["recent"] == [],
+                    str(payload),
+                )
                 status, payload = fetch(empty_port, "/api/ttl")
                 check("empty ttl []", payload["profiles"] == [], str(payload))
                 status, payload = fetch(empty_port, "/api/routes")
-                check("empty routes", payload["events"] == [] and payload["stats"]["route_switches"] == 0, str(payload))
+                check(
+                    "empty routes",
+                    payload["events"] == [] and payload["stats"]["route_switches"] == 0,
+                    str(payload),
+                )
                 status, payload = fetch(empty_port, "/api/churn")
-                check("empty churn layers zero", all(layer["changed"] == 0 for layer in payload["layers"]), str(payload["layers"]))
+                check(
+                    "empty churn layers zero",
+                    all(layer["changed"] == 0 for layer in payload["layers"]),
+                    str(payload["layers"]),
+                )
                 status, payload = fetch(empty_port, "/api/miss")
                 check("empty miss null", payload["event"] is None, str(payload))
                 status, payload = fetch(empty_port, "/api/topology")
@@ -376,6 +558,63 @@ def main() -> int:
                 check("POST refused", False, "POST unexpectedly succeeded")
             except urllib.error.HTTPError as exc:
                 check("POST refused 405", exc.code == 405, str(exc.code))
+
+            print("== relay health probe (E2E-002) ==")
+            # closed port -> unreachable (deterministic: loopback port 1)
+            readout = relay_readout(port, "127.0.0.1:1")
+            check("relay readout unreachable when port closed", readout == "unreachable", readout)
+            # real relay -> healthy (probe hits the relay's local control
+            # endpoint; the upstream is never contacted)
+            relay_server, relay_thread, relay_port = start_real_relay()
+            try:
+                readout = relay_readout(port, f"127.0.0.1:{relay_port}")
+                check("relay readout healthy against real relay", readout == "healthy", readout)
+            finally:
+                relay_server.should_exit = True
+                relay_thread.join(15)
+            # foreign HTTP server (hermes-webui stand-in) -> occupied, NEVER healthy
+            foreign = ThreadingHTTPServer(("127.0.0.1", 0), _ForeignHttpHandler)
+            foreign_thread = threading.Thread(target=foreign.serve_forever, daemon=True)
+            foreign_thread.start()
+            try:
+                readout = relay_readout(port, f"127.0.0.1:{foreign.server_address[1]}")
+                check(
+                    "relay readout occupied by foreign HTTP server",
+                    readout == "occupied by another service",
+                    readout,
+                )
+                check(
+                    "relay readout never healthy for foreign server", readout != "healthy", readout
+                )
+            finally:
+                foreign.shutdown()
+                foreign.server_close()
+                foreign_thread.join(5)
+
+            print("== startup occupant detection (E2E-002) ==")
+            # the dashboard backend must fail with a CLEAR actionable error
+            # when its listen address is taken, never a bare EADDRINUSE
+            with socket.socket() as squatter:
+                squatter.bind(("127.0.0.1", 0))
+                squatter.listen(1)
+                occupied_port = squatter.getsockname()[1]
+                err_buf = io.StringIO()
+                with redirect_stderr(err_buf):
+                    exit_code = server_main(
+                        ["--host", "127.0.0.1", "--port", str(occupied_port), "--db", str(db_path)]
+                    )
+                err_text = err_buf.getvalue()
+                check("dashboard main exits 2 on occupied port", exit_code == 2, str(exit_code))
+                check(
+                    "dashboard error names the port and --port override",
+                    "already in use" in err_text and "--port" in err_text,
+                    err_text.strip(),
+                )
+                check(
+                    "dashboard error names the vite proxy override",
+                    "vite.config.ts" in err_text,
+                    err_text.strip(),
+                )
         finally:
             server.shutdown()
             server.server_close()
@@ -385,8 +624,10 @@ def main() -> int:
         for failure in FAILURES:
             print(f"  - {failure}")
         return 1
-    print("\nSMOKE TEST PASSED — dashboard backend verified against a seeded "
-          "TelemetryStore, empty-store states, and a byte-identical read-only DB.")
+    print(
+        "\nSMOKE TEST PASSED — dashboard backend verified against a seeded "
+        "TelemetryStore, empty-store states, and a byte-identical read-only DB."
+    )
     return 0
 
 

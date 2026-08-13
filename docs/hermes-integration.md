@@ -132,9 +132,13 @@ both fingerprints — physical cache identity per invariant 7. The plugin's
 headers only contribute **correlation** and the **target count**; the relay
 keys leases by the physical cache fingerprint, not by session id.
 
-`cachepilot status` verifies relay health with a TCP probe of
-`CACHEPILOT_RELAY_LISTEN` (default `127.0.0.1:8787`) and reports the plugin
-state from `CACHEPILOT_ENABLED` plus telemetry evidence.
+`cachepilot status` verifies relay health with an HTTP probe of the relay's
+local control endpoint (`GET /cachepilot/health` — answered by the relay
+itself, never forwarded upstream) at `CACHEPILOT_RELAY_LISTEN` (default
+`127.0.0.1:8787`): 'healthy' requires the relay's distinctive body, so a
+foreign process squatting on the port reads 'occupied by another service'.
+It also reports the plugin state from `CACHEPILOT_ENABLED` plus telemetry
+evidence.
 
 ## 6. What is NOT modified (and how that is enforced)
 
