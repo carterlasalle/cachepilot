@@ -78,3 +78,58 @@ The following were exercised with real evidence and produced NO findings:
 - Read-only proof: seeded temp DB SHA-256 byte-stable across live dashboard + CLI read passes; smoke test's byte-identical proof passed.
 - Frontend headless: `yarn dev` (5173) serves HTML + all 15 TS/TSX modules transform (200); prod `dist/` served by the backend same-origin (index.html → JS/CSS bundles 200); frontend `types.ts`/`api.ts` contract matches backend payloads field-for-field.
 - Console-level issues: NOT verifiable in this session — no browser tool (worker is the CLI/API variant, per board E2E-001 fallback "Step 3.7 Flash"). Browser/screenshot verification (Playwright, console errors, visual empty states) is a follow-up for the Luna variant.
+
+---
+
+## RUN 2 — browser/Luna variant
+
+Run date: 2026-08-13 · seeded backend: `127.0.0.1:8792` · empty backend:
+`127.0.0.1:8793`
+
+Run 2 reproduced one new finding. Browser console and JavaScript errors were
+clean in the browser session; seeded and empty states were checked visually;
+screenshots are in `e2e-output/run2-screenshots/`.
+
+| ID | Severity | Component | Summary |
+|----|----------|-----------|---------|
+| E2E-006 | MEDIUM | dashboard / responsive UI | At 320px viewport the fixed 230px sidebar leaves only 90px for main content; dashboard cards continue off-screen with no mobile navigation or reflow, making the dashboard unusable on a phone-width viewport |
+
+## E2E-006 — MEDIUM — 320px mobile viewport clips dashboard content
+
+- **Component**: dashboard frontend layout (`.sidebar` + `.main` responsive
+  layout), all views.
+- **Reproduction** (live browser evidence):
+  1. Start the built dashboard backend on a free port with a nonexistent DB:
+     `uv run python dashboard/backend/server.py --db <missing> --port 8793`.
+  2. Open `http://127.0.0.1:8793/` at a 320×800 viewport.
+  3. The captured `empty-overview-320-800-settled.png` shows the fixed sidebar
+     occupying x=0..229 and the main area beginning at x=230, leaving only 90px
+     visible. Overview cards begin at x=254 and continue past the viewport;
+     the right side of the cards and the rest of the dashboard are inaccessible
+     without horizontal scrolling.
+- **Expected**: at the documented responsive breakpoint, navigation and the
+  main dashboard reflow or collapse so a 320px viewport can access the complete
+  empty state and view controls without content being clipped off-screen.
+- **Actual**: sidebar remains desktop-width and main content retains its
+  desktop minimum geometry. The screenshot displays only the left edge of the
+  first cards; no mobile menu or horizontal-scroll affordance exists.
+- **Evidence**: `e2e-output/run2-screenshots/empty-overview-320-800-settled.png`,
+  plus 768px and 1280px comparison screenshots. This is a visual usability
+  finding, not a console error.
+- **Suggested fix direction**: add a mobile breakpoint that collapses the
+  sidebar (drawer or horizontal nav) and makes card/table grids and topbar
+  responsive; preserve readable empty-state text at 320px.
+
+## RUN 2 explicit zero-finding areas
+
+- Browser console: zero application console messages and zero JS errors in the
+  seeded and empty browser sessions.
+- Seeded status and empty Overview: real values and honest zeros/`n/a`; empty
+  state visibly rendered with contrast.
+- Live lease polling: displayed 5s cadence and cache age changed 198s → 203s
+  after a 6-second wait.
+- Desktop visual checks: no clipping/overflow observed at 768px or 1280px.
+- Read-only contract: PUT/PATCH/DELETE/POST all 405 JSON; all nine GETs 200;
+  DB SHA-256 unchanged.
+- Quality/build/smoke: pytest 482 passed, ruff passed, yarn build passed,
+  smoke test 52/52 passed.

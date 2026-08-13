@@ -1,5 +1,7 @@
 # CachePilot — E2E Testing Tick Report (E2E-001)
 
+## Run 1 — CLI/API variant
+
 Date: 2026-08-13 · Worker: Step 3.7 Flash (CLI/API variant — no browser tool) · Repo: cachepilot @ 42311f1 (clean, main)
 
 Scope: fresh deploy + full user journey — quality gate, dashboard build,
@@ -141,3 +143,75 @@ fixed in this tick (mission: file, don't fix). Priorities for the next tick:
 2. smoke_test.py passes — YES (52/52).
 3. yarn build succeeds — YES (tsc --noEmit + vite build, dist emitted).
 4. Every endpoint exercised with body-level verification recorded — YES (§4 table; §5 CLI table; §6 relay table).
+
+---
+
+## Run 2 — browser/Luna variant
+
+Date: 2026-08-13 · Worker: browser/Luna variant · Repo: cachepilot @ main
+
+Scope: browser console, visual layout and empty states, responsive breakpoints,
+live lease polling, seeded and nonexistent-DB dashboards, read-only contract,
+quality gate, frontend build, and backend smoke test. Source code was not
+modified; only this report, tasks.md, and screenshots were added/updated.
+
+Verdict: **1 real finding (MEDIUM) — mobile layout is unusable at 320px.**
+Desktop seeded/empty rendering, console output, live polling, read-only
+responses, and data honesty passed.
+
+### Quality and build gates — PASS
+
+```
+uv sync --group dev       → Resolved 33 packages; checked 32 packages
+uv run ruff check .       → [] (exit 0)
+uv run pytest -q          → Pytest: 482 passed
+cd dashboard && yarn install → Yarn 4.18.0, done
+cd dashboard && yarn build   → 43 modules transformed; Vite build exit 0
+uv run python dashboard/backend/smoke_test.py → SMOKE TEST PASSED, 52 checks, exit 0
+```
+
+### Browser setup and seeded data — PASS
+
+Seeded `/tmp/cachepilot-e2e-run2-9EXN/telemetry.db` with the same
+`TelemetryStore` fixture used by `dashboard/backend/smoke_test.py`; served at
+`127.0.0.1:8792`. A nonexistent path was served at `127.0.0.1:8793`.
+The seeded Overview displayed the real fixture values: 3 requests, 50.0%
+cache hit rate, 1 confirmed hit, 1 miss rebuilt, 1 success unverified, 1
+churn event, openai `$0.000330`, and an armed lease. The empty Overview showed
+0, `n/a`, and `No provider telemetry recorded yet`, with no fabricated provider
+rows or costs. Screenshots are committed under
+`e2e-output/run2-screenshots/` for 1280px, 768px, and 320px states.
+
+### Browser checks — PASS except E2E-006
+
+- At 1280px, seeded Overview and Live leases rendered with readable dark-theme
+  colors, tables, badges, and no horizontal overflow (`scrollWidth=1280`),
+  and the screenshot shows no clipping.
+- Browser console returned `console_messages=[]`, `js_errors=[]`,
+  `total_errors=0` for the seeded and empty pages. Chrome headless emitted
+  only environment DBus/GPU diagnostics, not application console errors.
+- Empty Overview is visibly styled (dashed bordered empty-state box), not
+  white-on-white. `n/a` is used for an unknown empty-store hit rate.
+- Live leases explicitly displayed `polls every 5s`. After waiting 6 seconds,
+  the lease cache age changed from 198s to 203s, proving live polling refresh.
+- At 320px, the screenshot showed the fixed 230px sidebar plus the main
+  content beginning at x=230px; the Overview cards continued beyond the
+  320px viewport and were clipped/off-screen. See E2E-006.
+- At 768px, the settled screenshot was readable with sidebar and main content
+  visible; no separate desktop overflow was observed.
+
+### Read-only dashboard contract — PASS
+
+Against the seeded server at 8792, PUT, PATCH, DELETE, and POST `/api/leases`
+all returned HTTP 405, `application/json; charset=utf-8`, and the documented
+JSON error body. All nine GET endpoints returned HTTP 200 with JSON bodies.
+SHA-256 was identical before and after the complete GET/write probe:
+`fca38d61d7328447e78933bdca685160029da63570196bbbdfff10caf4bd49fd` before
+and after; no DB mutation occurred.
+
+### Findings
+
+One finding was appended to `e2e-output/tasks.md`: E2E-006 (MEDIUM), mobile
+responsive layout at 320px clips the dashboard content and provides no usable
+mobile navigation/content adaptation. No other browser findings were
+reproduced.
