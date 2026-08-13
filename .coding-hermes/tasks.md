@@ -13,7 +13,6 @@ every commit to a `gitreins task complete`.
 
 | ID | Task | Pri | Cpx | Deps | Tags | Model | Reasoning | Fallback |
 |----|------|-----|-----|------|------|-------|-----------|----------|
-| P06 | Cache warming — bounded cache-equivalent replay (max_tokens=1 output bounding, content discarded), ONE verified OpenAI-compatible adapter first | High | 5±1 | P05 | +++warm, ++adapter | DS-V4-Flash | High | DS-V4-Pro |
 | P07 | Economic controller — cost estimation, warm budget (budget_ratio 0.70), expected savings, ECONOMIC_STOP; turns KV watchdog into KV optimizer | Critical | 4±1 | P06 | +++economics, ++pricing | DS-V4-Flash | High | DS-V4-Pro |
 | P08 | TTL learning — route-aware learned bounds (lower/upper/estimate/confidence), observational refinement, `cachepilot ttl`; route changes must not corrupt bounds | High | 4±1 | P04+P07 | ++ttl, ++learning | DS-V4-Flash | Medium | Kimi-K3 |
 | P09 | Route intelligence — route identity (gateway/upstream/endpoint/region), router-miss analysis, optional economic route affinity (never blind stickiness) | Medium | 4±1 | P08 | ++routing | DS-V4-Flash | Medium | Kimi-K3 |
@@ -31,6 +30,7 @@ every commit to a `gitreins task complete`.
 | P03 | Relay pass-through — cachepilotd (127.0.0.1:8787), 100% pass-through, 0 cache modification; golden differential tests: same response/stream/tools/errors, byte-identical bodies via aiter_raw, RFC 7230 hop-by-hop stripping, wildcard-bind refused (judge PASS 310803ad) | High | 4±1 | ce49ad1 | DS-V4-Flash |
 | P04 | Physical request observation — correlation IDs (X-CachePilot-Session/Request/Turn, stripped before upstream), request+cache fingerprints from the physical HTTP request, usage parsing, cache telemetry (CONFIRMED_HIT/MISS_REBUILT/SUCCESS_UNVERIFIED/FAILED), route extraction, SQLite WAL telemetry store, `cachepilot status/leases/costs` CLI (judge PASS d48f7976) | High | 4±1 | c53eb82 | DS-V4-Flash |
 | P05 | Lease manager — CacheLease/LeaseState (PRD §49), arm/invalidate/complete, generation counter, normal-request-reset, per-cache-identity locks, §53 deadline + §54 jitter scheduler, DRY-RUN only (`WOULD WARM IN 47s`, no network warm), leases table + real `cachepilot leases` listing, X-CachePilot-Targets header bridging plugin targets → relay, race tests (judge PASS a7f7f161) | High | 5±1 | b90d98b | DS-V4-Flash |
+| P06 | Cache warming — bounded cache-equivalent replay: adapters.py (CacheCapabilities, CacheProviderAdapter base, OpenAICompatibleAdapter — max_tokens=1-family bounding, never invents fields), memory-only request snapshots (PRD §30), real warm executor via injectable transport (dry_run stays default), content discarded, warm_count/warm_cost_usd recorded, last_cache_touch_at only on verified touch, 2-miss warm circuit breaker, tool_choice policy §33, docs/provider-adapters.md, fake-provider + race tests (judge PASS 78483b62) | High | 5±1 | 8d6d81d | DS-V4-Flash |
 | P-BOOT | Bootstrap — repo, AGENTS.md, docs/PRD.md (full spec), task board, gitreins, hilo, scheduler registration | Critical | 2±1 | — | DS-V4-Flash |
 
 ## [ ] DOCS-000 — Documentation gate (completion-phase — do near the end, BEFORE E2E-001 / NEVER-DONE idle)
