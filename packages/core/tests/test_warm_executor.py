@@ -28,11 +28,29 @@ from cachepilot_core.fake_provider import (
     provider_result_to_http_response,
 )
 from cachepilot_core.identity import ApiMode, CanonicalRequest
-from cachepilot_core.leases import CacheLease, LeaseDecision, LeaseManager, LeaseSettings
-from cachepilot_core.pricing import estimate_cost
+from cachepilot_core.leases import (
+    CacheLease,
+    LeaseDecision,
+    LeaseManager,
+    LeaseSettings,
+    LeaseState,
+)
+from cachepilot_core.pricing import PricingTable, estimate_cost
 from cachepilot_core.snapshots import RequestSnapshot, SnapshotStore
 from cachepilot_core.telemetry import Outcome
 from cachepilot_core.usage import TokenUsage
+
+#: PRD §62-shaped pricing (matches the FakeProvider defaults): a 4000-token
+#: prefix costs $0.00352 cold / $0.00032 cached — warm economics positive.
+PRICING = PricingTable(
+    input_per_mtok=Decimal("0.80"),
+    output_per_mtok=Decimal("2.40"),
+    cache_read_per_mtok=Decimal("0.08"),
+    cache_write_per_mtok=Decimal("0.88"),
+)
+
+#: Normal-request usage for a 4000-token prefix (mirrors the fake provider).
+_USAGE = TokenUsage(prompt_tokens=4000, cache_read_tokens=4000)
 
 
 class FakeClock:
@@ -77,6 +95,8 @@ def _armed_touched_lease(manager: LeaseManager, clock: FakeClock) -> CacheLease:
     manager.target_started(lease.lease_id, "t1")
     manager.before_normal_request(lease.lease_id)
     manager.after_normal_request(lease.lease_id, Outcome.CONFIRMED_HIT)
+    # P07: the normal request refreshes the resume-cost estimates (PRD §65).
+    manager.update_cost_estimates(lease.lease_id, _USAGE)
     assert lease.state.name == "ARMED"
     return lease
 
@@ -90,7 +110,7 @@ def _manager(
     **settings,
 ) -> LeaseManager:
     return LeaseManager(
-        LeaseSettings(jitter_fraction=0.0, dry_run=dry_run, **settings),
+        LeaseSettings(jitter_fraction=0.0, dry_run=dry_run, pricing=PRICING, **settings),
         time_fn=clock,
         latency_p95_s=4.0,
         snapshot_store=snapshot_store,
@@ -204,14 +224,17 @@ def test_warm_bounded_replay_reaches_fake_cache_and_discards_content():
     assert executor.last_result is not None
     assert "fake completion" not in str(vars(lease))
 
-    # The entry the first warm built is still there → second warm HITS.
+    # P07 economics: the warm MISSED and paid the full cache-write price
+    # (≈ the cold resume cost) — that alone exhausts the warm budget
+    # (0.70 × R × avoidable < cold resume by construction), so the lease
+    # stops warming even though the rebuilt entry is still alive. Warming
+    # is economic, never a watchdog (AGENTS.md invariant 5).
     clock.advance(1000)
     decision = asyncio.run(manager.evaluate_lease(lease.lease_id))
-    assert decision is LeaseDecision.WARMED_CONFIRMED_HIT
-    assert lease.last_confirmed_hit_at == clock.now
-    assert lease.warm_count == 2
-    assert lease.warm_cost_usd > 0
-    assert len(executor.sent_bodies) == 2
+    assert decision is LeaseDecision.STOPPED_ECONOMIC
+    assert lease.state is LeaseState.ECONOMIC_STOP
+    assert lease.warm_count == 1
+    assert len(executor.sent_bodies) == 1  # nothing more was ever sent
 
 
 # -- outcome semantics: last_cache_touch_at (invariant 3, PRD §147) ----------
@@ -291,7 +314,7 @@ def test_warm_miss_rebuilt_refreshes_only_with_write_evidence():
         WarmResult(
             outcome=Outcome.MISS_REBUILT,
             usage=TokenUsage(prompt_tokens=4000),
-            cost_usd=Decimal("0.002"),
+            cost_usd=Decimal("0.0004"),
         )
     )
     store = SnapshotStore()
@@ -309,7 +332,7 @@ def test_warm_miss_rebuilt_refreshes_only_with_write_evidence():
     executor.result = WarmResult(
         outcome=Outcome.MISS_REBUILT,
         usage=TokenUsage(prompt_tokens=4000, cache_write_tokens=4000),
-        cost_usd=Decimal("0.002"),
+        cost_usd=Decimal("0.0004"),
     )
     clock.advance(1000)
     decision = asyncio.run(manager.evaluate_lease(lease.lease_id))
@@ -381,9 +404,11 @@ def test_warm_hit_resets_miss_streak():
 def test_fresh_manager_without_snapshot_store_is_non_warmable():
     clock = FakeClock()
     # No snapshot store, no executor — a freshly constructed manager must
-    # skip due leases, never crash, never invent a warm.
+    # skip due leases, never crash, never invent a warm. Pricing IS
+    # configured so the economic gate passes and the warm path is reached;
+    # the missing snapshot store is what makes the lease non-warmable.
     manager = LeaseManager(
-        LeaseSettings(jitter_fraction=0.0, dry_run=False),
+        LeaseSettings(jitter_fraction=0.0, dry_run=False, pricing=PRICING),
         time_fn=clock,
         latency_p95_s=4.0,
     )
@@ -576,6 +601,7 @@ def test_model_switch_old_identity_warm_never_sent():
     manager.target_started(new.lease_id, "n1")
     manager.before_normal_request(new.lease_id)
     manager.after_normal_request(new.lease_id, Outcome.CONFIRMED_HIT)
+    manager.update_cost_estimates(new.lease_id, _USAGE)  # P07: price the prefix
     store.store(_snapshot(new))
     assert old.state.name == "INVALIDATED"
 

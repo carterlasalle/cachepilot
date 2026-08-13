@@ -42,6 +42,7 @@ from cachepilot_core.leases import CacheLease, LeaseDecision, LeaseManager, Leas
 from cachepilot_core.snapshots import RequestSnapshot, SnapshotStore
 from cachepilot_core.storage import TelemetryStore
 from cachepilot_core.telemetry import Outcome
+from cachepilot_core.usage import TokenUsage
 
 from cachepilot_relay.observation import (
     build_canonical_request,
@@ -97,6 +98,10 @@ class LeaseController:
             latency_p95_s=latency_p95_s,
             snapshot_store=snapshot_store,
             warm_executor=warm_executor,
+            # P07: the configured pricing snapshot drives cost estimation
+            # (PRD §65 priority 2/3). None → unknown pricing → the economic
+            # gate skips with SKIP_UNKNOWN_PRICING (no savings claimed).
+            pricing=self.settings.pricing,
         )
         self.store = store
         self.enabled = enabled
@@ -160,18 +165,29 @@ class LeaseController:
             logger.warning("lease request tracking failed (traffic unaffected)", exc_info=True)
             return None
 
-    def on_request_end(self, ctx: LeaseRequestContext, outcome: Outcome) -> None:
+    def on_request_end(
+        self,
+        ctx: LeaseRequestContext,
+        outcome: Outcome,
+        usage: TokenUsage | None = None,
+    ) -> None:
         """After the response: PRD §148 normal-request-reset with the outcome.
 
         A failed provider call never refreshes the cache (invariant 3) and
         never counts as cache-producing: its snapshot is dropped, so the
         lease stays non-warmable until the next successful request (PRD §30
         fail-closed semantics — no unsafe reconstruction from a failed body).
+
+        When the observer normalized real usage for this request (P07), the
+        lease's resume-cost estimates are refreshed from it (PRD §65) — this
+        is the ONLY place cost data is written, never on scheduler ticks.
         """
         if not self.enabled:
             return
         try:
             self.manager.after_normal_request(ctx.lease_id, outcome)
+            if usage is not None and usage.prompt_tokens > 0:
+                self.manager.update_cost_estimates(ctx.lease_id, usage)
             lease = self.manager.get(ctx.lease_id)
             if lease is not None:
                 self._persist(lease)

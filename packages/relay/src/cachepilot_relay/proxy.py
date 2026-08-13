@@ -29,6 +29,7 @@ import httpx
 from cachepilot_core.adapters import OpenAICompatibleAdapter
 from cachepilot_core.snapshots import SnapshotStore
 from cachepilot_core.telemetry import Outcome
+from cachepilot_core.usage import TokenUsage
 from starlette.requests import Request
 from starlette.responses import Response, StreamingResponse
 
@@ -122,7 +123,14 @@ class RelayProxy:
                 store=self.observer.store if self.observer is not None else None,
                 enabled=config.observation_enabled,
                 snapshot_store=SnapshotStore(),
-                warm_executor=HttpWarmExecutor(self._client, OpenAICompatibleAdapter()),
+                warm_executor=HttpWarmExecutor(
+                    self._client,
+                    OpenAICompatibleAdapter(),
+                    # P07: the warm's cost is estimated from the configured
+                    # pricing snapshot (PRD §65 priority 2) so warm costs are
+                    # visible (invariant 4) and the economic gate sees them.
+                    pricing=config.lease_settings.pricing,
+                ),
             )
             if config.observation_enabled
             else None
@@ -179,8 +187,8 @@ class RelayProxy:
                 headers=response_headers,
             )
         response_body = b"".join([chunk async for chunk in upstream.aiter_raw()])
-        outcome = self._observe_bounded(request, url, body, response_body, upstream)
-        self._lease_end(lease_ctx, outcome or Outcome.SUCCESS_UNVERIFIED)
+        outcome, usage = self._observe_bounded(request, url, body, response_body, upstream)
+        self._lease_end(lease_ctx, outcome or Outcome.SUCCESS_UNVERIFIED, usage=usage)
         return Response(response_body, status_code=upstream.status_code, headers=response_headers)
 
     # -- lease lifecycle (fail open: never breaks forwarding) ---------------
@@ -202,10 +210,15 @@ class RelayProxy:
             targets_header=request.headers.get("x-cachepilot-targets"),
         )
 
-    def _lease_end(self, ctx: LeaseRequestContext | None, outcome: Outcome) -> None:
+    def _lease_end(
+        self,
+        ctx: LeaseRequestContext | None,
+        outcome: Outcome,
+        usage: TokenUsage | None = None,
+    ) -> None:
         if ctx is None or self.lease_controller is None:
             return
-        self.lease_controller.on_request_end(ctx, outcome)
+        self.lease_controller.on_request_end(ctx, outcome, usage=usage)
 
     # -- observation (fail open: never breaks forwarding) -------------------
 
@@ -216,9 +229,9 @@ class RelayProxy:
         request_body: bytes,
         response_body: bytes,
         upstream: httpx.Response,
-    ) -> Outcome | None:
+    ) -> tuple[Outcome | None, TokenUsage]:
         if self.observer is None:
-            return None
+            return None, TokenUsage()
         try:
             # request_body is the buffered client body (fingerprints);
             # response_body is the upstream's buffered body (usage parse).
@@ -234,7 +247,7 @@ class RelayProxy:
             )
         except Exception as exc:  # noqa: BLE001 — fail open (AGENTS.md invariant 9)
             logger.warning("telemetry observation failed (traffic unaffected): %s", exc)
-            return None
+            return None, TokenUsage()
 
     def _observe_streaming(
         self,

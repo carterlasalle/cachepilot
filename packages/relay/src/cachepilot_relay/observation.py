@@ -316,18 +316,20 @@ class RequestObserver:
         response_headers: Mapping[str, str],
         session_header: str | None = None,
         auth_headers: Mapping[str, str] | None = None,
-    ) -> Outcome | None:
+    ) -> tuple[Outcome | None, TokenUsage]:
         """Record one buffered (non-streaming) request/response pair.
 
         The response body is parsed read-only — the same bytes are returned
         to the client untouched. Streaming responses never reach this path.
 
-        Returns the classified :class:`~cachepilot_core.telemetry.Outcome`
-        (None when observation is disabled) so the proxy can feed it to the
-        lease controller (Phase 5: normal-request-reset, PRD §148).
+        Returns ``(outcome, usage)``: the classified
+        :class:`~cachepilot_core.telemetry.Outcome` (None when observation is
+        disabled) plus the normalized usage, so the proxy can feed both to
+        the lease controller (PRD §148 normal-request-reset; P07 cost
+        estimation, PRD §65).
         """
         if not self.enabled or self.store is None:
-            return None
+            return None, TokenUsage()
         route = extract_route_identity(upstream_url, response_headers)
         route_hash = route.route_hash()
         canonical = build_canonical_request(
@@ -356,7 +358,7 @@ class RequestObserver:
             session_header=session_header,
             history_hash=extract_history_hash(request_body),
         )
-        return outcome
+        return outcome, usage
 
     def observe_streaming(
         self,
@@ -383,7 +385,7 @@ class RequestObserver:
             # A non-2xx "streaming" response is simply a failed request; the
             # (never-consumed) response body is irrelevant to the FAILED
             # classification, so only the request body is passed.
-            return self.observe_bounded(
+            outcome, _ = self.observe_bounded(
                 body,
                 b"",
                 path=path,
@@ -393,6 +395,7 @@ class RequestObserver:
                 session_header=session_header,
                 auth_headers=auth_headers,
             )
+            return outcome
         route = extract_route_identity(upstream_url, response_headers)
         route_hash = route.route_hash()
         canonical = build_canonical_request(

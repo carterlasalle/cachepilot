@@ -26,8 +26,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from decimal import Decimal
 
 from cachepilot_core.leases import LeaseSettings
+from cachepilot_core.pricing import PricingTable
 from cachepilot_core.storage import TelemetryStore
 from cachepilot_relay.config import RelayConfig
 from helpers import DifferentialHarness
@@ -35,6 +37,16 @@ from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import Response, StreamingResponse
 from test_observation import _COMPLETION_REQUEST, ObservationUpstream, _sse_body
+
+#: P07: the relay tests configure the pricing snapshot so the economic gate
+#: can evaluate (PRD §65). Mirrors the FakeProvider defaults — the observed
+#: 4000-token prefix costs $0.00352 cold / $0.00032 cached.
+_PRICE = PricingTable(
+    input_per_mtok=Decimal("0.80"),
+    output_per_mtok=Decimal("2.40"),
+    cache_read_per_mtok=Decimal("0.08"),
+    cache_write_per_mtok=Decimal("0.88"),
+)
 
 
 def test_lease_scheduler_dry_run_warms_nothing_upstream(tmp_path, caplog):
@@ -52,6 +64,10 @@ async def _scenario_scheduler_dry_run(tmp_path, caplog) -> None:
         minimum_margin_s=10.0,
         scheduler_interval_s=0.05,
         jitter_fraction=0.0,
+        # P07: without pricing the economic gate would refuse every warm
+        # (SKIP_UNKNOWN_PRICING) — configure the snapshot so the dry-run
+        # scheduler can evaluate and log its (virtual) warm.
+        pricing=_PRICE,
     )
     kwargs = {
         "telemetry_db_path": str(tmp_path / "telemetry.db"),
@@ -103,6 +119,11 @@ async def _scenario_scheduler_dry_run(tmp_path, caplog) -> None:
         assert row.last_cache_touch_at is not None  # refreshed by the real request
         assert row.session_hash  # stored hashed, never raw
         assert row.session_hash != "sess-lease-1"
+        # P07: the observed usage was priced into the persisted resume-cost
+        # estimates (PRD §65) — a 4000-token prefix at the configured rates
+        # (cold = write-rate only, per estimate_resume_costs).
+        assert row.estimated_cold_resume_cost_usd == Decimal("0.00352")
+        assert row.estimated_cached_resume_cost_usd == Decimal("0.00032")
     finally:
         store.close()
 
@@ -119,6 +140,7 @@ async def _scenario_multiple_requests(tmp_path) -> None:
         minimum_margin_s=10.0,
         scheduler_interval_s=0.05,
         jitter_fraction=0.0,
+        pricing=_PRICE,
     )
     kwargs = {
         "telemetry_db_path": str(tmp_path / "telemetry.db"),
@@ -211,6 +233,9 @@ async def _scenario_real_warm(tmp_path) -> None:
         minimum_margin_s=10.0,
         scheduler_interval_s=0.05,
         jitter_fraction=0.0,
+        # P07: the pricing snapshot makes the warm economically positive
+        # (PRD §65) — the gate must pass for the bounded replay to fire.
+        pricing=_PRICE,
     )
     kwargs = {
         "telemetry_db_path": str(tmp_path / "telemetry.db"),

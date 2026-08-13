@@ -12,6 +12,7 @@ import asyncio
 from decimal import Decimal
 
 from cachepilot_core.adapters import WarmResult
+from cachepilot_core.economics import EconomicConfig, EconomicController, WarmAction, WarmDecision
 from cachepilot_core.leases import (
     CacheLease,
     LeaseDecision,
@@ -19,9 +20,23 @@ from cachepilot_core.leases import (
     LeaseSettings,
     LeaseState,
 )
+from cachepilot_core.pricing import PricingTable
 from cachepilot_core.snapshots import RequestSnapshot, SnapshotStore
 from cachepilot_core.telemetry import Outcome
 from cachepilot_core.usage import TokenUsage
+
+#: PRD §62-shaped pricing (matches the FakeProvider defaults): a 4000-token
+#: prefix costs $0.00352 cold / $0.00032 cached, so a ~$0.0003 warm is
+#: economically positive and several warms fit the $0.002128 budget.
+PRICING = PricingTable(
+    input_per_mtok=Decimal("0.80"),
+    output_per_mtok=Decimal("2.40"),
+    cache_read_per_mtok=Decimal("0.08"),
+    cache_write_per_mtok=Decimal("0.88"),
+)
+
+#: Normal-request usage for a 4000-token prefix (mirrors the fake provider).
+USAGE = TokenUsage(prompt_tokens=4000, cache_read_tokens=4000)
 
 
 class FakeClock:
@@ -67,13 +82,15 @@ def _armed_touched_lease(manager: LeaseManager, clock: FakeClock) -> CacheLease:
     manager.target_started(lease.lease_id, "t1")
     manager.before_normal_request(lease.lease_id)
     manager.after_normal_request(lease.lease_id, Outcome.CONFIRMED_HIT)
+    # P07: the normal request refreshes the resume-cost estimates (PRD §65).
+    manager.update_cost_estimates(lease.lease_id, USAGE)
     assert lease.state is LeaseState.ARMED
     return lease
 
 
 def _default_manager(clock: FakeClock, **settings) -> LeaseManager:
     return LeaseManager(
-        LeaseSettings(jitter_fraction=0.0, **settings),
+        LeaseSettings(jitter_fraction=0.0, pricing=PRICING, **settings),
         time_fn=clock,
         latency_p95_s=4.0,
     )
@@ -455,10 +472,263 @@ def test_dry_run_due_output_contains_would_warm_now_and_never_touches(caplog):
     assert lease.last_cache_touch_at == 1_000_000.0
 
 
-def test_economic_gate_placeholder_always_passes():
-    manager = _default_manager(FakeClock())
+def _stub_decision(action: WarmAction, **overrides) -> WarmDecision:
+    """A fully-populated WarmDecision (PRD §145 shape) for stub controllers."""
+    fields: dict[str, object] = {
+        "action": action,
+        "reason": "stub",
+        "resume_probability": 0.5,
+        "expected_avoidable_loss": Decimal("0.1"),
+        "expected_value": Decimal("0.05"),
+        "next_warm_cost": Decimal("0.01"),
+        "cumulative_warm_cost": Decimal(0),
+        "max_warm_budget": Decimal("0.035"),
+        "remaining_budget": Decimal("0.035"),
+        "safety_margin": Decimal(0),
+    }
+    fields.update(overrides)
+    return WarmDecision(**fields)
+
+
+class _StubController(EconomicController):
+    """Deterministic controller stub: records every evaluation, returns a
+    fixed decision (PRD §103 'inject a stub controller for determinism')."""
+
+    def __init__(self, decision: WarmDecision) -> None:
+        super().__init__()
+        self.decision = decision
+        self.calls: list[dict[str, object]] = []
+
+    def evaluate(self, **kwargs: object) -> WarmDecision:
+        self.calls.append(kwargs)
+        return self.decision
+
+
+# -- economics: P07 (PRD §60-65, §103, §134, §145) ---------------------------
+
+
+def test_economic_gate_consults_the_controller_and_records_decision():
+    """P07: the gate is no longer a pass-through placeholder — it returns
+    exactly the controller's should_warm (PRD §134) and records the decision."""
+    clock = FakeClock()
+    manager = _default_manager(clock)
     lease = _make_lease(manager)
-    assert manager.economic_gate(lease) is True  # P07 interface placeholder
+    manager.target_started(lease.lease_id, "bg-1")  # §63: R = 0.95
+    manager.update_cost_estimates(lease.lease_id, USAGE)
+
+    assert manager.economic_gate(lease) is True  # cheap warm → WARM
+    assert lease.last_warm_decision is not None
+    assert lease.last_warm_decision.action is WarmAction.WARM
+    assert lease.last_warm_decision.reason == "due_and_economically_positive"
+
+
+def test_economic_gate_refuses_with_unknown_pricing():
+    """PRD §65: unknown pricing → the gate refuses and no savings are claimed."""
+    clock = FakeClock()
+    manager = LeaseManager(LeaseSettings(jitter_fraction=0.0), time_fn=clock, latency_p95_s=4.0)
+    lease = _make_lease(manager)
+    manager.update_cost_estimates(lease.lease_id, USAGE)
+
+    assert lease.estimated_cold_resume_cost_usd is None
+    assert lease.estimated_cached_resume_cost_usd is None
+    assert manager.economic_gate(lease) is False
+    assert lease.last_warm_decision is not None
+    assert lease.last_warm_decision.action is WarmAction.SKIP_UNKNOWN_PRICING
+
+
+def test_p07_one_cheap_warm_executes():
+    """PRD §103 'One cheap warm': warm cost < avoidable miss → WARMED_*."""
+    clock = FakeClock()
+    executor = _RecordingExecutor()
+    manager = _real_warm_manager(clock, executor)
+    lease = _armed_touched_lease(manager, clock)
+    _store_snapshot(manager, lease)
+    clock.advance(1000)  # far past the deadline → due → gate → warm
+
+    decision = asyncio.run(manager.evaluate_lease(lease.lease_id))
+    assert decision is LeaseDecision.WARMED_CONFIRMED_HIT
+    assert len(executor.calls) == 1  # the warm executed
+    assert lease.warm_count == 1
+    assert lease.warm_cost_usd == 0.001  # visible (invariant 4)
+    assert lease.last_warm_decision is not None
+    assert lease.last_warm_decision.action is WarmAction.WARM
+
+
+def test_p07_exhausted_budget_stops_economic_and_lets_cache_expire():
+    """PRD §103 'Too many warms' / §62: cumulative warm cost + next warm >
+    budget → ECONOMIC_STOP, cache allowed to expire (no warm ever runs)."""
+    clock = FakeClock()
+    manager = _default_manager(clock)
+    lease = _armed_touched_lease(manager, clock)
+    # Budget = 0.70 * (0.95 * (0.00352 - 0.00032)) = 0.002128; spending
+    # 0.0042 leaves nothing — the ~$0.0003 next warm no longer fits.
+    lease.warm_cost_usd = 0.0042
+    lease.warm_count = 4
+    touch_before = lease.last_cache_touch_at
+    clock.advance(1000)
+
+    decision = asyncio.run(manager.evaluate_lease(lease.lease_id))
+    assert decision is LeaseDecision.STOPPED_ECONOMIC
+    assert lease.state is LeaseState.ECONOMIC_STOP
+    assert lease.last_warm_decision is not None
+    assert lease.last_warm_decision.action is WarmAction.ECONOMIC_STOP
+    # The cache is never touched by a warm and the decision is stable.
+    assert lease.last_cache_touch_at == touch_before
+    assert asyncio.run(manager.evaluate_lease(lease.lease_id)) is LeaseDecision.STOPPED_ECONOMIC
+
+
+def test_p07_unknown_pricing_never_warms():
+    """PRD §103 'Unknown pricing': economically unbounded warming disabled —
+    even a fully warmable manager (executor + snapshot) never sends a warm."""
+    clock = FakeClock()
+    executor = _RecordingExecutor()
+    manager = LeaseManager(
+        LeaseSettings(jitter_fraction=0.0, dry_run=False),
+        time_fn=clock,
+        latency_p95_s=4.0,
+        snapshot_store=SnapshotStore(),
+        warm_executor=executor,
+    )
+    lease = _make_lease(manager)
+    manager.target_started(lease.lease_id, "t1")
+    manager.before_normal_request(lease.lease_id)
+    manager.after_normal_request(lease.lease_id, Outcome.CONFIRMED_HIT)
+    manager.update_cost_estimates(lease.lease_id, USAGE)
+    assert lease.estimated_cold_resume_cost_usd is None  # never claimed
+    _store_snapshot(manager, lease)
+    clock.advance(1000)
+
+    decision = asyncio.run(manager.evaluate_lease(lease.lease_id))
+    assert decision is LeaseDecision.STOPPED_ECONOMIC
+    assert lease.state is LeaseState.ECONOMIC_STOP
+    assert executor.calls == []  # nothing was sent
+    assert lease.warm_count == 0  # no warm, no savings claim
+    assert lease.last_warm_decision is not None
+    assert lease.last_warm_decision.action is WarmAction.SKIP_UNKNOWN_PRICING
+
+
+def test_p07_zero_resume_probability_never_warms():
+    """PRD §103 'Zero probability of continuation': never warm."""
+    clock = FakeClock()
+    manager = _default_manager(clock, detached_resume_probability=0.0)
+    lease = _armed_touched_lease(manager, clock)
+    # Re-arm with an explicitly detached target → PRD §63 R = 0.
+    manager.target_finished(lease.lease_id, "t1")
+    manager.target_started(lease.lease_id, "detached-t1")
+    assert manager.resume_probability(lease) == 0.0
+    clock.advance(1000)
+
+    decision = asyncio.run(manager.evaluate_lease(lease.lease_id))
+    assert decision is LeaseDecision.STOPPED_ECONOMIC
+    assert lease.last_warm_decision is not None
+    assert lease.last_warm_decision.action is WarmAction.SKIP_NO_CONTINUATION
+
+
+def test_resume_probability_heuristic_prd63():
+    """PRD §63 P0: no targets → 0; detached → low (0.20); background
+    target with notify_on_complete → high (0.95)."""
+    clock = FakeClock()
+    manager = _default_manager(clock)
+    lease = _make_lease(manager)
+    assert manager.resume_probability(lease) == 0.0  # no continuation possible
+
+    manager.target_started(lease.lease_id, "bg-1")
+    assert manager.resume_probability(lease) == 0.95  # notify_on_complete
+
+    manager.target_started(lease.lease_id, "detached-d1")
+    # A mix of detached and notify targets → not all detached → high.
+    assert manager.resume_probability(lease) == 0.95
+
+    manager.target_finished(lease.lease_id, "bg-1")
+    assert manager.resume_probability(lease) == 0.20  # all detached → low
+
+
+def test_p07_economic_gate_consults_injected_controller():
+    """PRD §103: inject a stub controller — the gate returns its decision and
+    passes it the lease-derived economic inputs (PRD §146 economics step)."""
+    clock = FakeClock()
+    stop = _stub_decision(WarmAction.ECONOMIC_STOP)
+    stub = _StubController(stop)
+    manager = LeaseManager(
+        LeaseSettings(jitter_fraction=0.0, pricing=PRICING),
+        time_fn=clock,
+        latency_p95_s=4.0,
+        economic_controller=stub,
+    )
+    lease = _make_lease(manager)
+    manager.target_started(lease.lease_id, "bg-1")  # §63: R = 0.95
+    manager.update_cost_estimates(lease.lease_id, USAGE)
+
+    assert manager.economic_gate(lease) is False  # stub says stop → no warm
+    assert len(stub.calls) == 1
+    call = stub.calls[0]
+    assert call["cold_resume_cost"] == lease.estimated_cold_resume_cost_usd
+    assert call["cached_resume_cost"] == lease.estimated_cached_resume_cost_usd
+    assert call["next_warm_cost"] == lease.next_warm_cost_usd
+    assert call["cumulative_warm_cost"] == lease.warm_cost_usd
+    assert call["resume_probability"] == 0.95
+    assert call["pricing_known"] is True
+
+    # A WARM decision from the stub passes the gate; the decision is recorded.
+    stub.decision = _stub_decision(WarmAction.WARM, reason="due_and_economically_positive")
+    assert manager.economic_gate(lease) is True
+    assert lease.last_warm_decision is stub.decision  # PRD §145
+
+
+def test_p07_normal_request_is_a_free_heartbeat():
+    """PRD §64: a natural request refreshes the cache and the cost estimates
+    WITHOUT consuming any warm budget (free heartbeat)."""
+    clock = FakeClock()
+    manager = _default_manager(clock)
+    lease = _armed_touched_lease(manager, clock)
+    lease.warm_count = 3
+    lease.warm_cost_usd = 0.003  # budget already partly spent by warms
+    clock.advance(60)
+
+    manager.before_normal_request(lease.lease_id)
+    manager.after_normal_request(lease.lease_id, Outcome.CONFIRMED_HIT)
+    manager.update_cost_estimates(lease.lease_id, USAGE)
+
+    assert lease.last_cache_touch_at == clock.now  # cache refreshed for free
+    assert lease.warm_count == 3  # no warm ran, no budget consumed
+    assert lease.warm_cost_usd == 0.003
+    assert lease.estimated_cold_resume_cost_usd == 0.00352  # re-derived
+    assert lease.state is LeaseState.ARMED
+
+
+def test_p07_warm_decision_recorded_for_due_evaluation(caplog):
+    """PRD §145: every due evaluation records the explainable WarmDecision
+    (on the lease AND in a log line) with the full economic breakdown."""
+    clock = FakeClock()
+    manager = _default_manager(clock)
+    lease = _armed_touched_lease(manager, clock)
+    clock.advance(1000)
+
+    with caplog.at_level("INFO", logger="cachepilot_core.leases"):
+        decision = asyncio.run(manager.evaluate_lease(lease.lease_id))
+    assert decision is LeaseDecision.SKIPPED_DRY_RUN  # gate passed, dry run
+
+    recorded = lease.last_warm_decision
+    assert recorded is not None
+    assert recorded.action is WarmAction.WARM
+    assert recorded.reason == "due_and_economically_positive"
+    assert recorded.expected_avoidable_loss == Decimal("0.0032")  # 0.00352 - 0.00032
+    assert recorded.expected_value == Decimal("0.00304")  # 0.95 * 0.0032
+    assert recorded.max_warm_budget == Decimal("0.002128")  # 0.70 * EV
+    assert recorded.remaining_budget == Decimal("0.002128")
+    assert recorded.next_warm_cost == Decimal("0.0003224")
+    assert recorded.cumulative_warm_cost == Decimal(0)
+    assert any("warm decision warm" in record.message for record in caplog.records)
+
+
+def test_p07_disabled_economics_restores_watchdog_gate():
+    """PRD §84 cache.economics.enabled=false: the operator explicitly opts
+    back into watchdog behaviour — the gate always passes and records nothing."""
+    clock = FakeClock()
+    manager = _default_manager(clock, economics=EconomicConfig(enabled=False))
+    lease = _make_lease(manager)  # no cost data at all
+    assert manager.economic_gate(lease) is True
+    assert lease.last_warm_decision is None  # no decision was made
 
 
 # -- locking (§52) -----------------------------------------------------------
@@ -539,6 +809,52 @@ def test_lease_settings_defaults():
     assert 240.0 * 0.97 <= deadline <= 240.0 * 1.03
 
 
+def test_lease_settings_economics_from_env(monkeypatch):
+    """PRD §84 cache.economics tunables via CACHEPILOT_ECONOMICS_* + the
+    configured pricing snapshot via CACHEPILOT_PRICING_* (PRD §65/§66)."""
+    monkeypatch.setenv("CACHEPILOT_ECONOMICS_ENABLED", "false")
+    monkeypatch.setenv("CACHEPILOT_ECONOMICS_BUDGET_RATIO", "0.5")
+    monkeypatch.setenv("CACHEPILOT_ECONOMICS_MINIMUM_EXPECTED_SAVINGS_USD", "0.01")
+    monkeypatch.setenv("CACHEPILOT_ECONOMICS_RESUME_PROBABILITY", "0.8")
+    monkeypatch.setenv("CACHEPILOT_ECONOMICS_DETACHED_RESUME_PROBABILITY", "0.1")
+    monkeypatch.setenv("CACHEPILOT_PRICING_INPUT_PER_MTK", "1.0")
+    monkeypatch.setenv("CACHEPILOT_PRICING_OUTPUT_PER_MTK", "2.0")
+    monkeypatch.setenv("CACHEPILOT_PRICING_CACHE_READ_PER_MTK", "0.1")
+    monkeypatch.setenv("CACHEPILOT_PRICING_CACHE_WRITE_PER_MTK", "1.1")
+    settings = LeaseSettings.from_env()
+    assert settings.economics.enabled is False
+    assert settings.economics.budget_ratio == Decimal("0.5")
+    assert settings.economics.minimum_expected_savings == Decimal("0.01")
+    assert settings.resume_probability == 0.8
+    assert settings.detached_resume_probability == 0.1
+    assert settings.pricing is not None
+    assert settings.pricing.input_per_mtok == Decimal("1.0")
+    assert settings.pricing.cache_read_per_mtok == Decimal("0.1")
+    # Defaults stay intact when nothing is set (dry-run + economics on).
+    defaults = LeaseSettings.from_env({})
+    assert defaults.dry_run is True
+    assert defaults.economics.enabled is True
+    assert defaults.economics.budget_ratio == Decimal("0.70")
+    assert defaults.resume_probability == 0.95
+    assert defaults.detached_resume_probability == 0.20
+    assert defaults.pricing is None
+
+
+def test_lease_settings_economics_env_falls_back_on_malformed(monkeypatch):
+    """A bad or out-of-range variable never breaks the relay (fail open)."""
+    monkeypatch.setenv("CACHEPILOT_ECONOMICS_BUDGET_RATIO", "2.0")  # > 1 → default
+    monkeypatch.setenv("CACHEPILOT_ECONOMICS_MINIMUM_EXPECTED_SAVINGS_USD", "-5")
+    monkeypatch.setenv("CACHEPILOT_ECONOMICS_RESUME_PROBABILITY", "nope")
+    monkeypatch.setenv("CACHEPILOT_ECONOMICS_DETACHED_RESUME_PROBABILITY", "2.5")
+    monkeypatch.setenv("CACHEPILOT_PRICING_INPUT_PER_MTK", "1.0")  # partial → None
+    settings = LeaseSettings.from_env()
+    assert settings.economics.budget_ratio == Decimal("0.70")
+    assert settings.economics.minimum_expected_savings == Decimal("0.0")
+    assert settings.resume_probability == 0.95
+    assert settings.detached_resume_probability == 0.20
+    assert settings.pricing is None
+
+
 # -- real-warm path races (Phase 6, PRD §51) ---------------------------------
 
 
@@ -559,7 +875,7 @@ class _RecordingExecutor:
 
 def _real_warm_manager(clock: FakeClock, executor: _RecordingExecutor) -> LeaseManager:
     return LeaseManager(
-        LeaseSettings(jitter_fraction=0.0, dry_run=False),
+        LeaseSettings(jitter_fraction=0.0, dry_run=False, pricing=PRICING),
         time_fn=clock,
         latency_p95_s=4.0,
         snapshot_store=SnapshotStore(),

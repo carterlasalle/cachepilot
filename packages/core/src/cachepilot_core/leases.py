@@ -22,15 +22,19 @@ Warm safety (PRD §32, invariant 9): an uncertain warm is skipped
 bound, and the warm circuit breaker (§94) stops warming a lease after 2
 consecutive misses until a normal request produces new cache evidence.
 
+P07 (PRD §134) turns the watchdog into an optimizer: :meth:`LeaseManager.economic_gate`
+consults the :class:`~cachepilot_core.economics.EconomicController` (PRD §60-65,
+§146) instead of always passing. Cost data is refreshed on the normal-request
+path only (:meth:`LeaseManager.update_cost_estimates`, PRD §64/§65 — never on
+scheduler ticks), every due evaluation records an explainable
+:class:`~cachepilot_core.economics.WarmDecision` (PRD §145), and an exhausted
+warm budget stops warming with ``ECONOMIC_STOP`` (PRD §61-62, §103).
+
 Lease identity is physical, never the session alone (AGENTS.md invariant
 7): the lease carries provider, model, api_mode, base_url, auth scope and
 all five fingerprints. One session may own several leases concurrently
 (PRD §21) — e.g. one per provider — and a model switch invalidates the old
 model's lease instead of refreshing it.
-
-P07 economics are NOT built here: :meth:`LeaseManager.economic_gate` is a
-documented placeholder that always passes, keeping the interface for the
-Phase 7 economic controller (PRD §134).
 """
 
 from __future__ import annotations
@@ -50,6 +54,8 @@ from enum import Enum
 from pydantic import BaseModel, Field
 
 from cachepilot_core.adapters import WarmExecutor, WarmResult
+from cachepilot_core.economics import EconomicConfig, EconomicController, WarmDecision
+from cachepilot_core.pricing import CostResolver, PricingTable, estimate_cost, estimate_resume_costs
 from cachepilot_core.snapshots import SnapshotStore
 from cachepilot_core.telemetry import Outcome
 from cachepilot_core.usage import TokenUsage
@@ -64,6 +70,28 @@ ENV_JITTER_FRACTION = "CACHEPILOT_LEASE_JITTER_FRACTION"
 ENV_DEFAULT_TTL_S = "CACHEPILOT_LEASE_DEFAULT_TTL_S"
 ENV_SCHEDULER_INTERVAL_S = "CACHEPILOT_LEASE_SCHEDULER_INTERVAL_S"
 ENV_DRY_RUN = "CACHEPILOT_LEASE_DRY_RUN"
+
+#: Environment variables for the economic controller (PRD §60-61, §63, §84
+#: ``cache.economics`` block).
+ENV_ECONOMICS_ENABLED = "CACHEPILOT_ECONOMICS_ENABLED"
+ENV_ECONOMICS_BUDGET_RATIO = "CACHEPILOT_ECONOMICS_BUDGET_RATIO"
+ENV_ECONOMICS_MINIMUM_SAVINGS = "CACHEPILOT_ECONOMICS_MINIMUM_EXPECTED_SAVINGS_USD"
+ENV_ECONOMICS_RESUME_PROBABILITY = "CACHEPILOT_ECONOMICS_RESUME_PROBABILITY"
+ENV_ECONOMICS_DETACHED_RESUME_PROBABILITY = "CACHEPILOT_ECONOMICS_DETACHED_RESUME_PROBABILITY"
+
+#: Environment variables for the configured pricing snapshot (PRD §65
+#: priority 2/3, §66 fallback snapshot — never authority). All four must be
+#: set for a pricing table to engage (all-or-nothing, fail closed).
+ENV_PRICING_INPUT_PER_MTK = "CACHEPILOT_PRICING_INPUT_PER_MTK"
+ENV_PRICING_OUTPUT_PER_MTK = "CACHEPILOT_PRICING_OUTPUT_PER_MTK"
+ENV_PRICING_CACHE_READ_PER_MTK = "CACHEPILOT_PRICING_CACHE_READ_PER_MTK"
+ENV_PRICING_CACHE_WRITE_PER_MTK = "CACHEPILOT_PRICING_CACHE_WRITE_PER_MTK"
+
+#: PRD §63 P0 heuristic defaults: a background target with
+#: ``notify_on_complete`` resumes with high probability; an explicitly
+#: detached target resumes with low probability.
+DEFAULT_RESUME_PROBABILITY = 0.95
+DEFAULT_DETACHED_RESUME_PROBABILITY = 0.20
 
 
 class LeaseState(str, Enum):
@@ -131,6 +159,14 @@ class CacheLease:
     estimated_cold_resume_cost_usd: float | None = None
     estimated_cached_resume_cost_usd: float | None = None
 
+    #: In-memory economics bookkeeping (P07) — NEVER persisted (the stored
+    #: snapshot only carries the two estimated-resume-cost columns; the
+    #: prefix size, the next-warm predictor and the last decision are
+    #: process-local and re-derived on the next normal request).
+    prefix_tokens: int | None = None
+    next_warm_cost_usd: float | None = None
+    last_warm_decision: WarmDecision | None = None
+
     state: LeaseState = LeaseState.INACTIVE
 
     def arm(self) -> None:
@@ -160,6 +196,21 @@ class LeaseSettings(BaseModel):
     #: Phase 5: the warm executor logs ``WOULD WARM`` and never sends a
     #: network request (PRD §132).
     dry_run: bool = True
+    #: Economic controller tunables (PRD §60-61, §84 ``cache.economics``).
+    #: Read from ``CACHEPILOT_ECONOMICS_*``.
+    economics: EconomicConfig = Field(default_factory=EconomicConfig)
+    #: Configured pricing snapshot (PRD §65 priority 2/3, §66 fallback — never
+    #: authority). ``None`` means unknown pricing: the economic gate skips with
+    #: SKIP_UNKNOWN_PRICING and no savings are ever claimed (invariant 4).
+    pricing: PricingTable | None = None
+    #: PRD §63 P0 heuristic: background target with ``notify_on_complete``
+    #: resumes with high probability (default 0.95).
+    resume_probability: float = Field(default=DEFAULT_RESUME_PROBABILITY, ge=0.0, le=1.0)
+    #: PRD §63 P0 heuristic: an explicitly detached target resumes with low
+    #: probability (default 0.20).
+    detached_resume_probability: float = Field(
+        default=DEFAULT_DETACHED_RESUME_PROBABILITY, ge=0.0, le=1.0
+    )
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> LeaseSettings:
@@ -172,6 +223,34 @@ class LeaseSettings(BaseModel):
             default_ttl_s=_env_float(env.get(ENV_DEFAULT_TTL_S), 300.0),
             scheduler_interval_s=_env_float(env.get(ENV_SCHEDULER_INTERVAL_S), 1.0),
             dry_run=_env_flag(env.get(ENV_DRY_RUN, "true"), True),
+            economics=EconomicConfig(
+                enabled=_env_flag(env.get(ENV_ECONOMICS_ENABLED, "true"), True),
+                budget_ratio=_env_bounded(
+                    env.get(ENV_ECONOMICS_BUDGET_RATIO),
+                    Decimal("0.70"),
+                    minimum=Decimal(0),
+                    minimum_exclusive=True,
+                    maximum=Decimal(1),
+                ),
+                minimum_expected_savings=_env_bounded(
+                    env.get(ENV_ECONOMICS_MINIMUM_SAVINGS),
+                    Decimal("0.0"),
+                    minimum=Decimal(0),
+                ),
+            ),
+            pricing=_pricing_from_env(env),
+            resume_probability=_env_bounded(
+                env.get(ENV_ECONOMICS_RESUME_PROBABILITY),
+                Decimal(str(DEFAULT_RESUME_PROBABILITY)),
+                minimum=Decimal(0),
+                maximum=Decimal(1),
+            ),
+            detached_resume_probability=_env_bounded(
+                env.get(ENV_ECONOMICS_DETACHED_RESUME_PROBABILITY),
+                Decimal(str(DEFAULT_DETACHED_RESUME_PROBABILITY)),
+                minimum=Decimal(0),
+                maximum=Decimal(1),
+            ),
         )
 
 
@@ -241,12 +320,26 @@ class LeaseManager:
         latency_p95_s: float = 4.0,
         snapshot_store: SnapshotStore | None = None,
         warm_executor: WarmExecutor | None = None,
+        pricing: PricingTable | None = None,
+        price_override: Decimal | None = None,
+        economic_controller: EconomicController | None = None,
     ) -> None:
         self.settings = settings or LeaseSettings()
         self.time_fn = time_fn
         self.latency_p95_s = latency_p95_s
         self.snapshot_store = snapshot_store
         self.warm_executor = warm_executor
+        #: Configured pricing snapshot for cost estimation (PRD §65 priority
+        #: 2/3): the constructor argument wins, else ``settings.pricing``.
+        self.pricing = pricing if pricing is not None else self.settings.pricing
+        #: Flat configured price override (PRD §65 priority 3).
+        self.price_override = price_override
+        #: The economic controller (PRD §60-65). Injectable for deterministic
+        #: tests; defaults to a real controller over ``settings.economics``.
+        self.economic_controller = economic_controller or EconomicController(
+            self.settings.economics
+        )
+        self._cost_resolver = CostResolver()
         self._leases: dict[str, CacheLease] = {}
         self._by_cache_fingerprint: dict[str, str] = {}
         self._runtime: dict[str, _LeaseRuntime] = {}
@@ -492,16 +585,118 @@ class LeaseManager:
             self._locks[cache_fingerprint] = lock
         return lock
 
-    def economic_gate(self, lease: CacheLease) -> bool:
-        """P07 placeholder economic gate — ALWAYS passes (documented).
+    # -- economics (P07: PRD §60-65, §134, §145-146) -------------------------
 
-        Phase 7 (PRD §134) replaces this with the real economic controller:
-        warm iff ``expected_avoidable_loss > expected_next_warm_cost +
-        safety_margin`` (AGENTS.md invariant 5). The interface (called once
-        per due lease, before warming) is kept so P07 plugs in without
-        touching the scheduler.
+    def update_cost_estimates(self, lease_id: str, usage: TokenUsage) -> CacheLease:
+        """Refresh the lease's resume-cost estimates from request usage (PRD §65).
+
+        Called on the normal-request path ONLY (:meth:`after_normal_request`
+        via the relay controller — PRD §64 free heartbeat), never on a
+        scheduler tick. When pricing is known, ``prefix_tokens`` are priced
+        with :func:`~cachepilot_core.pricing.estimate_resume_costs` and the
+        next-warm predictor is the bounded warm shape (cache-read prefix +
+        one output token, PRD §31/§147 — the warm replays the still-alive
+        cache). When pricing is unknown the resume-cost fields stay/return
+        ``None``: the gate then skips with SKIP_UNKNOWN_PRICING and no
+        savings are ever claimed (PRD §65, AGENTS.md invariant 4).
         """
-        return True
+        lease = self._require(lease_id)
+        prefix = max(usage.prompt_tokens, 0)
+        if prefix <= 0:
+            # No usable usage (e.g. a failed/empty observation) — keep the
+            # last known estimates rather than clobbering them with zeros.
+            return lease
+        lease.prefix_tokens = prefix
+        if self.pricing is not None:
+            cold, cached = estimate_resume_costs(prefix, self.pricing)
+            lease.estimated_cold_resume_cost_usd = float(cold)
+            lease.estimated_cached_resume_cost_usd = float(cached)
+            warm_usage = TokenUsage(
+                prompt_tokens=prefix,
+                cache_read_tokens=prefix,
+                completion_tokens=1,
+            )
+            lease.next_warm_cost_usd = float(estimate_cost(warm_usage, self.pricing))
+        else:
+            # PRD §65: unknown pricing → never claim savings. The resolved
+            # request cost (provider-returned > configured override) is still
+            # recorded as the warm-cost predictor when it exists.
+            lease.estimated_cold_resume_cost_usd = None
+            lease.estimated_cached_resume_cost_usd = None
+            resolution = self._cost_resolver.resolve(usage, None, self.price_override)
+            if resolution.is_known and resolution.amount is not None:
+                lease.next_warm_cost_usd = float(resolution.amount)
+            else:
+                lease.next_warm_cost_usd = None
+        return lease
+
+    def resume_probability(self, lease: CacheLease) -> float:
+        """PRD §63 P0 heuristic — no ML, deterministic.
+
+        - no active targets → 0.0 (no continuation possible; never warm);
+        - every target explicitly detached (``detached-`` id prefix) → low
+          (``settings.detached_resume_probability``, default 0.20);
+        - otherwise a background target with ``notify_on_complete`` (the
+          relay's ``bg-N`` synthetic ids) → high
+          (``settings.resume_probability``, default 0.95).
+        """
+        if not lease.active_targets:
+            return 0.0
+        if all(target.startswith("detached-") for target in lease.active_targets):
+            return self.settings.detached_resume_probability
+        return self.settings.resume_probability
+
+    def evaluate_economics(self, lease: CacheLease) -> WarmDecision:
+        """Run the economic controller for a due lease — PRD §146 economics step.
+
+        Derives the controller inputs from the lease (resume-cost estimates,
+        cumulative warm cost, next-warm predictor, §63 resume probability),
+        records the explainable :class:`WarmDecision` on the lease and in a
+        log line (PRD §145), and returns it.
+        """
+        cold = lease.estimated_cold_resume_cost_usd
+        cached = lease.estimated_cached_resume_cost_usd
+        pricing_known = cold is not None and cached is not None
+        decision = self.economic_controller.evaluate(
+            cold_resume_cost=cold if cold is not None else Decimal(0),
+            cached_resume_cost=cached if cached is not None else Decimal(0),
+            next_warm_cost=(
+                lease.next_warm_cost_usd if lease.next_warm_cost_usd is not None else Decimal(0)
+            ),
+            cumulative_warm_cost=lease.warm_cost_usd,
+            resume_probability=self.resume_probability(lease),
+            pricing_known=pricing_known,
+        )
+        lease.last_warm_decision = decision  # PRD §145 (in-memory only)
+        logger.info(
+            "warm decision %s (%s): expected_avoidable_loss=%s remaining_budget=%s "
+            "next_warm_cost=%s cumulative_warm_cost=%s resume_probability=%s "
+            "lease=%s ttl=%ss confidence=%s",
+            decision.action.value,
+            decision.reason,
+            decision.expected_avoidable_loss,
+            decision.remaining_budget,
+            decision.next_warm_cost,
+            decision.cumulative_warm_cost,
+            decision.resume_probability,
+            lease.lease_id,
+            lease.estimated_ttl_s,
+            lease.ttl_confidence,
+        )
+        return decision
+
+    def economic_gate(self, lease: CacheLease) -> bool:
+        """P07: warm iff the economic controller says WARM (PRD §134, invariant 5).
+
+        Disabled economics (``economics.enabled=False``) restores the P05/P06
+        watchdog behaviour — every due lease passes the gate. Otherwise the
+        gate consults the controller and returns ``decision.should_warm``:
+        SKIP_UNKNOWN_PRICING / SKIP_NO_CONTINUATION / SKIP_NOT_ECONOMIC /
+        ECONOMIC_STOP all mean NO warm (fail closed for warming, invariant 9).
+        """
+        if not self.settings.economics.enabled:
+            return True
+        return self.evaluate_economics(lease).should_warm
 
     async def evaluate_lease(self, lease_id: str) -> LeaseDecision:
         """PRD §146 core algorithm for one lease (dry-run warm executor)."""
@@ -777,3 +972,59 @@ def _env_flag(raw: str | None, default: bool) -> bool:
     # Unrecognized → the safe default. For dry_run that means Phase 5
     # dry-run stays ON (fail closed for warming: uncertain config → no warm).
     return default
+
+
+def _env_bounded(
+    raw: str | None,
+    default: Decimal,
+    *,
+    minimum: Decimal,
+    maximum: Decimal | None = None,
+    minimum_exclusive: bool = False,
+    maximum_exclusive: bool = False,
+) -> Decimal:
+    """Parse a Decimal env var, falling back when malformed or out of range.
+
+    A bad or out-of-range variable can never break the relay (fail open for
+    traffic): the value must satisfy the (optionally exclusive) bounds, else
+    the default is returned.
+    """
+    if raw is None:
+        return default
+    try:
+        value = Decimal(raw.strip())
+    except (TypeError, ValueError, ArithmeticError):
+        return default
+    if value < minimum or (not minimum_exclusive and value == minimum):
+        return default
+    if maximum is not None and (value > maximum or (not maximum_exclusive and value == maximum)):
+        return default
+    return value
+
+
+def _pricing_from_env(env: Mapping[str, str]) -> PricingTable | None:
+    """Build the configured pricing snapshot from ``CACHEPILOT_PRICING_*``.
+
+    All-or-nothing (fail closed): every rate must parse to a non-negative
+    number, otherwise ``None`` (unknown pricing → the economic gate skips
+    with SKIP_UNKNOWN_PRICING). Fallback snapshot only, never authority
+    (PRD §66).
+    """
+    raw = {
+        "input_per_mtok": env.get(ENV_PRICING_INPUT_PER_MTK),
+        "output_per_mtok": env.get(ENV_PRICING_OUTPUT_PER_MTK),
+        "cache_read_per_mtok": env.get(ENV_PRICING_CACHE_READ_PER_MTK),
+        "cache_write_per_mtok": env.get(ENV_PRICING_CACHE_WRITE_PER_MTK),
+    }
+    if any(value is None for value in raw.values()):
+        return None
+    rates: dict[str, Decimal] = {}
+    for field_name, value in raw.items():
+        try:
+            rate = Decimal(str(value).strip())
+        except (TypeError, ValueError, ArithmeticError):
+            return None
+        if rate < 0:
+            return None
+        rates[field_name] = rate
+    return PricingTable(**rates)

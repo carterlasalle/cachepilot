@@ -36,8 +36,17 @@ class WarmAction(str, Enum):
 
 
 class EconomicConfig(BaseModel):
-    """Tunables for the economic controller (PRD §60-61)."""
+    """Tunables for the economic controller (PRD §60-61, §84 ``cache.economics``).
 
+    ``enabled`` is the operator's explicit switch (PRD §84 sample): when
+    False the lease manager falls back to the P05/P06 watchdog behaviour
+    (every due lease warms). The PRD §84 sample also suggests
+    ``minimum_expected_savings_usd: 0.01`` — operators opt in via
+    ``CACHEPILOT_ECONOMICS_MINIMUM_EXPECTED_SAVINGS_USD``; the default stays
+    0.0 so the controller's pure math is the only gate out of the box.
+    """
+
+    enabled: bool = True
     budget_ratio: Decimal = Field(default=Decimal("0.70"), gt=0, le=1)
     safety_margin: Decimal = Field(default=Decimal("0.0"), ge=0)
     minimum_expected_savings: Decimal = Field(default=Decimal("0.0"), ge=0)
