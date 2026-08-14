@@ -14,7 +14,7 @@ evaluator:
   max_input_tokens: 1M
   max_output_tokens: 400k
 defaults:
-  model: deepseek-v4-flash
+  model: deepseek/deepseek-v4-flash-0731
   api_key_env: GITREINS_LLM_API_KEY
 history:
   enabled: true
