@@ -171,3 +171,81 @@ One new finding was filed (E2E-007). Full evidence in `e2e-output/report.md`.
   body) and route `OPTIONS`/`TRACE`/any unknown method through `_write_refused()`
   (405 JSON), and extend the smoke test's 405 loop to include an exhaustive
   method set (HEAD/OPTIONS/TRACE) so the contract is uniformly machine-readable.
+
+---
+
+## RUN 5 — CLI/API variant (2026-08-15)
+
+Run date: 2026-08-15 · repo `main` @ `7a8abda` (Run 5 tick) · CLI/API E2E
+variant (no browser). Fresh deploy: `uv sync --group dev` clean, `.venv/bin`
+present, `yarn install && yarn build` → **43 modules transformed** (index.html
+0.55 kB, JS 162.59 kB, CSS 5.48 kB) green, `dist/` emitted. Backend:
+`.venv/bin/python dashboard/backend/server.py`. Relay: real `cachepilotd`
+(127.0.0.1:8795 → mock upstream 127.0.0.1:9991). Seeded + empty + corrupt
+temp telemetry DBs under `/tmp/cp-e2e5/`.
+
+### Re-verification of prior findings
+
+| ID | Severity | Result | Evidence (live) |
+|----|----------|--------|-----------------|
+| E2E-002 | MEDIUM | **FIXED** | With `hermes-webui` squatting 8787 and `mcp serve` on 8788, `cachepilot status` → `Relay: occupied by another service` (never `healthy`, prior R2 false positive). Pointed at a real relay (`CACHEPILOT_RELAY_LISTEN=127.0.0.1:8795`): relay control `GET /cachepilot/health` answered `{"service":"cachepilot-relay","status":"ok"}` and CLI+API both read `Relay: healthy`. Both daemons refuse an occupied default with the actionable error: `cachepilotd: ... 127.0.0.1:8787 is already in use — another process owns it (on a stock Hermes host this is typically hermes-webui, HERMES_WEBUI_PORT default 8787). Pick a free address with --listen HOST:PORT or CACHEPILOT_RELAY_LISTEN.`; `[dashboard] error: listen address 127.0.0.1:8788 is already in use — another process owns it (on a stock Hermes host this is typically hermes_cli's 'mcp serve'). Pick a free port with --port PORT and update the /api proxy target in dashboard/vite.config.ts.` (exit 2, tested on 8787/8788/8791/8790 all occupied). Relay pass-through live-verified: GET `/hello` → mock upstream body byte-identical; hop-by-hop/correlation handling intact. |
+| E2E-003 | LOW | **FIXED** | Live server: `POST`/`PUT`/`DELETE`/`PATCH /api/leases` all → **405 `application/json; charset=utf-8`** `{"error": "the dashboard backend is read-only (GET only)"}`. No 501/HTML. |
+| E2E-004 | LOW | **FIXED** | `cachepilot status/leases/costs/ttl/routes/churn/explain-miss/topology --db /tmp/cp-e2e5/clean-cli/missing.db` → each prints the read-only stderr notice naming the path ("CLI reads are read-only; the relay creates the DB on first write") + honest empty output, **exit 0**, and **neither the file nor its parent directory is created** (`ls` confirms the dir does not exist). Dashboard on a missing `--db` renders honest empty state (`/api/status` hit_rate null + `providers: []`, `/api/leases` `[]`, `/api/costs` `0.0`). |
+| E2E-005 | LOW | **FIXED** | Same seeded DB: `cachepilot status` shows `route-change churn events 0` **with the footnote** "= churn events attributed to a route change (churn_events.route_changed); all observed switches: cachepilot routes", while `cachepilot routes` shows `route switches 1`. API mirrors: `/api/status` `route_changes: 0` vs `/api/routes` `stats.route_switches: 1`. Labels now disambiguate the sources. |
+| E2E-006 | MEDIUM | **FIXED** | `dashboard/src/styles.css` has `@media (max-width: 768px)` (line 414) collapsing `.sidebar`→row sticky top nav and reflowing to single column; desktop ≥768px untouched (media query is the only breakpoint). `yarn build` green. (Browser render not re-run in this CLI/API variant; code/build state confirms the fix per Run 4.) |
+| E2E-007 | LOW | **FIXED** | Live server: `OPTIONS`/`TRACE`/`HEAD /api/leases` now all **405 JSON**; `HEAD` omits the body but carries the JSON content-type + Content-Length (HTTP HEAD semantics). `smoke_test.py` 405 loop covers all 7 methods (HEAD asserts empty body) → **SMOKE TEST PASSED**. |
+
+### New finding
+
+| ID | Severity | Component | Summary |
+|----|----------|-----------|---------|
+| E2E-008 | LOW | CLI (`cachepilot_cli`) + dashboard backend (`server.py`) | A present-but-corrupt / non-SQLite telemetry DB file makes every CLI read command crash with an unhandled `sqlite3.DatabaseError: file is not a database` traceback (exit 1), and the dashboard `/api/*` endpoints return HTTP 500 JSON — both contradicting the documented contract that "a corrupt file, or an unreadable database is an honest empty store" (server.py:142-143, docs/dashboard.md). |
+
+## E2E-008 — LOW — Corrupt/unreadable telemetry DB: CLI traceback + dashboard 500, not the documented honest-empty-store
+
+- **Component**: `packages/cli/src/cachepilot_cli/churn.py:open_read_only_store`
+  (returns a live store for ANY existing file — only missing files are caught)
+  + `dashboard/backend/server.py:open_store` / `ReadOnlyTelemetryStore.connect`.
+  Every `cachepilot <cmd>` read command and all 9 `/api/*` GET endpoints.
+- **Reproduction** (live):
+  1. `echo "not a database" > /tmp/cp-e2e5/text.db` and
+     `head -c 2000 /dev/urandom > /tmp/cp-e2e5/corrupt.db`.
+  2. `cachepilot status --db <corrupt.db>` → **raw Python traceback**,
+     `sqlite3.DatabaseError: file is not a database`, **exit 1** (reproduced for
+     `status`, `leases`, `costs`, `ttl`). No graceful message, no honest empty
+     state — the traceback leaks the CLI entry point and internal call stack.
+  3. `.venv/bin/python dashboard/backend/server.py --port 8796 --db <corrupt.db>`
+     then `GET /api/status` and `GET /api/leases` → **HTTP 500**
+     `{"error": "DatabaseError: file is not a database"}`.
+- **Expected**: the never-fabricate read posture treats a corrupt/unreadable
+  database like a missing one. `server.py:141-143` states: "a missing file, a
+  corrupt file, or an unreadable database is an honest empty store, not an
+  error page full of invented numbers"; docs/dashboard.md line 66-67 promises
+  the CLI "renders the honest empty state". A read-only observability command
+  should degrade to an honest empty state (or a clean, decidable error), never
+  a raw `sqlite3` traceback or a 500.
+- **Actual**: the CLI crashes with an unhandled traceback (exit 1) and the
+  dashboard answers 500 — neither is the documented contract. The dashboard
+  `_api` does fail open (a bad store never kills the request thread) and the
+  500 body is JSON+serializable, so severity is LOW and read-only integrity is
+  NOT violated; but the CLI behaviour is a usability defect (a corrupt DB is a
+  common failure after an interrupted write or a stale/foreign file at the
+  `--db` path).
+- **Suggested fix direction** (NOT changed this tick — architectural, multiple
+  files): in `open_read_only_store` and the dashboard's `open_store`, probe the
+  file (e.g. `PRAGMA quick_check` / `SELECT count(*) FROM sqlite_master` on a
+  scratch read-only connection) and treat a `sqlite3.DatabaseError` as the
+  same "no readable telemetry" path as a missing file → honest empty state;
+  have the CLI wrap store reads so a `DatabaseError` degrades to the documented
+  empty output + a stderr notice instead of a traceback. Extend `smoke_test.py`
+  with a corrupt-DB case asserting the honest-empty contract.
+
+### RUN 5 zero-finding areas / gates
+
+- Quality gate: **482 pytest passed in 43.37s**; `ruff check src/ packages/ dashboard/backend/` → "All checks passed!"; mypy authoritative CI invocation → **Success: no issues found in 74 source files**. `uv sync --group dev` clean.
+- Frontend gate: `yarn install` + `yarn build` → **43 modules transformed**, success, `dist/` emitted.
+- `dashboard/backend/smoke_test.py` → **SMOKE TEST PASSED** (seeded + empty store + relay probe + startup occupant detection + 7-method 405 contract + byte-identical read-only DB).
+- All 8 CLI commands on the seeded DB return real, mutually consistent data: `status` (3 requests, hit rate 50.0% = 1/2, 1 CHIT / 1 MISS / 1 UNVERIFIED), `leases` (LEASE lease-00…  ARMED, 76s cache age, 300s TTL), `costs` ($0.000330 total, openai), `ttl` (288s estimate, 120-600s bounds, conf 0.85, 12 samples, survival P(survive)=1.00 n=4, median 300s), `routes` (1 switch, 1 route_instability verdict), `churn` (tools+cache key changed, cause "tool list mutation"), `explain-miss` (stable/changed layers, cause, conf 0.82, ~1234 tokens, first divergent byte), `topology` (2 sessions, 1 pair, tool schemas stability 0.0%, ~1,234 tokens).
+- All 8 CLI commands on a MISSING DB: honest empty states, exit 0, no file/dir created (E2E-004). On the seeded DB all 9 `/api/*` endpoints return real JSON matching docs/dashboard.md schemas; empty-store endpoints return honest zeros/`[]`/null hit_rate; unknown `/api/*` → 404 JSON; static SPA serving (`/`, `/some/route`) serves `index.html`; `../package.json` traversal → 404 (root-escaped paths blocked), `/..%2f..%2fetc/passwd` → not leaked (served app HTML, candidate never escapes `dist/` root).
+- Edge inputs clean: `/api/miss?session=zzz` → `{"event": null, "stable": [], "changed": []}`; invalid `CACHEPILOT_RELAY_LISTEN` → `Relay: unreachable (invalid CACHEPILOT_RELAY_LISTEN='...')`; unknown CLI subcommand → argparse error. Relay pass-through works (GET/POST forwarded to upstream; 501 from the GET-only mock upstream is the stub, not the relay).
+- Browser/visual at 320/768/1280px and live console: NOT re-run this tick (CLI/API variant; browser follow-up lives with the Luna variant as in prior runs).
