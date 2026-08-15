@@ -10,10 +10,12 @@ None are fabricated; every task row carries reproduction evidence.
 
 | ID | Severity | Component | Summary |
 |----|----------|-----------|---------|
-| E2E-002 | MEDIUM | relay / dashboard backend / deploy | Default ports 8787 + 8788 collide with stock-Hermes companion processes (hermes-webui, Hermes MCP server) on this host; out-of-box flows unusable, relay probe reports false "healthy" |
-| E2E-003 | LOW | dashboard backend | PUT/DELETE/PATCH return 501 + HTML body, not the documented 405 JSON — write refusal works but the error contract is wrong and non-JSON |
-| E2E-004 | LOW | CLI (TelemetryStore.connect) | Every CLI read command silently CREATES an empty telemetry DB at a missing `--db`/`CACHEPILOT_TELEMETRY_DB` path (mkdir + CREATE TABLE); a typo'd path yields a stray ~84 KB file instead of an error |
-| E2E-005 | LOW | CLI + dashboard API | "Route changes" counters disagree across surfaces on the same DB: `cachepilot status` → `route changes 0` (churn_events.route_changed) while `cachepilot routes` → `route switches 1` (route_events rows); labels do not disambiguate the sources |
+| E2E-002 | MEDIUM | relay / dashboard backend / deploy | Default ports 8787 + 8788 collide with stock-Hermes companion processes (hermes-webui, Hermes MCP server) on this host; out-of-box flows unusable, relay probe reports false "healthy" — **no longer reproduces (fixed in 8057569)** |
+| E2E-003 | LOW | dashboard backend | PUT/DELETE return 501 + HTML body, not the documented 405 JSON — write refusal works but the error contract is wrong and non-JSON — **no longer reproduces (fixed in c976378)** |
+| E2E-004 | LOW | CLI (TelemetryStore.connect) | Every CLI read command silently CREATES an empty telemetry DB at a missing `--db`/`CACHEPILOT_TELEMETRY_DB` path (mkdir + CREATE TABLE); a typo'd path yields a stray ~84 KB file instead of an error — **no longer reproduces (fixed in 93d7a32)** |
+| E2E-005 | LOW | CLI + dashboard API | "Route changes" counters disagree across surfaces on the same DB — **no longer reproduces (fixed in ba93d89)** |
+| E2E-006 | MEDIUM | dashboard / responsive UI | At 320px viewport the fixed 230px sidebar clips dashboard content — **no longer reproduces (fixed in 1095a97)** |
+| E2E-007 | LOW | dashboard backend | Write-refusal JSON 405 does not extend to HEAD/OPTIONS/TRACE — they still return 501 + text/html (incomplete continuation of the E2E-003 fix); smoke test only asserts the 4 write methods |
 
 ---
 
@@ -133,3 +135,39 @@ screenshots are in `e2e-output/run2-screenshots/`.
   DB SHA-256 unchanged.
 - Quality/build/smoke: pytest 482 passed, ruff passed, yarn build passed,
   smoke test 52/52 passed.
+
+---
+
+## RUN 3 — CLI/API variant (2026-08-15)
+
+Re-verified all five prior findings against a fresh deploy (`ff55ff5`):
+**E2E-002, E2E-003, E2E-004, E2E-005, E2E-006 no longer reproduce (fixed).**
+One new finding was filed (E2E-007). Full evidence in `e2e-output/report.md`.
+
+## E2E-007 — LOW — Dashboard backend: HEAD/OPTIONS/TRACE return 501 + text/html, not the documented 405 JSON
+
+- **Component**: `dashboard/backend/server.py` `Handler` — adds `do_POST`,
+  `do_PUT`, `do_DELETE`, `do_PATCH` (the E2E-003 fix) but NOT `do_HEAD`,
+  `do_OPTIONS`, `do_TRACE`.
+- **Reproduction** (live, seeded + empty-store servers on 8794/8797):
+  - `curl -X HEAD /api/leases` → **501** `text/html;charset=utf-8`
+  - `curl -X OPTIONS /api/leases` → **501** `text/html;charset=utf-8`
+  - `curl -X TRACE /api/leases` → **501** `text/html;charset=utf-8`
+  - contrast: `curl -X PUT/DELETE/PATCH/POST /api/leases` → **405**
+    `application/json; charset=utf-8` `{"error":"the dashboard backend is read-only (GET only)"}`
+- **Expected**: `docs/dashboard.md` `line 96` documents "`POST`/writes are
+  refused with 405 (the backend is read-only)" — a consistent JSON 405
+  (or, for the read-only GET-contract, at least a JSON error) for any
+  unimplemented method, as with the fixed write methods.
+- **Actual**: only the four write methods are 405 JSON; HEAD (a read-ish method
+  many HTTP clients use for liveness/`curl -I`), OPTIONS (CORS preflight), and
+  TRACE fall through to `BaseHTTPRequestHandler`'s generic **501 + HTML body**.
+  Read-only integrity is NOT violated (all still refused), but the error
+  contract remains inconsistent and non-JSON for these methods — the same
+  defect class E2E-003 fixed, extended incompletely.
+- **Note**: `smoke_test.py` asserts 405 only for `("POST","PUT","DELETE","PATCH")`
+  (line 554), so this gap is untested by the gate.
+- **Suggested fix direction**: implement `do_HEAD` (honor GET semantics, omit
+  body) and route `OPTIONS`/`TRACE`/any unknown method through `_write_refused()`
+  (405 JSON), and extend the smoke test's 405 loop to include an exhaustive
+  method set (HEAD/OPTIONS/TRACE) so the contract is uniformly machine-readable.

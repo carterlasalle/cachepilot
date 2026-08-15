@@ -215,3 +215,156 @@ One finding was appended to `e2e-output/tasks.md`: E2E-006 (MEDIUM), mobile
 responsive layout at 320px clips the dashboard content and provides no usable
 mobile navigation/content adaptation. No other browser findings were
 reproduced.
+
+---
+
+## RUN 3 — CLI/API variant
+
+Date: 2026-08-15 · Worker: CLI/API E2E tick (no browser tool) · Repo: cachepilot @ ff55ff5 (main, clean)
+
+Scope: full CLI/API user journey against a fresh deploy. Re-verify the five
+prior findings (E2E-002..E2E-006, all claimed FIXED) and hunt for new defects.
+Read/test-only tick — no source modified; only `e2e-output/report.md` +
+`e2e-output/tasks.md` changed.
+
+Verdict: **1 new LOW finding (E2E-007). All five prior findings E2E-002..E2E-006
+re-verified as no-longer-reproducing (fixed).** No fabricated numbers; a
+malformed/empty DB is served honestly.
+
+### 1. Quality gate (deploy/build) — PASS
+
+```
+uv sync --group dev     → Resolved 33 packages, OK
+uv run ruff check .     → All checks passed!
+uv run pytest -q        → 482 passed in 40.25s
+```
+
+Full suite green (P00–P12). No pre-existing or new failures.
+
+### 2. Dashboard build — PASS
+
+```
+cd dashboard
+yarn install → Done in 0s 939ms
+yarn build   → tsc --noEmit && vite build: ✓ built in 1.92s
+  dist/index.html                   0.55 kB │ gzip:  0.34 kB
+  dist/assets/index-CB_MdEba.css    5.48 kB │ gzip:  1.67 kB
+  dist/assets/index-NcpMpYl1.js   162.59 kB │ gzip: 51.82 kB
+```
+
+TypeScript strict-pass (tsc --noEmit) → Vite emit; `dist/` gitignored.
+
+### 3. Dashboard backend smoke test — PASS
+
+```
+uv run python dashboard/backend/smoke_test.py
+→ SMOKE TEST PASSED — ... (E2E-002/003 assertions included)
+```
+
+The smoke test now asserts PUT/DELETE/PATCH 405 JSON (fix for E2E-003) and the
+relay-probe + startup-occupant behaviors (fix for E2E-002), all green.
+
+### 4. Live dashboard backend — PASS, re-verified E2E-002/E2E-003
+
+Started on a seeded temp DB (`/tmp/cachepilot-e2e/run3.db`, 86016 B, sha
+`21ac2d65…e7a82a7`) at `127.0.0.1:8794`. Body-level verification of every
+endpoint (real data, not just HTTP codes):
+
+| Endpoint | HTTP | Body verified |
+|---|---|---|
+| GET /api/health | 200 | `{"ok": true}` |
+| GET /api/status | 200 | stats.total=3, hit_rate=0.5, confirmed=1/miss=1/unverified=1, relay="occupied by another service", plugin="active", providers=[anthropic{1,null}, openai{2,0.00033}] |
+| GET /api/leases | 200 | 1 lease state="armed", cache_age_s≈79, active_targets=["target-1"], warm_cost_usd=1e-05, ttl=300.0 |
+| GET /api/costs | 200 | total_usd=0.00033, openai 0.00033, recent n=2, "recorded-cost-only" note |
+| GET /api/ttl | 200 | 1 profile estimated_ttl_s=288.0, bounds 120/600, confidence 0.85, samples 12, survival sample_count=4, p_survive_at_ttl=1.0 |
+| GET /api/routes | 200 | 1 event verdict="route_instability", stats route_switches=1, instability_verdicts=1 |
+| GET /api/churn | 200 | cause "tool list mutation", top_causes=[{"tool list mutation",1}] |
+| GET /api/miss | 200 | event.likely_cause="tool list mutation", confidence 0.82, prefix loss 1234, stable=[system,history,route,model], changed=[tools,cache key] |
+| GET /api/miss?session=hash-session-1 | 200 | session-scoped event returned |
+| GET /api/topology | 200 | sessions=2, total_pairs=1, churn_pairs=1, prefix_stability_pct=0.0, tool schemas 0.0% ~1234 tokens |
+| POST/PUT/DELETE/PATCH /api/leases | 405 | JSON `{"error":"the dashboard backend is read-only (GET only)"}` for ALL four (E2E-003 fixed) |
+| GET /api/not-an-endpoint | 404 | JSON `{"error":"unknown endpoint: /api/not-an-endpoint"}` |
+| GET / (dist/) | 200 | index.html → /assets/index-NcpMpYl1.js (text/javascript, 162662 B) + /assets/index-CB_MdEba.css (text/css, 5478 B) |
+| GET /leases (SPA fallback) | 200 | index.html |
+| GET path-traversal attempts | 200 | all neutralized → SPA index.html, no file disclosure (passwd not leaked) |
+
+Empty-store server (nonexistent DB, 8797): `status` → total=0, hit_rate=null,
+providers=[], plugin="active (no telemetry recorded yet)"; leases `{"leases":[]}`,
+costs total=0.0, ttl `{"profiles":[]}`, routes empty events + zero stats, churn
+empty, miss `{"event":null,...}`, topology zeros — never fabricated numbers.
+Seeded DB sha unchanged (`21ac2d65…e7a82a7` before == after all reads+writes).
+
+### 5. Live CLI — PASS, re-verified E2E-004/E2E-005
+
+Seeded temp DB; `cachepilot <cmd> --db /tmp/cachepilot-e2e/run3.db`:
+
+| Command | Verified output |
+|---|---|
+| status | CachePilot 0.1.0, Relay: unreachable (closed 8798), plugin: active, requests 3, hit rate 50.0% (1/2), CONFIRMED_HIT 1, MISS_REBUILT 1, SUCCESS_UNVERIFIED 1, churn events 1, **route-change churn events 0 + explanatory footnote** (E2E-005 fixed) |
+| leases | `lease-00 1 113s 300s ARMED` |
+| costs | total recorded $0.000330, openai $0.000330, recorded-cost-only note |
+| ttl | openai\|gpt-4o-mini\|chat, estimated 288s, bounds 120/600, conf 0.85, samples 12, survival P=1.00 (n=4), median 300s |
+| routes | verdict=route_instability, route-1…→route-2…, switches 1, instability verdicts 1 (E2E-005 disambiguated) |
+| churn | tools/cache key changed 1/1, top cause "tool list mutation" ×1 |
+| explain-miss | session, aaaa…→bbbb…, Stable 4 / Changed 2, cause + conf 0.82 + ~1234 tokens + offset 4096 tool schemas |
+| topology | sessions 2, pairs 1, churn 1 (stability 0.0%), tool schemas 0.0% ~1,234 tokens |
+
+E2E-004 re-verified: `status --db /tmp/cachepilot-e2e/missing-cli.db` → prints
+`no telemetry database at ... — nothing recorded yet (CLI reads are read-only;
+the relay creates the DB on first write)`, exit 0, **no file created** (checked
+across all 8 subcommands on an `m2.db` path — no stray DB materialized). `--db`
+beats `CACHEPILOT_TELEMETRY_DB` (status shows requests 3); `CACHEPILOT_ENABLED=false`
+→ "inactive (CACHEPILOT_ENABLED=false)". E2E-005 disambiguation present in the
+status output.
+
+### 6. Live relay pass-through — PASS, re-verified E2E-002
+
+`cachepilotd --listen 127.0.0.1:8796 --upstream http://127.0.0.1:8795` (mock
+upstream with request logging); fresh relay on 8798 for control-path checks.
+
+| Check | Result |
+|---|---|
+| GET /health direct vs via | body `{"ok": true, "upstream": "mock"}` byte-identical, 200 |
+| POST /v1/chat/completions | 32 B body echoed byte-identical direct vs via |
+| Hop-by-hop stripping | `Connection: X-Strip-Me` + `X-Strip-Me` NOT present upstream (null) |
+| Correlation headers | `X-CachePilot-Session`/`X-CachePilot-Request` NOT present upstream (null) |
+| Host rewrite | upstream saw `Host: 127.0.0.1:8795` (its own address), not 8796 |
+| Error pass-through | GET /error → 400 + JSON body unchanged |
+| SSE streaming | `data: one/two/[DONE]` — 36 bytes direct == 36 bytes via relay, `cmp` IDENTICAL |
+| Control endpoint | GET /cachepilot/health → `{"service":"cachepilot-relay","status":"ok"}` (intercepted); POST /cachepilot/health + GET /cachepilot/health/x pass through verbatim (narrow PRD §27 interception preserved) |
+| Wildcard bind | `--listen 0.0.0.0:8799` refused, documented pydantic error, exit 2 |
+| Observation fail-open | 13 live requests recorded to default telemetry DB; pass-through never broke |
+
+E2E-002 re-verified (HTTP-confirmed probe, not TCP-rely): probe at `127.0.0.1:8787`
+(Hermes companion squatting) → authenticated `occupied by another service`, NOT
+"healthy"; at real relay → `healthy`; at closed port → `unreachable`. Wildcard
+bind still refused (exit 2). Startup occupant detection: `server.py`/`cachepilotd`
+fail with an actionable error naming the port + override (smoke test asserts exit 2).
+
+### 7. Frontend (headless) — PASS
+
+Served `dist/` same-origin via the backend: index.html (200, text/html), JS
+bundle (200, text/javascript, 162662 B), CSS bundle (200, text/css, 5478 B),
+SPA fallback for non-API paths, path-traversal attempts neutralized (all 200 →
+index.html, no file disclosure). Browser-only concerns (console errors, layout,
+5s polling) are out of scope for this CLI/API variant per the board's fallback.
+Note: `127.0.0.1:8788` is still owned by the Hermes MCP server on this host, so
+`yarn dev`'s `/api` proxy still points at a foreign 401 service unless
+`vite.config.ts` is edited — this is the residual side-effect of the (still
+present) 8787/8788 occupancy; relay readout now correctly reports "occupied"
+rather than a false "healthy".
+
+### 8. Findings → tasks
+
+5 rows in `e2e-output/tasks.md` updated as **no longer reproduces (fixed)**:
+E2E-002, E2E-003, E2E-004, E2E-005, E2E-006. One NEW finding appended:
+**E2E-007 (LOW) — dashboard write-refusal JSON 405 does not extend to HEAD /
+OPTIONS / TRACE (fall to 501 + text/html), an incomplete continuation of the
+E2E-003 fix.**
+
+### 9. Acceptance criteria
+
+1. gates ran green — YES (ruff pass; 482 pytest; yarn build; smoke test PASS).
+2. e2e-output/report.md has the Run 3 section with real captured evidence — YES.
+3. e2e-output/tasks.md reflects new findings — YES (E2E-007; E2E-002..006 marked fixed).
+4. No source, CLI, relay, or backend code modified — YES (only report/tasks).
