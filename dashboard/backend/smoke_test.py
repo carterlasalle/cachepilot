@@ -32,13 +32,14 @@ import io
 import json
 import os
 import socket
+import sqlite3
 import sys
 import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -58,6 +59,8 @@ from cachepilot_relay.server import create_app
 repo_root = Path(__file__).resolve().parents[2]
 if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
+
+from cachepilot_cli.main import main as cli_main
 
 from dashboard.backend.server import DashboardServer, Handler
 from dashboard.backend.server import main as server_main
@@ -548,6 +551,87 @@ def main() -> int:
             finally:
                 empty_server.shutdown()
                 empty_server.server_close()
+
+            print("== corrupt DB -> honest empty store (E2E-008) ==")
+            # A present-but-corrupt / non-SQLite store file must behave EXACTLY
+            # like a missing DB: no CLI traceback (exit 0, honest empty output,
+            # stderr notice naming the path) and no dashboard HTTP 500.
+            corrupt_path = tmp_path / "corrupt.db"
+            corrupt_path.write_bytes(b"\x00\x01\xff not-sqlite-garbage " * 64)
+            # (optional) PRAGMA quick_check on a real corrupt header raises
+            # "file is not a database" — the probe the openers rely on.
+            probe = sqlite3.connect(f"file:{corrupt_path}?mode=ro", uri=True)
+            try:
+                probe.execute("PRAGMA quick_check")
+                check(
+                    "corrupt probe quick_check raises",
+                    False,
+                    "quick_check unexpectedly succeeded on garbage bytes",
+                )
+            except sqlite3.DatabaseError as exc:
+                check(
+                    "corrupt probe quick_check raises file-is-not-a-database",
+                    "file is not a database" in str(exc),
+                    str(exc),
+                )
+            finally:
+                probe.close()
+            # CLI read commands exit 0 with honest empty output, no traceback,
+            # and a stderr notice naming the path (every read command shares
+            # open_read_only_store, so one command proves the shared opener).
+            for cli_sub in ("status", "leases", "costs", "churn", "topology"):
+                out_buf, err_buf = io.StringIO(), io.StringIO()
+                with redirect_stdout(out_buf), redirect_stderr(err_buf):
+                    cli_code = cli_main([cli_sub, "--db", str(corrupt_path)])
+                cli_err = err_buf.getvalue()
+                check(
+                    f"corrupt CLI {cli_sub} exits 0",
+                    cli_code == 0,
+                    f"exit {cli_code}",
+                )
+                check(
+                    f"corrupt CLI {cli_sub} stderr names path + corrupt",
+                    str(corrupt_path) in cli_err and "not SQLite" in cli_err,
+                    cli_err.strip(),
+                )
+                check(
+                    f"corrupt CLI {cli_sub} no traceback",
+                    "Traceback" not in cli_err and "sqlite3." not in cli_err,
+                    cli_err.strip(),
+                )
+            # Dashboard /api/* endpoints return HTTP 200 empty-state JSON.
+            corrupt_server = DashboardServer(
+                ("127.0.0.1", 0), Handler, db_path=str(corrupt_path)
+            )
+            corrupt_port = int(corrupt_server.server_address[1])
+            corrupt_thread = threading.Thread(
+                target=corrupt_server.serve_forever, daemon=True
+            )
+            corrupt_thread.start()
+            try:
+                status, payload = fetch(corrupt_port, "/api/leases")
+                check(
+                    "corrupt leases 200 []",
+                    status == 200 and payload == {"leases": []},
+                    f"{status} {payload}",
+                )
+                status, payload = fetch(corrupt_port, "/api/status")
+                check(
+                    "corrupt stats 200 zero",
+                    status == 200
+                    and payload["stats"]["total"] == 0
+                    and payload["providers"] == [],
+                    f"{status} {payload}",
+                )
+                status, payload = fetch(corrupt_port, "/api/costs")
+                check(
+                    "corrupt costs 200 zero",
+                    status == 200 and payload["total_usd"] == 0.0,
+                    f"{status} {payload}",
+                )
+            finally:
+                corrupt_server.shutdown()
+                corrupt_server.server_close()
 
             print("== write refusal ==")
             refused_error = {"error": "the dashboard backend is read-only (GET only)"}

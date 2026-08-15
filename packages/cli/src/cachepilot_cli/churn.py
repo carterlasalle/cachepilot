@@ -16,8 +16,10 @@
 from __future__ import annotations
 
 import argparse
+import sqlite3
 import sys
 from collections import Counter
+from pathlib import Path
 
 from cachepilot_core.churn import changed_frequency
 from cachepilot_core.storage import TelemetryStore, resolve_db_path
@@ -34,8 +36,28 @@ _LAYERS = (
 )
 
 
+def _is_readable_sqlite(path: Path) -> bool:
+    """Return True if ``path`` is a valid, readable SQLite database.
+
+    Opens a scratch read-only connection and runs ``PRAGMA quick_check``.
+    A present-but-corrupt or non-SQLite file raises ``sqlite3.DatabaseError``
+    (``file is not a database``); any ``sqlite3.Error`` means the path is
+    NOT safe to hand to the store, and the caller treats it as absent.
+    """
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        conn.execute("PRAGMA quick_check")
+        return True
+    except sqlite3.Error:
+        return False
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 def open_read_only_store(db_path: str | None) -> TelemetryStore | None:
-    """Open the telemetry store read-only; None for a missing database (E2E-004).
+    """Open the telemetry store read-only; None for a missing DB (E2E-004).
 
     CLI read commands must never create the database: a typo'd ``--db`` or
     stale ``CACHEPILOT_TELEMETRY_DB`` used to silently materialize a stray
@@ -43,11 +65,26 @@ def open_read_only_store(db_path: str | None) -> TelemetryStore | None:
     notice naming it (reads are read-only; the relay creates the DB on its
     first write) and return None — the caller renders its honest empty
     output and exits 0.
+
+    The same holds for a present-but-corrupt or non-SQLite ``--db`` file
+    (E2E-008): it is an honest empty store, NOT a crash. The up-front
+    :func:`_is_readable_sqlite` probe treats such a file exactly like a
+    missing one — print the same notice naming the path and return None —
+    so the caller renders honest empty output and exits 0 with no
+    traceback.
     """
     path = resolve_db_path(db_path)
     if not path.is_file():
         print(
             f"no telemetry database at {path} — nothing recorded yet "
+            "(CLI reads are read-only; the relay creates the DB on first write)",
+            file=sys.stderr,
+        )
+        return None
+    if not _is_readable_sqlite(path):
+        print(
+            f"telemetry database at {path} is corrupt or not SQLite — "
+            "treating it as an empty store "
             "(CLI reads are read-only; the relay creates the DB on first write)",
             file=sys.stderr,
         )

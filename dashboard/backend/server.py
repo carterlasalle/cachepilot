@@ -134,6 +134,26 @@ class ReadOnlyTelemetryStore(TelemetryStore):
         self._conn: sqlite3.Connection | None = conn
 
 
+def _is_readable_sqlite(path: Path) -> bool:
+    """Return True if ``path`` is a valid, readable SQLite database.
+
+    Opens a scratch read-only connection and runs ``PRAGMA quick_check``.
+    A present-but-corrupt or non-SQLite file raises ``sqlite3.DatabaseError``
+    (``file is not a database``); any ``sqlite3.Error`` means the path is
+    NOT safe to hand to the store, and the caller treats it as absent.
+    """
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        conn.execute("PRAGMA quick_check")
+        return True
+    except sqlite3.Error:
+        return False
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 def open_store(db_path: str | None = None) -> TelemetryStore | None:
     """Open the telemetry store read-only, or return None for an EMPTY store.
 
@@ -141,9 +161,18 @@ def open_store(db_path: str | None = None) -> TelemetryStore | None:
     empty state (zeros / empty lists). This is the never-fabricate path: a
     missing file, a corrupt file, or an unreadable database is an honest
     empty store, not an error page full of invented numbers.
+
+    E2E-008: ``ReadOnlyTelemetryStore`` connects LAZILY (on the first
+    query), so a DatabaseError from a present-but-corrupt / non-SQLite
+    ``--db`` would otherwise escape during request handling and produce an
+    HTTP 500. The up-front :func:`_is_readable_sqlite` probe treats such a
+    file exactly like a missing one (return None), so every endpoint
+    renders its honest empty state with HTTP 200 — never a 500.
     """
     path = resolve_db_path(db_path)
-    if not path.is_file():
+    if not path.is_file() or not _is_readable_sqlite(path):
+        # Missing OR present-but-corrupt / non-SQLite (E2E-008): both are
+        # an honest empty store.
         return None
     try:
         return ReadOnlyTelemetryStore(path)
