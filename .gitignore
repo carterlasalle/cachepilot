@@ -31,3 +31,4 @@ dashboard/.yarn/
 # GitReins local task state (never commit)
 .gitreins/tasks.yaml
 .gitreins/history/
+.gitreins/usage.jsonl
