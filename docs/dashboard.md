@@ -93,7 +93,7 @@ Production mode (no dev server): `yarn build`, then the backend serves
 | `GET /api/miss?session=` | Latest (or session-scoped) miss explanation: stable/changed layers, cause, confidence, prefix loss |
 | `GET /api/topology` | Cross-request prefix topology + tool-ordering stability |
 | `GET /api/health` | `{"ok": true}` connectivity probe |
-| any other `GET` | 404; `POST`/writes are refused with 405 (the backend is read-only) |
+| any other `GET` | 404; every non-`GET` method (`POST`/`PUT`/`DELETE`/`PATCH`/`OPTIONS`/`TRACE`/`HEAD`) is refused with the same machine-readable JSON 405 (the backend is read-only) |
 
 The route counters are deliberately different measurements (PRD §25 vs §72):
 `GET /api/status` `route_changes` counts churn events with `route_changed=1`
@@ -129,7 +129,9 @@ uv run python dashboard/backend/smoke_test.py
 
 It seeds a temp DB via `TelemetryStore`, serves every endpoint, asserts the
 populated + empty-store responses, proves the DB file is byte-identical
-after the whole read session, and confirms writes are refused (405).
+after the whole read session, and confirms every non-`GET` method
+(`POST`/`PUT`/`DELETE`/`PATCH`/`OPTIONS`/`TRACE`/`HEAD`) is refused with
+the machine-readable JSON 405 (read-only).
 
 Frontend gate:
 

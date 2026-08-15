@@ -551,9 +551,16 @@ def main() -> int:
 
             print("== write refusal ==")
             refused_error = {"error": "the dashboard backend is read-only (GET only)"}
-            for method in ("POST", "PUT", "DELETE", "PATCH"):
+            # E2E-007: every non-GET method (POST/PUT/DELETE/PATCH/OPTIONS/
+            # TRACE/HEAD) is refused with the same machine-readable read-only
+            # JSON 405. HEAD is a GET without a response body, so it carries
+            # no request data and its response omits the body (asserted empty
+            # below) while still carrying the 405 status + JSON content-type.
+            for method in ("POST", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE", "HEAD"):
                 req = urllib.request.Request(
-                    f"http://127.0.0.1:{port}/api/leases", method=method, data=b"{}"
+                    f"http://127.0.0.1:{port}/api/leases",
+                    method=method,
+                    data=b"" if method == "HEAD" else b"{}",
                 )
                 try:
                     urllib.request.urlopen(req, timeout=10)
@@ -567,15 +574,18 @@ def main() -> int:
                         content_type.startswith("application/json"),
                         content_type or "(no Content-Type header)",
                     )
-                    try:
-                        parsed_body = json.loads(body)
-                    except json.JSONDecodeError:
-                        parsed_body = None
-                    check(
-                        f"{method} refused documented error body",
-                        parsed_body == refused_error,
-                        body,
-                    )
+                    if method == "HEAD":
+                        check("HEAD omits response body", body == "", repr(body))
+                    else:
+                        try:
+                            parsed_body = json.loads(body)
+                        except json.JSONDecodeError:
+                            parsed_body = None
+                        check(
+                            f"{method} refused documented error body",
+                            parsed_body == refused_error,
+                            body,
+                        )
 
             print("== relay health probe (E2E-002) ==")
             # closed port -> unreachable (deterministic: loopback port 1)

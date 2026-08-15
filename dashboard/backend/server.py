@@ -472,6 +472,20 @@ class Handler(BaseHTTPRequestHandler):
     def do_PATCH(self) -> None:  # http.server API (capitalized by contract)
         self._write_refused()
 
+    def do_OPTIONS(self) -> None:  # http.server API (capitalized by contract)
+        self._write_refused()
+
+    def do_TRACE(self) -> None:  # http.server API (capitalized by contract)
+        self._write_refused()
+
+    def do_HEAD(self) -> None:  # http.server API (capitalized by contract)
+        # HEAD is GET without a response body. Like every other non-GET
+        # method it is refused with the read-only 405 JSON, but per HTTP
+        # HEAD semantics it sends only status + headers — no body — even
+        # though the refusal body (and its Content-Length) is the same one
+        # the GET-equivalent would carry (E2E-007).
+        self._write_refused(body=False)
+
     # -- helpers -----------------------------------------------------------
 
     def _api(self, build: Any) -> None:
@@ -492,23 +506,32 @@ class Handler(BaseHTTPRequestHandler):
                 store.close()
         self._send_json(200, payload)
 
-    def _send_json(self, status: int, payload: Any) -> None:
-        body = json.dumps(payload, default=_json_default).encode("utf-8")
+    def _send_json(self, status: int, payload: Any, *, body: bool = True) -> None:
+        data = json.dumps(payload, default=_json_default).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(body)
+        # HEAD (E2E-007) must not return a response body; send only the
+        # status/headers, but keep the Content-Length the body would carry.
+        if body:
+            self.wfile.write(data)
 
-    def _write_refused(self) -> None:
-        """Refuse a write with the documented read-only 405 JSON (E2E-003).
+    def _write_refused(self, *, body: bool = True) -> None:
+        """Refuse a non-GET method with the documented read-only 405 JSON.
 
-        POST / PUT / DELETE / PATCH all land here — the backend is read-only
-        (docs/dashboard.md), so every write method answers the same JSON 405
-        instead of the stdlib fallback 501 HTML page for unimplemented ones.
+        POST / PUT / DELETE / PATCH / OPTIONS / TRACE / HEAD all land here —
+        the backend is read-only (docs/dashboard.md), so every non-GET method
+        answers the same machine-readable JSON 405 instead of the stdlib
+        fallback 501 HTML page for unimplemented ones (E2E-003). ``do_HEAD``
+        passes ``body=False`` so it omits the response body as HEAD requires.
         """
-        self._send_json(405, {"error": "the dashboard backend is read-only (GET only)"})
+        self._send_json(
+            405,
+            {"error": "the dashboard backend is read-only (GET only)"},
+            body=body,
+        )
 
     def _serve_static(self, path: str) -> None:
         root = self.server.dist_dir
