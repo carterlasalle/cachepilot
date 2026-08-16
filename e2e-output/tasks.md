@@ -618,3 +618,69 @@ clean, zero listeners leaked**.
 
 **None.** Zero-findings tick; all prior E2E-002..E2E-011 re-verified FIXED
 with live command evidence. No E2E-012 task added to the board.
+
+### RUN 14 (2026-08-16) — zero new finding; all prior E2E-002..E2E-011 FIXED
+
+**Worker:** DS-V4-Flash (CLI/API, test-only tick — no src/ packages/
+dashboard/backend/ logic modified). **Repo:** cachepilot @ main, clean.
+
+**Fresh deploy (quality gate) — all green:** uv sync --group dev → 33 pkgs /
+32 checked OK; **488 pytest (-x -q) 74.08s**; ruff check src/ packages/
+dashboard/backend/ → All checks passed!; mypy (uvx --native-parser
+--python-version 3.12 --follow-imports=skip src packages) → Success, 74 files;
+dashboard yarn build → 43 modules (2.10s); dashboard/backend smoke_test.py →
+SMOKE TEST PASSED (144 PASS, exit 0).
+
+**Live user journey (fresh current-build services, E2E-011 hygiene used
+throughout):** relay 9082→9081 mock upstream — control `GET /cachepilot/health`
+→ 200 `{"service":"cachepilot-relay","status":"ok"}` (CL 44); relay GET
+`/upstream/resource` **byte-identical** pass-through body
+`{"ok": true, "upstream": "mock"}` + `x-upstream-marker: mock`; relay POST
+`/upstream/posts` body `{"payload":"echo-me-14"}` **byte-identical** echo +
+marker; upstream 503 forwarded **byte-identical** through relay 9097→9092.
+Dashboard backend 9083 on seeded telemetry DB — all 9 `/api/*` GET
+(health/status/leases/costs/ttl/churn/routes/topology/miss) → real seeded
+JSON. All 8 CLI read commands (status/leases/costs/ttl/churn/explain-miss/
+routes/topology) consistent; seeded DB sha `33ba841e` byte-stable before/after
+(read-only proven).
+
+**Re-verification of all prior findings (live evidence):** E2E-002 relay
+readouts `Relay: healthy`(9082)/`unreachable`(9998 closed)/`unreachable`(9091
+foreign); startup occupant detection → **both `cachepilotd` (9089) and
+`dashboard/backend/server.py` (9084) exit 2** with actionable error naming
+port + override. E2E-003/007 uniform **405 application/json; charset=utf-8**
+for POST/PUT/DELETE/PATCH/OPTIONS/TRACE on /api/status (read-only refusal).
+E2E-010 HEAD mirrors GET → 200, 0 body, CL mirrors (incl. real asset
+`/assets/index-*.js` CL=547). E2E-004 missing `--db` path → exit 0
+honest-empty, **no file / no parent dir created**. E2E-005 status `churn
+events 1`+`route-change churn events 0` footnote vs routes `route switches 1`
+(disambiguated). E2E-006 `styles.css:414 @media (max-width: 768px)` + in built
+CSS bundle. E2E-008/009 corrupt (random bytes) + wrong-schema (unrelated
+table) → all 8 CLI read commands exit 0, no traceback, no "no such table";
+dashboard `/api/*` on 9086/9087 → 200 `{"leases":[]}` empty JSON. E2E-011
+`hygiene.py self-test` exit 0 + guard/trap teardown + post-run **908x clean,
+zero leaker**.
+
+**Edge-probe batch (new-defect hunt) — all clean:** hostile params
+`/api/leases?limit=-5|abc|999999&offset=-1` → 200 no crash; hostile
+`/api/miss?session=../../etc/passwd|%00|a%20b|999999|null` → 200 honest
+`{"event":null}` JSON; 404s correct (`/api/not-an-endpoint`,
+`/api/leases/`, `/api//leases`); static traversal `/../../etc/passwd`,
+`/%2e%2e/etc/passwd`, `/..%2f..%2fetc/passwd` → 200 SPA `index.html` (547B,
+no path disclosure); HTTP/1.0 `/api/health` → 200 + CL + content-type; relay
+control-path encodings (query-string / trailing-slash / double-slash / case) →
+no interception leak; `--db` empty-file / directory / `/dev/null` → honest-empty
+exit 0, no traceback.
+
+**Teardown / hygiene:** pre-run guard + trap teardown used live on every
+spawned service; `hygiene.py self-test` exit 0; post-run scan → **908x clean,
+zero listeners leaked**.
+
+### New finding — RUN 14
+
+**None.** Zero-findings tick; all prior E2E-002..E2E-011 re-verified FIXED
+with live command evidence; edge-probe batch clean. No E2E-012 filed. Only a
+test-artifact observation recorded (not a defect): `hygiene.py self-test`'s
+`--clean` step auto-kills all 908x occupants including a live tick's own
+services, so verifications depending on live 908x services must run BEFORE
+the self-test step (see run14/README.md).
