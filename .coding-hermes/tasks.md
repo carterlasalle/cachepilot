@@ -49,6 +49,27 @@ every commit to a `gitreins task complete`.
 
 ## Tick Log
 
+- **2026-08-16 (idle tick, THIS TICK — f3752d2..HEAD)**: Board = only
+  perpetual fixtures (E2E-001 Run 13 was done in the work tick f70efd2, 5
+  idle-chore commits ago — at the low bound of the 5-10 window, not yet due;
+  NEVER-DONE audit). No real pending work → idle. Git-history cross-ref +
+  GitReins dual-source check: **gitreins task store 0 pending (No tasks
+  found)**, no committed work behind pending board tasks, **upstream synced
+  (git fetch: unpushed=0, behind=0, origin/main==HEAD f3752d2)**, git clean
+  tree (no untracked/staged). Lightweight verification (board heavily audited,
+  zero gaps, across the many prior idle+work ticks this cycle): **488 pytest
+  pass in 56.51s**, **ruff check src/ packages/ dashboard/backend/
+  e2e-output/hygiene.py → All checks passed!**. Leak check: **no 908x
+  listener** (ss -tlnp clean; only schedulerd on 9090 — the scheduler daemon,
+  out of the E2E test-reserved range — E2E-011 hygiene premise holds). CHK8
+  CI: **3/3 recent runs success** (gh run list fresh,
+  carterlasalle/cachepilot — latest idle-tick chore runs f3752d2/c4c8f92/
+  878ccb3 green, no failures to file). GitReins judge configured (defaults at
+  root: model deepseek/deepseek-v4-flash-0731, api_key_env GITREINS_LLM_API_KEY).
+  Zero new tasks found. Scheduler cooldown had reverted 43200→900 by daemon
+  ApplyFleetConfig (field lowercase `cooldown_s`) — re-applied **43200s
+  (idle)** via API PUT, verified GET (cooldown_s=43200, enabled=True).
+
 - **2026-08-16 (idle tick, THIS TICK — c4c8f92..HEAD)**: Board = only
   perpetual fixtures (E2E-001 Run 13 was done in the work tick f70efd2, 4
   idle-chore commits ago — not due, window 5-10; NEVER-DONE audit). No real
