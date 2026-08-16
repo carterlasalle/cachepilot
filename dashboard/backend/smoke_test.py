@@ -258,6 +258,39 @@ def fetch(port: int, path: str) -> tuple[int, Any]:
             return exc.code, body
 
 
+def head_fetch(port: int, path: str) -> tuple[int, bytes, Any]:
+    """Issue a HEAD request; return (status, body_bytes, headers)."""
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method="HEAD")
+    try:
+        resp = urllib.request.urlopen(req, timeout=10)
+        return resp.status, resp.read(), resp.headers
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read(), exc.headers
+
+
+def assert_head_mirrors_get(port: int, path: str, label: str) -> None:
+    """RFC 9110 §9.3.2 (E2E-010): HEAD equals GET (status + headers, incl.
+    Content-Length) with ZERO response-body bytes. ``path`` must be a GET-200
+    resource (the refusal-across-the-board HEAD-405 regression it guards is a
+    GET-friendly path returning 405)."""
+    get_req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method="GET")
+    with urllib.request.urlopen(get_req, timeout=10) as resp:
+        get_status, get_body, get_headers = resp.status, resp.read(), resp.headers
+    head_status, head_body, head_headers = head_fetch(port, path)
+    check(f"HEAD {label} status mirrors GET", head_status == get_status, f"HEAD {head_status} vs GET {get_status}")
+    check(f"HEAD {label} empty body", head_body == b"", repr(head_body))
+    check(
+        f"HEAD {label} content-length == GET body length",
+        head_headers.get("Content-Length") == str(len(get_body)),
+        f"HEAD CL={head_headers.get('Content-Length')} vs GET {len(get_body)} bytes",
+    )
+    check(
+        f"HEAD {label} content-type == GET",
+        head_headers.get("Content-Type") == get_headers.get("Content-Type"),
+        str(head_headers.get("Content-Type")),
+    )
+
+
 class _ForeignHttpHandler(BaseHTTPRequestHandler):
     """Minimal non-relay HTTP server (stands in for hermes-webui on 8787)."""
 
@@ -728,16 +761,16 @@ def main() -> int:
 
             print("== write refusal ==")
             refused_error = {"error": "the dashboard backend is read-only (GET only)"}
-            # E2E-007: every non-GET method (POST/PUT/DELETE/PATCH/OPTIONS/
-            # TRACE/HEAD) is refused with the same machine-readable read-only
-            # JSON 405. HEAD is a GET without a response body, so it carries
-            # no request data and its response omits the body (asserted empty
-            # below) while still carrying the 405 status + JSON content-type.
-            for method in ("POST", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE", "HEAD"):
+            # E2E-007: every non-GET method that WOULD write (POST/PUT/
+            # DELETE/PATCH/OPTIONS/TRACE) is refused with the same
+            # machine-readable read-only JSON 405. HEAD is NOT a write
+            # request — per RFC 9110 §9.3.2 it mirrors GET (same status +
+            # headers, zero body), so it is exercised separately below.
+            for method in ("POST", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE"):
                 req = urllib.request.Request(
                     f"http://127.0.0.1:{port}/api/leases",
                     method=method,
-                    data=b"" if method == "HEAD" else b"{}",
+                    data=b"{}",
                 )
                 try:
                     urllib.request.urlopen(req, timeout=10)
@@ -751,18 +784,46 @@ def main() -> int:
                         content_type.startswith("application/json"),
                         content_type or "(no Content-Type header)",
                     )
-                    if method == "HEAD":
-                        check("HEAD omits response body", body == "", repr(body))
-                    else:
-                        try:
-                            parsed_body = json.loads(body)
-                        except json.JSONDecodeError:
-                            parsed_body = None
-                        check(
-                            f"{method} refused documented error body",
-                            parsed_body == refused_error,
-                            body,
-                        )
+                    try:
+                        parsed_body = json.loads(body)
+                    except json.JSONDecodeError:
+                        parsed_body = None
+                    check(
+                        f"{method} refused documented error body",
+                        parsed_body == refused_error,
+                        body,
+                    )
+
+            print("== HEAD mirrors GET (RFC 9110 §9.3.2, E2E-010) ==")
+            # HEAD must answer identically to GET (same status + headers,
+            # incl. Content-Length) but with ZERO body bytes. E2E-010 fixes
+            # the regression where HEAD routed through the write-refusal and
+            # answered every GET-200 resource with a 405.
+            # API resource(s): /api/health and /api/leases are GET-200 and
+            # so must be HEAD-200 (no body, same headers as GET).
+            assert_head_mirrors_get(port, "/api/health", "/api/health")
+            assert_head_mirrors_get(port, "/api/leases", "/api/leases")
+            # Static / SPA resources: serve a real (tiny) production build so
+            # _serve_static's HEAD mirrors GET for /, an asset, and the SPA
+            # fallback path.
+            dist_dir = tmp_path / "dist"
+            assets_dir = dist_dir / "assets"
+            assets_dir.mkdir(parents=True)
+            (dist_dir / "index.html").write_text("<html>dashboard</html>", encoding="utf-8")
+            (assets_dir / "app.js").write_text("console.log('cachepilot');", encoding="utf-8")
+            static_server = DashboardServer(
+                ("127.0.0.1", 0), Handler, db_path=str(db_path), dist_dir=dist_dir
+            )
+            static_port = int(static_server.server_address[1])
+            static_thread = threading.Thread(target=static_server.serve_forever, daemon=True)
+            static_thread.start()
+            try:
+                assert_head_mirrors_get(static_port, "/", "/ (index.html)")
+                assert_head_mirrors_get(static_port, "/assets/app.js", "/assets/app.js")
+                assert_head_mirrors_get(static_port, "/leases", "/leases (SPA fallback)")
+            finally:
+                static_server.shutdown()
+                static_server.server_close()
 
             print("== relay health probe (E2E-002) ==")
             # closed port -> unreachable (deterministic: loopback port 1)

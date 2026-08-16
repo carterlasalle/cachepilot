@@ -530,12 +530,21 @@ class Handler(BaseHTTPRequestHandler):
         self._write_refused()
 
     def do_HEAD(self) -> None:  # http.server API (capitalized by contract)
-        # HEAD is GET without a response body. Like every other non-GET
-        # method it is refused with the read-only 405 JSON, but per HTTP
-        # HEAD semantics it sends only status + headers — no body — even
-        # though the refusal body (and its Content-Length) is the same one
-        # the GET-equivalent would carry (E2E-007).
-        self._write_refused(body=False)
+        # RFC 9110 §9.3.2: HEAD MUST be answered identically to GET — the
+        # same status line and headers (Content-Length included) but with
+        # ZERO response-body bytes. HEAD is NOT a write request. Previously
+        # it fell through to _write_refused and answered every GET-200
+        # resource (/, /leases, /assets/*.js, /api/*) with a 405 — an
+        # over-broadening introduced by the E2E-003/007 write-refusal fix.
+        # Re-dispatch along the SAME GET routing path so every GET-200
+        # resource is HEAD-200 (headers only, body suppressed) and HEAD is
+        # only a non-200 where GET itself would be (none on this read-only
+        # surface). _send_json / _serve_static honor the suppression flag.
+        self._head_only = True
+        try:
+            self.do_GET()
+        finally:
+            self._head_only = False
 
     # -- helpers -----------------------------------------------------------
 
@@ -570,19 +579,23 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        # HEAD (E2E-007) must not return a response body; send only the
-        # status/headers, but keep the Content-Length the body would carry.
-        if body:
+        # HEAD (E2E-007 / RFC 9110 §9.3.2) must not return a response body;
+        # send only the status/headers, but keep the Content-Length the body
+        # would carry. ``do_HEAD`` sets ``_head_only`` while re-dispatching
+        # through GET routing so GET-200 resources are HEAD-200 with no body.
+        if body and not getattr(self, "_head_only", False):
             self.wfile.write(data)
 
     def _write_refused(self, *, body: bool = True) -> None:
-        """Refuse a non-GET method with the documented read-only 405 JSON.
+        """Refuse a write / non-GET method with the documented read-only 405 JSON.
 
-        POST / PUT / DELETE / PATCH / OPTIONS / TRACE / HEAD all land here —
-        the backend is read-only (docs/dashboard.md), so every non-GET method
+        POST / PUT / DELETE / PATCH / OPTIONS / TRACE all land here — the
+        backend is read-only (docs/dashboard.md), so every non-GET method
         answers the same machine-readable JSON 405 instead of the stdlib
-        fallback 501 HTML page for unimplemented ones (E2E-003). ``do_HEAD``
-        passes ``body=False`` so it omits the response body as HEAD requires.
+        fallback 501 HTML page for unimplemented ones (E2E-003). HEAD does
+        NOT land here: per RFC 9110 §9.3.2 it mirrors GET (see ``do_HEAD``).
+        The ``body`` switch only suppresses the body when a caller needs a
+        body-less refusal (no longer used by HEAD).
         """
         self._send_json(
             405,
@@ -616,7 +629,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        # HEAD (RFC 9110 §9.3.2) mirrors GET: same status + headers (incl.
+        # Content-Length), but zero response-body bytes.
+        if not getattr(self, "_head_only", False):
+            self.wfile.write(body)
 
     def log_message(self, fmt: str, *args: Any) -> None:  # quiet access log
         print(f"[dashboard] {self.address_string()} {fmt % args}")
