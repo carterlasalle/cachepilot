@@ -1,6 +1,7 @@
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+
 class H(BaseHTTPRequestHandler):
     def _respond(self):
         body = json.dumps({"ok": True, "upstream": "mock"}).encode()
