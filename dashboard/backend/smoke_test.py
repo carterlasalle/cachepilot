@@ -279,10 +279,18 @@ def assert_head_mirrors_get(port: int, path: str, label: str) -> None:
     head_status, head_body, head_headers = head_fetch(port, path)
     check(f"HEAD {label} status mirrors GET", head_status == get_status, f"HEAD {head_status} vs GET {get_status}")
     check(f"HEAD {label} empty body", head_body == b"", repr(head_body))
+    # RFC 9110 §9.3.2: HEAD reflects the Content-Length the GET would carry.
+    # For API payloads embedding a time-based field (e.g. /api/leases'
+    # cache_age_s = time.time() — server.py) a GET and a HEAD straddling a
+    # second boundary can legitimately differ by a digit, so compare with a
+    # small tolerance band rather than byte-exact equality (E2E-010).
+    head_cl_raw = head_headers.get("Content-Length")
+    head_cl = int(head_cl_raw) if head_cl_raw is not None else None
+    len_tolerance = 0 if "api/" not in path else 2
     check(
-        f"HEAD {label} content-length == GET body length",
-        head_headers.get("Content-Length") == str(len(get_body)),
-        f"HEAD CL={head_headers.get('Content-Length')} vs GET {len(get_body)} bytes",
+        f"HEAD {label} content-length consistent with GET body length",
+        head_cl is not None and abs(head_cl - len(get_body)) <= len_tolerance,
+        f"HEAD CL={head_cl_raw} vs GET {len(get_body)} bytes (tol {len_tolerance})",
     )
     check(
         f"HEAD {label} content-type == GET",
