@@ -76,7 +76,25 @@ every commit to a `gitreins task complete`.
   `e2e-output/tasks.md`, `.coding-hermes/tasks.md` (+ `e2e-output/run7/` notes +
   mock upstream test artifact). **No src/, packages/, or dashboard/backend/
   implementation modified.** Only e2e notes + board committed (worker commits
-  findings; foreman runs the judge).
+  findings; foreman runs the judge). Foreman layer: GitReins lifecycle — create
+  E2E-001-R7 → start → worker pushed commit c5541d1 (verified remote
+  HEAD, unpushed=0) → foreman judge run #1 returned **FAIL 4164a0c6** (Tier-2
+  caught a genuine gap: full `ruff check .` reported I001 import-sort in the new
+  `e2e-output/run7/mock_upstream.py`; worker's own lint had scoped to
+  src/packages/dashboard and missed the artifact). Foreman fixed the 1-line
+  mechanical lint issue directly (commit **377003c**, ruff `All checks
+  passed!`), re-opened the task, and the re-run judge returned **Overall PASS
+  68824bd**, all 4 criteria ✓ with live command evidence (482 pytest, ruff,
+  yarn build 43 modules, smoke_test PASS; E2E-009 reproduced live, no source
+  modified). Task E2E-001-R7 then deleted. Worker also created a new GitReins
+  task `E2E-009` (4 criteria: extend quick_check probe to check expected tables
+  via sqlite_master, wrap CLI reads so any sqlite3.Error → honest-empty exit 0,
+  dashboard /api/* 200 empty JSON no 500, add smoke_test valid-but-wrong-schema
+  case) — left in_progress as the next tick's mirror of board E2E-009. MANDATORY
+  PUSH: c5541d1 + 377003c both pushed, remote HEAD verified (unpushed=0,
+  behind=0). CI: prior 3 runs success, no failures. Board now has a real pending
+  task E2E-009 → **project ACTIVE** → cooldown set 900s (already 900, verified
+  via scheduler GET cooldown_s=900 enabled=true).
 
 - **2026-08-15 (idle tick, b797659..HEAD — this tick)**: Board = only perpetual fixtures (E2E-001 Run 6 was done in E2E-008 work tick 449c76b, ~5 commits ago — window 5-10, not due; NEVER-DONE audit). No real pending work → idle. Git-history cross-ref + GitReins dual-source check: **gitreins task store 0 pending**, no committed work behind pending board tasks, git clean tree, **upstream synced (unpushed=0, behind=0)**. Lightweight verification (board heavily audited, zero gaps, across prior idle+work ticks this cycle): **482 pytest pass in 58.71s**, **ruff check src/ dashboard/backend/ All checks passed**, gitreins judge configured (check-gitreins-judge.py PASS, model deepseek/deepseek-v4-flash-0731). CHK8 CI: **4/4 recent runs success** (gh run list fresh, carterlasalle/cachepilot — latest idle-tick chore runs green, no failures). Zero new tasks found. Scheduler cooldown had reverted 43200→900 by daemon ApplyFleetConfig (field is lowercase `cooldown_s`) — re-applied **43200s (idle)** via API PUT, verified GET (cooldown_s=43200, enabled=true).
 - **2026-08-15 (idle tick, 8fcb096..HEAD)**: Board = only perpetual fixtures (E2E-001 Run 6 was 4 commits/ticks ago in E2E-008 work tick 449c76b — window 5-10, not due; NEVER-DONE audit). No real pending work → idle. Git-history cross-ref + GitReins dual-source check: **gitreins task store 0 pending**, no committed work behind pending board tasks, **upstream synced (unpushed=0, behind=0)**, git clean tree. Lightweight verification (board heavily audited, zero gaps, across prior idle+work ticks this cycle): **482 pytest pass in 49.6s**, **ruff check src/ dashboard/backend/ All checks passed**, gitreins judge configured (check-gitreins-judge.py PASS in prior ticks, model deepseek/deepseek-v4-flash-0731), DuckBrain namespace `cachepilot` healthy (3 keys: overview/pitfalls/e2e-history, list_keys verified in prior tick). CHK8 CI: **3/3 recent runs success** (gh run list fresh, carterlasalle/cachepilot — latest idle-tick chore runs 5fe6558/d83a1b4/8fcb096 green, no failures). Zero new tasks found. Scheduler cooldown had reverted 43200→900 by daemon ApplyFleetConfig (field is lowercase `cooldown_s`) — re-applied **43200s (idle)** via API PUT, verified GET (cooldown_s=43200, enabled=true).
