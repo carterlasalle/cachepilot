@@ -13,7 +13,8 @@ every commit to a `gitreins task complete`.
 
 | ID | Task | Pri | Cpx | Deps | Tags | Model | Reasoning | Fallback |
 |----|------|-----|-----|------|------|-------|-----------|----------|
-| E2E-001 | E2E Testing Tick (self-improving loop) — spawn Luna (browser/screenshots) or Step 3.7 Flash (CLI/API). Deploy/build, Playwright, screenshots, endpoints, console. → e2e-output/tasks.md → inject into board. Every 5-10 ticks. Run 1 (2026-08-13, e838b28): 463 pytest pass, smoke 52/52, yarn build ✓, relay pass-through ✓, 4 findings → E2E-002..005. Run 2 (2026-08-13, 3300078, browser/Luna variant): console clean, visual at 1280/768/320px, live polling ✓, read-only contract ✓, 1 finding → E2E-006 (fixed 1095a97, judge PASS e210e179). Run 3 (2026-08-15, 064c098, CLI/API): 482 pytest, smoke ✓, all gates green; E2E-002..006 re-verified FIXED; 1 new finding → E2E-007. Run 4 (2026-08-15, 42249bb via E2E-007 fix): re-verified 405 contract exhaustive. Run 5 (2026-08-15, this tick, CLI/API): 482 pytest, ruff/mypy, yarn build (43 modules), smoke ✓; E2E-002..007 re-verified FIXED; 1 new finding → E2E-008 (corrupt-DB contract). Run 6 (2026-08-15, 449c76b via E2E-008 fix): re-verified corrupt-DB contract closed — all 8 CLI read commands + /api/* return honest empty on a corrupt/non-SQLite DB. Next run: every 5-10 ticks. | High | 4±1 | P12 | ++testing, +browser, +vision | GPT-5.6 Luna | Visual verification | Step 3.7 Flash |
+| E2E-001 | E2E Testing Tick (self-improving loop) — spawn Luna (browser/screenshots) or Step 3.7 Flash (CLI/API). Deploy/build, Playwright, screenshots, endpoints, console. → e2e-output/tasks.md → inject into board. Every 5-10 ticks. Run 1 (2026-08-13, e838b28): 463 pytest pass, smoke 52/52, yarn build ✓, relay pass-through ✓, 4 findings → E2E-002..005. Run 2 (2026-08-13, 3300078, browser/Luna variant): console clean, visual at 1280/768/320px, live polling ✓, read-only contract ✓, 1 finding → E2E-006 (fixed 1095a97, judge PASS e210e179). Run 3 (2026-08-15, 064c098, CLI/API): 482 pytest, smoke ✓, all gates green; E2E-002..006 re-verified FIXED; 1 new finding → E2E-007. Run 4 (2026-08-15, 42249bb via E2E-007 fix): re-verified 405 contract exhaustive. Run 5 (2026-08-15, this tick, CLI/API): 482 pytest, ruff/mypy, yarn build (43 modules), smoke ✓; E2E-002..007 re-verified FIXED; 1 new finding → E2E-008 (corrupt-DB contract). Run 6 (2026-08-15, 449c76b via E2E-008 fix): re-verified corrupt-DB contract closed — all 8 CLI read commands + /api/* return honest empty on a corrupt/non-SQLite DB. Run 7 (2026-08-16, this tick, CLI/API): 482 pytest, ruff, yarn build (43 modules), smoke ✓; E2E-002..008 re-verified FIXED; 1 new finding → E2E-009 (wrong-schema SQLite crashes CLI + 500 on dashboard). Next run: every 5-10 ticks. | High | 4±1 | P12 | ++testing, +browser, +vision | GPT-5.6 Luna | Visual verification | Step 3.7 Flash |
+| E2E-009 | Wrong-schema SQLite telemetry DB breaks the honest-empty read path — `_is_readable_sqlite` only runs PRAGMA quick_check (integrity, not schema); a valid SQLite file with unrelated/missing CachePilot tables passes the probe, then the read-only openers (which skip CREATE TABLE by design) crash on the first SELECT: all 8 CLI read commands exit 1 with a raw `sqlite3.OperationalError: no such table: ...` traceback; dashboard `/api/*` return HTTP 500 `{"error":"OperationalError: no such table: ..."}`. E2E-008 fixed only corrupt-garbage/non-SQLite files. Expected (E2E-008 contract continuity): schema mismatch treats like corrupt → CLI stderr notice + honest empty + exit 0, no traceback; dashboard 200 empty JSON. Fix dir: extend probe to check expected tables via `SELECT count(*) FROM sqlite_master ...` on scratch ro conn + wrap CLI store reads so any sqlite3.Error degrades to honest-empty; add smoke_test valid-but-wrong-schema case. | Low | 2±1 | E2E-008 | ++testing, +read-path | DS-V4-Flash | Read-path honesty | DS-V4-Flash |
 
 ## Completed
 
@@ -44,6 +45,38 @@ every commit to a `gitreins task complete`.
 | P-BOOT | Bootstrap — repo, AGENTS.md, docs/PRD.md (full spec), task board, gitreins, hilo, scheduler registration | Critical | 2±1 | — | DS-V4-Flash |
 
 ## Tick Log
+
+- **2026-08-16 (work tick — E2E-001 Run 7, CLI/API)**: Board had the perpetual
+  E2E-001 fixture (Run 6 was 449c76b, ~5 commits ago — due in the 5-10 window)
+  plus a new Active E2E-009 finding. Dispatched the CLI/API E2E worker variant.
+  Worker ran a full E2E verification tick: **fresh deploy** (`uv sync --group
+  dev` clean; **482 pytest passed 40.34s**; `ruff check src/ packages/
+  dashboard/backend/` All checks passed; `yarn build` 43 modules transformed;
+  `dashboard/backend/smoke_test.py` SMOKE TEST PASSED). **Full user journey**
+  (CLI/API only): live relay `cachepilotd` 9082 → mock upstream 9081 (pass-
+  through GET/POST byte-identical; control `GET /cachepilot/health` distinctive
+  JSON intercepted, HEAD/POST pass-through narrow PRD §27), live dashboard
+  backend 9083 on a seeded telemetry DB (all 9 `/api/*` GET endpoints real
+  JSON), all 8 CLI read commands consistent. **All 8 prior findings
+  E2E-002..E2E-008 re-verified FIXED** (regression): E2E-002 relay readouts
+  healthy/unreachable/occupied-by-foreign live + startup occupant detection;
+  E2E-003/007 uniform JSON 405 for POST/PUT/DELETE/PATCH/OPTIONS/TRACE + HEAD
+  405 JSON headers with 0 body bytes; E2E-004 missing `--db` never created, exit
+  0, honest empty; E2E-005 status "route-change churn events 0"+footnote vs
+  routes "route switches 1"; E2E-006 `@media (max-width:768px)` mobile collapse
+  verified by code/build state; E2E-008 corrupt/non-SQLite DB → CLI exit 0 no
+  traceback + dashboard 200 empty JSON. **1 new finding → E2E-009 (LOW)**:
+  `_is_readable_sqlite` runs only PRAGMA quick_check (integrity, not schema), so
+  a VALID SQLite file with an unrelated/wrong schema passes the probe and then
+  crashes every CLI read (raw `sqlite3.OperationalError: no such table: ...`
+  traceback, exit 1) and returns dashboard HTTP 500 — a continuity gap in
+  E2E-008's honest-empty contract. Filed with exact repro (create unrelated-
+  table DB → probe True → CLI traceback / dashboard 500), expected vs actual,
+  and fix direction. Files changed (test-only): `e2e-output/report.md`,
+  `e2e-output/tasks.md`, `.coding-hermes/tasks.md` (+ `e2e-output/run7/` notes +
+  mock upstream test artifact). **No src/, packages/, or dashboard/backend/
+  implementation modified.** Only e2e notes + board committed (worker commits
+  findings; foreman runs the judge).
 
 - **2026-08-15 (idle tick, b797659..HEAD — this tick)**: Board = only perpetual fixtures (E2E-001 Run 6 was done in E2E-008 work tick 449c76b, ~5 commits ago — window 5-10, not due; NEVER-DONE audit). No real pending work → idle. Git-history cross-ref + GitReins dual-source check: **gitreins task store 0 pending**, no committed work behind pending board tasks, git clean tree, **upstream synced (unpushed=0, behind=0)**. Lightweight verification (board heavily audited, zero gaps, across prior idle+work ticks this cycle): **482 pytest pass in 58.71s**, **ruff check src/ dashboard/backend/ All checks passed**, gitreins judge configured (check-gitreins-judge.py PASS, model deepseek/deepseek-v4-flash-0731). CHK8 CI: **4/4 recent runs success** (gh run list fresh, carterlasalle/cachepilot — latest idle-tick chore runs green, no failures). Zero new tasks found. Scheduler cooldown had reverted 43200→900 by daemon ApplyFleetConfig (field is lowercase `cooldown_s`) — re-applied **43200s (idle)** via API PUT, verified GET (cooldown_s=43200, enabled=true).
 - **2026-08-15 (idle tick, 8fcb096..HEAD)**: Board = only perpetual fixtures (E2E-001 Run 6 was 4 commits/ticks ago in E2E-008 work tick 449c76b — window 5-10, not due; NEVER-DONE audit). No real pending work → idle. Git-history cross-ref + GitReins dual-source check: **gitreins task store 0 pending**, no committed work behind pending board tasks, **upstream synced (unpushed=0, behind=0)**, git clean tree. Lightweight verification (board heavily audited, zero gaps, across prior idle+work ticks this cycle): **482 pytest pass in 49.6s**, **ruff check src/ dashboard/backend/ All checks passed**, gitreins judge configured (check-gitreins-judge.py PASS in prior ticks, model deepseek/deepseek-v4-flash-0731), DuckBrain namespace `cachepilot` healthy (3 keys: overview/pitfalls/e2e-history, list_keys verified in prior tick). CHK8 CI: **3/3 recent runs success** (gh run list fresh, carterlasalle/cachepilot — latest idle-tick chore runs 5fe6558/d83a1b4/8fcb096 green, no failures). Zero new tasks found. Scheduler cooldown had reverted 43200→900 by daemon ApplyFleetConfig (field is lowercase `cooldown_s`) — re-applied **43200s (idle)** via API PUT, verified GET (cooldown_s=43200, enabled=true).

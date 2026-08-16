@@ -249,3 +249,90 @@ temp telemetry DBs under `/tmp/cp-e2e5/`.
 - All 8 CLI commands on a MISSING DB: honest empty states, exit 0, no file/dir created (E2E-004). On the seeded DB all 9 `/api/*` endpoints return real JSON matching docs/dashboard.md schemas; empty-store endpoints return honest zeros/`[]`/null hit_rate; unknown `/api/*` → 404 JSON; static SPA serving (`/`, `/some/route`) serves `index.html`; `../package.json` traversal → 404 (root-escaped paths blocked), `/..%2f..%2fetc/passwd` → not leaked (served app HTML, candidate never escapes `dist/` root).
 - Edge inputs clean: `/api/miss?session=zzz` → `{"event": null, "stable": [], "changed": []}`; invalid `CACHEPILOT_RELAY_LISTEN` → `Relay: unreachable (invalid CACHEPILOT_RELAY_LISTEN='...')`; unknown CLI subcommand → argparse error. Relay pass-through works (GET/POST forwarded to upstream; 501 from the GET-only mock upstream is the stub, not the relay).
 - Browser/visual at 320/768/1280px and live console: NOT re-run this tick (CLI/API variant; browser follow-up lives with the Luna variant as in prior runs).
+
+---
+
+## RUN 7 — CLI/API variant (2026-08-16)
+
+Run date: 2026-08-16 · repo `main` (E2E-001-R7 tick) · CLI/API E2E variant
+(no browser). Fresh deploy: `uv sync --group dev` clean, **482 pytest passed
+(40.34s)**, `ruff check src/ packages/ dashboard/backend/` → "All checks
+passed!", `yarn build` → **43 modules transformed** (dist emitted),
+`dashboard/backend/smoke_test.py` → **SMOKE TEST PASSED**. Live relay
+(`cachepilotd` 127.0.0.1:9082 → mock upstream 9081) + live dashboard backend
+(9083) on a seeded temp telemetry DB under `e2e-output/run7/`. Ports 8787/8788
+are squatted by foreign processes on this host (hermes-webui, mcp serve), used
+as the E2E-002 occupancy live-check.
+
+### Re-verification of prior findings — ALL FIXED
+
+| ID | Severity | Result | Evidence (live) |
+|----|----------|--------|-----------------|
+| E2E-002 | MEDIUM | **FIXED** | `cachepilot status` with relay on 9082 → `Relay: healthy`; dashboard `/api/status` with `CACHEPILOT_RELAY_LISTEN=127.0.0.1:9082` → `healthy`, with `=127.0.0.1:9099` (closed) → `unreachable`, with default (8787 squatted foreign python) → `occupied by another service`. Relay control `GET /cachepilot/health` → `{"service":"cachepilot-relay","status":"ok"}`; `HEAD`/`POST /cachepilot/health` pass through upstream (narrow PRD §27 GET-only interception preserved). Startup occupant detection + actionable errors covered by smoke PASS. |
+| E2E-003 | LOW | **FIXED** | `POST`/`PUT`/`DELETE`/`PATCH /api/leases` → **405 application/json; charset=utf-8** `{"error":"the dashboard backend is read-only (GET only)"}`. |
+| E2E-004 | LOW | **FIXED** | All 8 `cachepilot <cmd> --db /tmp/...missing.db` → stderr read-only notice + honest empty output, **exit 0**, **no file created** (ls confirms). |
+| E2E-005 | LOW | **FIXED** | Same seeded DB: `status` → `route-change churn events 0` + footnote; `routes` → `route switches 1`. Disambiguated. |
+| E2E-006 | MEDIUM | **FIXED** | `dashboard/src/styles.css:414` `@media (max-width: 768px)` collapses `.app`→1fr, `.sidebar`→row sticky top nav, hides `.brand-sub`/`.sidebar-foot`, single-column stat-grid/bar-row/layer-groups. Code/build state confirms (CLI/API variant). |
+| E2E-007 | LOW | **FIXED** | `OPTIONS`/`TRACE`/`HEAD /api/leases` → **405 JSON**; `HEAD` returns 405 + JSON content-type + Content-Length but **0 body bytes** (HTTP HEAD semantics). smoke 7-method loop green. |
+| E2E-008 | LOW | **FIXED** | Corrupt/garbage DB: all CLI reads → stderr "corrupt or not SQLite" notice + honest empty, **exit 0**, **no traceback**; dashboard `/api/*` on corrupt DB → all **200 empty JSON** (verified on 9086: status total=0, leases [], costs 0.0, etc.). smoke corrupt-DB case green. |
+
+### New finding
+
+| ID | Severity | Component | Summary |
+|----|----------|-----------|---------|
+| E2E-009 | LOW | CLI (`cachepilot_cli`) + dashboard backend (`server.py`) | A **valid SQLite file with the wrong/unrelated schema** (passes `PRAGMA quick_check`) makes every CLI read command crash with an unhandled `sqlite3.OperationalError: no such table: ...` traceback (exit 1) and the dashboard `/api/*` endpoints return **HTTP 500** — a continuity gap in the E2E-008 honest-empty-store contract, which only handles non-SQLite/corrupt-garbage files. |
+
+## E2E-009 — LOW — Wrong-schema SQLite DB: CLI traceback + dashboard 500 (E2E-008 honest-empty gap on the read path)
+
+- **Component**: `packages/cli/src/cachepilot_cli/churn.py:_is_readable_sqlite` +
+  `open_read_only_store`; `dashboard/backend/server.py` identical
+  `_is_readable_sqlite` + `open_store`. The probe only runs `PRAGMA quick_check`
+  (a file-INTEGRITY check) and does NOT validate that the expected CachePilot
+  schema tables exist; the read-only openers (`TelemetryStore(read_only=True)`,
+  `ReadOnlyTelemetryStore`) deliberately skip `conn.executescript(_SCHEMA)`, so
+  a wrong-schema file has no self-heal path.
+- **Reproduction** (live):
+  1. Create a VALID SQLite DB with an unrelated table:
+     `python -c "import sqlite3;c=sqlite3.connect('/tmp/cp-e2e-wrongschema.db');c.execute('CREATE TABLE unrelated (id INTEGER PRIMARY KEY, name TEXT)');c.commit()"`.
+  2. `_is_readable_sqlite()` on this file → **True** (it is a valid SQLite DB).
+  3. `cachepilot churn --db /tmp/cp-e2e-wrongschema.db` → **raw Python traceback**
+     `sqlite3.OperationalError: no such table: churn_events`, **exit 1**.
+     Reproduced for ALL 8 read commands (`status`, `leases`, `costs`, `ttl`,
+     `routes`, `churn`, `explain-miss`, `topology`) — each crashes on its first
+     query (`no such table: request_events` / `leases` / `provider_profiles` /
+     `route_events` / `churn_events`).
+  4. Dashboard backend on the same file then `GET /api/status`, `/api/leases`,
+     `/api/costs`, ... → **HTTP 500**
+     `{"error":"OperationalError: no such table: request_events"}` (per-endpoint
+     table name varies). All 9 endpoints 500; none return the honest-empty 200.
+- **Expected**: identical to the E2E-008 contract — a present-but-unreadable
+  telemetry path (a valid SQLite file that is not a CachePilot store: a foreign
+  app's DB, a stale/different-schema file, tooling replaced the file) is an
+  honest empty store. CLI: stderr notice naming the path + honest empty output,
+  exit 0, no traceback. Dashboard: `/api/*` 200 empty JSON, no 500.
+- **Actual**: `PRAGMA quick_check` only proves the file is a structurally valid
+  SQLite DB — it says nothing about whether it has the CachePilot tables. The
+  read-only openers skip schema creation (by design, to never modify the store),
+  so the first real `SELECT` raises `OperationalError` and the read path crashes
+  with a raw traceback (CLI) or a 500 (dashboard). Read-only integrity is NOT
+  violated (nothing is written), severity LOW, but it is a genuine usability /
+  honest-posture defect and a direct continuity gap of E2E-008's fix.
+- **Suggested fix direction** (NOT changed this tick — tester): extend the
+  `_is_readable_sqlite` probe to also confirm the expected schema is present,
+  e.g. `SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN
+  ('request_events', ...)` on the scratch read-only connection, and treat a
+  schema mismatch exactly like the corrupt-file path (honest empty / 200). Also
+  wrap CLI store reads (churn/main/topology handlers) so any `sqlite3.Error`
+  during a read degrades to the documented honest-empty output + stderr notice
+  instead of an unhandled traceback. Extend `smoke_test.py` with a
+  valid-but-wrong-schema DB case asserting the honest-empty contract for both
+  CLI and dashboard.
+
+### RUN 7 zero-finding areas / gates
+
+- Quality gate: **482 pytest passed (40.34s)**; `ruff check src/ packages/ dashboard/backend/` → "All checks passed!"; `uv sync --group dev` clean.
+- Frontend gate: `yarn install` + `yarn build` → **43 modules transformed**, dist emitted.
+- `dashboard/backend/smoke_test.py` → **SMOKE TEST PASSED** (seeded + empty + corrupt + relay probe + startup occupant detection + 7-method 405 + byte-identical read-only DB).
+- Full CLI/API user journey on the seeded DB consistent: all 8 CLI commands return real, mutually consistent data (`status` 3 requests / 50.0% / churn 1; `leases` ARMED 118s/300s; `costs` $0.000330 openai; `ttl` 288s/120-600s/conf 0.85/survival P=1.00; `routes` 1 switch / route_instability; `churn` tools+cache key / "tool list mutation"; `explain-miss` cause+conf 0.82+~1234 tokens; `topology` 2 sessions / 1 pair / tool schemas 0.0%). All 9 `/api/*` GET endpoints return real JSON; write methods / HEAD/OPTIONS/TRACE all 405 JSON, HEAD body 0 bytes.
+- Relay pass-through live-verified this tick: `GET /hello` and `POST /v1/chat/completions` forwarded to the mock upstream byte-identical; relay control `GET /cachepilot/health` intercepted (distinctive JSON) while `HEAD`/`POST /cachepilot/health` and non-control paths pass through unchanged.
+- Browser/visual at 320/768/1280px and live console: NOT re-run this tick (CLI/API variant; browser follow-up lives with the Luna variant as in prior runs). E2E-006 verified by code/build state only.

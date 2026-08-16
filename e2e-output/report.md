@@ -368,3 +368,140 @@ E2E-003 fix.**
 2. e2e-output/report.md has the Run 3 section with real captured evidence — YES.
 3. e2e-output/tasks.md reflects new findings — YES (E2E-007; E2E-002..006 marked fixed).
 4. No source, CLI, relay, or backend code modified — YES (only report/tasks).
+
+---
+
+## Run 7 — CLI/API variant (2026-08-16)
+
+Date: 2026-08-16 · Worker: CLI/API E2E tick (no browser tool) · Repo:
+cachepilot @ main (E2E-001-R7 tick). Scope: fresh deploy + full CLI/API user
+journey against a live relay and live dashboard backend; re-verify all seven
+prior findings (E2E-002..E2E-008); hunt for new protocol/contract-level gaps
+on the read path. Test-only tick — no source modified; only
+`e2e-output/report.md`, `e2e-output/tasks.md`, and `.coding-hermes/tasks.md`
+changed.
+
+Verdict: **1 new LOW finding (E2E-009). All seven prior findings
+E2E-002..E2E-008 re-verified as no-longer-reproducing (fixed).** No fabricated
+numbers; the seeded store served honest, mutually consistent data on every
+surface.
+
+### 1. Quality gate (deploy/build) — PASS
+
+```
+uv sync --group dev   → Resolved 33 packages, OK
+uv run ruff check src/ packages/ dashboard/backend/ → All checks passed!
+uv run pytest -q      → 482 passed in 40.34s
+```
+
+Full suite green (P00–P12). No pre-existing or new failures.
+
+### 2. Dashboard build — PASS
+
+```
+cd dashboard
+yarn build → tsc --noEmit && vite build: ✓ built in 2.11s
+  dist/assets/index-CB_MdEba.css  5.48 kB │ gzip: 1.67 kB
+  dist/assets/index-NcpMpYl1.js  162.59 kB │ gzip: 51.82 kB
+```
+
+TypeScript strict-pass → Vite emit; `dist/` gitignored.
+
+### 3. Dashboard backend smoke test — PASS
+
+```
+uv run python dashboard/backend/smoke_test.py
+→ SMOKE TEST PASSED — seeded + empty-store states + byte-identical read-only DB,
+  7-method 405 contract, relay probe, startup occupant detection.
+```
+
+### 4. Live relay + dashboard backend — PASS, re-verified E2E-002/E2E-003/E2E-007
+
+Started a real relay (`cachepilotd` 127.0.0.1:9082) forwarding to a mock
+upstream (127.0.0.1:9081), and the dashboard backend on a seeded temp DB
+(`e2e-output/run7/telemetry.db`) at 127.0.0.1:9083. Ports 8787 (hermes-webui)
+and 8788 (mcp serve) are squatted by foreign processes on this host — used as
+the E2E-002 live occupancy check.
+
+Relay pass-through (E2E-002, P03 invariants):
+| Check | Result |
+|---|---|
+| `GET /cachepilot/health` | `{"service":"cachepilot-relay","status":"ok"}` (intercepted distinctive body) |
+| `HEAD`/`POST /cachepilot/health` | pass through upstream verbatim (narrow PRD §27 GET-only interception preserved) |
+| `GET /hello` direct vs via relay | `{"ok": true, "upstream": "mock"}` byte-identical |
+| `POST /v1/chat/completions` | body echoed byte-identical direct vs via |
+
+Relay readouts (E2E-002):
+- relay on 9082 → `cachepilot status` `Relay: healthy`; dashboard
+  `/api/status` with `CACHEPILOT_RELAY_LISTEN=127.0.0.1:9082` → `healthy`
+- `CACHEPILOT_RELAY_LISTEN=127.0.0.1:9099` (closed port) → `unreachable`
+- default (8787 squatted foreign python) → `occupied by another service`
+  (never `healthy` — E2E-002 false-positive eliminated)
+
+Write-refusal contract (E2E-003 + E2E-007):
+- `POST`/`PUT`/`DELETE`/`PATCH`/`OPTIONS`/`TRACE /api/leases` → **405**
+  `application/json; charset=utf-8` `{"error":"the dashboard backend is
+  read-only (GET only)"}`
+- `HEAD /api/leases` → **405** + JSON content-type + Content-Length, **0 body
+  bytes** (HTTP HEAD semantics)
+
+Read-only API GET (seeded store): all 9 endpoints return real JSON matching
+docs/dashboard.md — `/api/status` (total=3, hit_rate=0.5, relay/providers),
+`/api/leases` (1 ARMED lease), `/api/costs` ($0.000330, openai),
+`/api/ttl` (288s, 120-600s, conf 0.85, survival P=1.00 n=4), `/api/routes`
+(1 route_instability switch), `/api/churn` (tools+cache-key, "tool list
+mutation"), `/api/miss` (cause+conf 0.82+~1234 tokens), `/api/topology`
+(2 sessions, 1 pair, tool schemas 0.0%), `/api/health` `{"ok":true}`.
+
+### 5. Live CLI — PASS, re-verified E2E-004/E2E-005
+
+All 8 commands on the seeded DB return real, mutually consistent data (see
+`e2e-output/tasks.md` RUN 7 table).
+
+E2E-004 re-verified: all 8 commands on a missing `--db` print the stderr
+read-only notice naming the path + honest empty output, **exit 0**, and
+**no file/parent dir created** (ls confirms the path does not exist).
+
+E2E-005 re-verified: `cachepilot status` → `route-change churn events 0` +
+footnote (churn_events.route_changed), `cachepilot routes` → `route switches 1`
+— sources disambiguated.
+
+### 6. Re-verify E2E-008 — FIXED
+
+Corrupt/garbage DB (`printf 'this is not a sqlite database' > c.db`):
+- all CLI reads → stderr `... is corrupt or not SQLite — treating it as an
+  empty store ...`, honest empty output, **exit 0, no traceback**
+- dashboard `/api/*` on the corrupt DB (9086) → all **200 empty JSON**
+  (`status` total=0, `leases` [], `costs` 0.0, `ttl` [], `routes` empty,
+  `churn` empty, `miss` event=null, `topology` zeros)
+
+### 7. Re-verify E2E-006 — FIXED (by code/build state)
+
+`dashboard/src/styles.css:414` has `@media (max-width: 768px)` collapsing the
+230px sidebar into a horizontal sticky top-nav row and reflowing to single
+column. Browser render not re-run in this CLI/API variant.
+
+### 8. New finding → E2E-009 (LOW)
+
+A **valid SQLite file with the wrong/unrelated schema** passes the
+`PRAGMA quick_check` probe (integrity-only; it does not validate the CachePilot
+schema), then the read-only openers (which skip `CREATE TABLE IF NOT EXISTS` by
+design) crash on their first real `SELECT`:
+- **CLI: all 8 read commands** → raw `sqlite3.OperationalError: no such
+  table: ...` traceback, **exit 1**.
+- **Dashboard: all 9 `/api/*`** → **HTTP 500**
+  `{"error":"OperationalError: no such table: request_events"}` (table name
+  varies per endpoint).
+
+This is a continuity gap in the E2E-008 honest-empty-store contract, which only
+handles non-SQLite/corrupt-garbage files (those that fail `quick_check`).
+Reproduced live; full repro + expected/actual + fix direction filed as E2E-009
+in `e2e-output/tasks.md` and on the board.
+
+### 9. Acceptance criteria
+
+1. gates ran green — YES (ruff pass; 482 pytest; yarn build; smoke test PASS).
+2. e2e-output/report.md + tasks.md carry RUN 7 evidence — YES.
+3. all 8 prior findings re-verified fixed — YES (E2E-002..E2E-008).
+4. new findings filed with exact reproduction — YES (E2E-009).
+5. No source, CLI, relay, or backend code modified — YES (only report/tasks/board).
