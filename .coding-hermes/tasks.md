@@ -74,6 +74,25 @@ every commit to a `gitreins task complete`.
   relay control-path encodings, --db edge cases). Worker committed test-only
   changes (e2e-output/run12/ artifacts + report.md + tasks.md RUN 12 + E2E-001
   board row Run 12 note) and ran gitreins task complete E2E-001-R12.
+  **Foreman layer (trust-but-verify, not just worker claim):** independently
+  re-ran **488 pytest (-x -q) 88.75s**, **ruff check src/ packages/
+  dashboard/backend/ → All checks passed!**, **mypy → Success, 74 files**,
+  **yarn build → 43 modules (2.05s)**, **smoke_test.py → SMOKE TEST PASSED
+  (exit 0)** — all green in my own session. GitReins lifecycle: task
+  E2E-001-R12 (created by worker, in_progress) → worker's judge complete →
+  **judge PASS 9ec14f5c** (tier1 lint/secrets/tests PASS; tier2 ALL 6 criteria
+  ✓ with live command evidence: 488 pytest, ruff+mypy, yarn 43 mod +
+  smoke 144 PASS, live relay pass-through incl. forward-503, 8 CLI reads
+  consistent, all 11 prior findings re-verified FIXED, zero-findings tick
+  committed+pushed) → task deleted, store clean (**0 pending**). MANDATORY
+  PUSH verified: commit 65c25f8 pushed, remote HEAD at 65c25f8,
+  **unpushed=0 behind=0** (git fetch + rev-list). Leak check: **no 908x
+  listener** (ss -tlnp clean — E2E-011 hygiene premise holds). CI: **4/4
+  recent runs success** (gh run list fresh, carterlasalle/cachepilot — Run 12
+  commit runs green), no failures to file. Only perpetual fixtures (E2E-001
+  not due, NEVER-DONE) remain → **project idle** → scheduler cooldown set
+  **43200s (idle)** via API PUT (had reverted 43200→900 by daemon
+  ApplyFleetConfig), verified GET (cooldown_s=43200, enabled=true).
 - **2026-08-16 (idle tick, THIS TICK — ad28733..HEAD)**: Board = only perpetual fixtures (E2E-001 Run 11 was done in the E2E-011 work tick 0a073b9/700d112/79ddf2a — 7 commits ago incl. E2E-011 work + rapid-fire idle board updates, window 5-10 not yet due; NEVER-DONE audit). No real pending work → idle. Git-history cross-ref + GitReins dual-source check: **gitreins task store 0 pending (No tasks found)**, no committed work behind pending board tasks, **upstream synced (unpushed=0, behind=0, origin/main==HEAD ad28733)**, git clean tree. Lightweight verification (board heavily audited, zero gaps, across prior idle+work ticks this cycle): **488 pytest pass in 78.01s**, **ruff check src/ packages/ dashboard/backend/ e2e-output/hygiene.py → All checks passed!**, **gitreins check-gitreins-judge.py PASS** (model deepseek/deepseek-v4-flash-0731). Leak check: **no 908x listener** (ss -tlnp clean — E2E-011 premise holds). CHK8 CI: **4/4 recent runs success** (gh run list fresh, carterlasalle/cachepilot — latest idle-tick chore runs green, no failures). Zero new tasks found. Scheduler cooldown had reverted 43200→900 by daemon ApplyFleetConfig (field lowercase `cooldown_s`) — re-applied **43200s (idle)** via API PUT, verified GET (cooldown_s=43200, enabled=true).
 
 - **2026-08-16 (idle tick, this session — THIS TICK)**: Board = only perpetual fixtures (E2E-001 Run 11 was done +5 posts-700d112, E2E-011 work tick — 5 commits back, window 5-10 not yet due; NEVER-DONE audit). No real pending work → idle. Git-history cross-ref + GitReins dual-source check: **gitreins task store 0 pending (No tasks found)**, upstream synced (unpushed=0, behind=0, origin/main==HEAD 5de98b6), git clean tree. Lightweight verification (board heavily audited, zero gaps, across prior idle+work ticks this cycle): **488 pytest pass in 56.18s**, **ruff check src/ packages/ dashboard/backend/ e2e-output/hygiene.py → All checks passed**, **gitreins judge configured (check-gitreins-judge.py PASS, model deepseek/deepseek-v4-flash-0731, caps 60 iter/1M in/400k out/20m)**. CHK8 CI: **4/4 recent runs success** (gh run list fresh, carterlasalle/cachepilot — latest idle-tick chore runs green, no failures). Leak check: no 908x listener. Zero new tasks found. Scheduler cooldown had reverted 43200→900 by daemon (field lowercase `cooldown_s`) — re-applied **43200s (idle)** via API PUT, verified GET (cooldown_s=43200, enabled=true).
