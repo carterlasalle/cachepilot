@@ -100,6 +100,19 @@ _LAYERS: tuple[tuple[str, str], ...] = (
     ("model", "model_changed"),
 )
 
+#: The CachePilot telemetry tables every read-only opener expects (PRD §82).
+#: A valid SQLite file that lacks any of these has a foreign / unrelated
+#: schema and must be treated as absent — the same honest-empty contract as
+#: a corrupt or missing file (E2E-009).
+_EXPECTED_TABLES: tuple[str, ...] = (
+    "request_events",
+    "churn_events",
+    "leases",
+    "provider_profiles",
+    "ttl_observations",
+    "route_events",
+)
+
 #: The one environment variable that switches the plugin; used for the
 #: status view's plugin-state readout (mirrors the CLI).
 ENV_PLUGIN_ENABLED = "CACHEPILOT_ENABLED"
@@ -135,18 +148,27 @@ class ReadOnlyTelemetryStore(TelemetryStore):
 
 
 def _is_readable_sqlite(path: Path) -> bool:
-    """Return True if ``path`` is a valid, readable SQLite database.
+    """Return True if ``path`` is a readable CachePilot-schema SQLite file.
 
-    Opens a scratch read-only connection and runs ``PRAGMA quick_check``.
+    Opens a scratch read-only connection and runs ``PRAGMA quick_check``,
+    then confirms the expected telemetry tables exist via ``sqlite_master``.
     A present-but-corrupt or non-SQLite file raises ``sqlite3.DatabaseError``
-    (``file is not a database``); any ``sqlite3.Error`` means the path is
+    (``file is not a database``); a valid file whose schema lacks any
+    expected telemetry table is a foreign/unrelated database (E2E-009).
+    Either way any ``sqlite3.Error``, or a missing table, means the path is
     NOT safe to hand to the store, and the caller treats it as absent.
     """
     conn = None
     try:
         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         conn.execute("PRAGMA quick_check")
-        return True
+        placeholders = ", ".join("?" for _ in _EXPECTED_TABLES)
+        found = conn.execute(
+            f"SELECT count(*) FROM sqlite_master "
+            f"WHERE type='table' AND name IN ({placeholders})",
+            _EXPECTED_TABLES,
+        ).fetchone()[0]
+        return found == len(_EXPECTED_TABLES)
     except sqlite3.Error:
         return False
     finally:
@@ -162,17 +184,17 @@ def open_store(db_path: str | None = None) -> TelemetryStore | None:
     missing file, a corrupt file, or an unreadable database is an honest
     empty store, not an error page full of invented numbers.
 
-    E2E-008: ``ReadOnlyTelemetryStore`` connects LAZILY (on the first
-    query), so a DatabaseError from a present-but-corrupt / non-SQLite
-    ``--db`` would otherwise escape during request handling and produce an
-    HTTP 500. The up-front :func:`_is_readable_sqlite` probe treats such a
-    file exactly like a missing one (return None), so every endpoint
-    renders its honest empty state with HTTP 200 — never a 500.
+    E2E-008 / E2E-009: ``ReadOnlyTelemetryStore`` connects LAZILY (on the
+    first query), so a DatabaseError from a present-but-corrupt / non-SQLite
+    / wrong-schema ``--db`` would otherwise escape during request handling
+    and produce an HTTP 500. The up-front :func:`_is_readable_sqlite` probe
+    treats such a file exactly like a missing one (return None), so every
+    endpoint renders its honest empty state with HTTP 200 — never a 500.
     """
     path = resolve_db_path(db_path)
     if not path.is_file() or not _is_readable_sqlite(path):
-        # Missing OR present-but-corrupt / non-SQLite (E2E-008): both are
-        # an honest empty store.
+        # Missing OR present-but-corrupt / non-SQLite / wrong-schema
+        # (E2E-008 / E2E-009): all three are an honest empty store.
         return None
     try:
         return ReadOnlyTelemetryStore(path)
@@ -527,6 +549,12 @@ class Handler(BaseHTTPRequestHandler):
         store = open_store(self.server.db_path)
         try:
             payload = build(store)
+        except sqlite3.Error:
+            # E2E-009 defensive layer: a wrong-schema store that slipped
+            # past the read-only probe (probe/read race, or a table missing
+            # at SELECT time) behaves EXACTLY like a missing/corrupt store —
+            # honest empty JSON, never a 500.
+            payload = build(None)
         except Exception as exc:  # noqa: BLE001 — fail open: a bad store must never crash the request thread
             self._send_json(500, {"error": f"{type(exc).__name__}: {exc}"})
             return

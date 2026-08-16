@@ -66,12 +66,15 @@ Read-only guarantees:
   renders the honest empty state (the relay creates the DB on its first
   write).
 - A present-but-corrupt or non-SQLite store is treated exactly like a
-  missing one (E2E-008). Both openers (the CLI's `open_read_only_store` and
-  the dashboard's `open_store`) run an up-front read-only probe
-  (`PRAGMA quick_check` on a scratch `mode=ro` connection) before returning
-  a store; if that raises `sqlite3.Error` the file is corrupt/not SQLite
-  and is handled as an honest empty store — the CLI prints the same stderr
-  notice naming the path and exits 0 with no traceback, and every dashboard
+  missing one (E2E-008), as is a VALID SQLite file whose schema lacks the
+  expected CachePilot telemetry tables (E2E-009). Both openers (the CLI's
+  `open_read_only_store` and the dashboard's `open_store`) run an up-front
+  read-only probe on a scratch `mode=ro` connection before returning a
+  store: `PRAGMA quick_check`, then `sqlite_master` to confirm the expected
+  telemetry tables are present. If that raises `sqlite3.Error`, or any
+  expected table is absent, the file is corrupt/not-SQLite/wrong-schema and
+  is handled as an honest empty store — the CLI prints a stderr notice
+  naming the path and exits 0 with no traceback, and every dashboard
   endpoint returns HTTP 200 with its empty state (zeros / empty lists),
   never a 500.
 - Endpoints expose the SAME query surface as the `cachepilot` CLI

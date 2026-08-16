@@ -35,25 +35,57 @@ _LAYERS = (
     ("model", "model_changed"),
 )
 
+#: The CachePilot telemetry tables every read-only opener expects (PRD §82).
+#: A valid SQLite file that lacks any of these has a foreign / unrelated
+#: schema and must be treated as absent — the same honest-empty contract as
+#: a corrupt or missing file (E2E-009).
+_EXPECTED_TABLES: tuple[str, ...] = (
+    "request_events",
+    "churn_events",
+    "leases",
+    "provider_profiles",
+    "ttl_observations",
+    "route_events",
+)
+
 
 def _is_readable_sqlite(path: Path) -> bool:
-    """Return True if ``path`` is a valid, readable SQLite database.
+    """Return True if ``path`` is a readable CachePilot-schema SQLite file.
 
-    Opens a scratch read-only connection and runs ``PRAGMA quick_check``.
+    Opens a scratch read-only connection and runs ``PRAGMA quick_check``,
+    then confirms the expected telemetry tables exist via ``sqlite_master``.
     A present-but-corrupt or non-SQLite file raises ``sqlite3.DatabaseError``
-    (``file is not a database``); any ``sqlite3.Error`` means the path is
+    (``file is not a database``); a valid file whose schema lacks any
+    expected telemetry table is a foreign/unrelated database (E2E-009).
+    Either way any ``sqlite3.Error``, or a missing table, means the path is
     NOT safe to hand to the store, and the caller treats it as absent.
     """
     conn = None
     try:
         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         conn.execute("PRAGMA quick_check")
-        return True
+        placeholders = ", ".join("?" for _ in _EXPECTED_TABLES)
+        found = conn.execute(
+            f"SELECT count(*) FROM sqlite_master "
+            f"WHERE type='table' AND name IN ({placeholders})",
+            _EXPECTED_TABLES,
+        ).fetchone()[0]
+        return found == len(_EXPECTED_TABLES)
     except sqlite3.Error:
         return False
     finally:
         if conn is not None:
             conn.close()
+
+
+def _print_empty_store_notice(path: Path) -> None:
+    """Warn that a store read failed and is treated as absent/corrupt."""
+    print(
+        f"telemetry database at {path} is corrupt, not SQLite, or lacks the "
+        "expected telemetry schema — treating it as an empty store "
+        "(CLI reads are read-only; the relay creates the DB on first write)",
+        file=sys.stderr,
+    )
 
 
 def open_read_only_store(db_path: str | None) -> TelemetryStore | None:
@@ -66,12 +98,12 @@ def open_read_only_store(db_path: str | None) -> TelemetryStore | None:
     first write) and return None — the caller renders its honest empty
     output and exits 0.
 
-    The same holds for a present-but-corrupt or non-SQLite ``--db`` file
-    (E2E-008): it is an honest empty store, NOT a crash. The up-front
-    :func:`_is_readable_sqlite` probe treats such a file exactly like a
-    missing one — print the same notice naming the path and return None —
-    so the caller renders honest empty output and exits 0 with no
-    traceback.
+    The same holds for a present-but-corrupt, non-SQLite, or wrong-schema
+    ``--db`` file (E2E-008 / E2E-009): it is an honest empty store, NOT a
+    crash. The up-front :func:`_is_readable_sqlite` probe treats such a file
+    exactly like a missing one — print the same notice naming the path and
+    return None — so the caller renders honest empty output and exits 0
+    with no traceback.
     """
     path = resolve_db_path(db_path)
     if not path.is_file():
@@ -82,12 +114,7 @@ def open_read_only_store(db_path: str | None) -> TelemetryStore | None:
         )
         return None
     if not _is_readable_sqlite(path):
-        print(
-            f"telemetry database at {path} is corrupt or not SQLite — "
-            "treating it as an empty store "
-            "(CLI reads are read-only; the relay creates the DB on first write)",
-            file=sys.stderr,
-        )
+        _print_empty_store_notice(path)
         return None
     return TelemetryStore(path, read_only=True)
 
@@ -99,7 +126,14 @@ def cmd_churn(args: argparse.Namespace) -> int:
         print("no churn events")
         return 0
     try:
-        events = store.churn_list(limit=args.limit)
+        try:
+            events = store.churn_list(limit=args.limit)
+        except sqlite3.Error:
+            # E2E-009 defensive layer: a wrong-schema store that slipped
+            # past the probe (probe/read race) reads as honest-empty.
+            _print_empty_store_notice(store.db_path)
+            print("no churn events")
+            return 0
     finally:
         store.close()
     if not events:
@@ -130,7 +164,17 @@ def cmd_explain_miss(args: argparse.Namespace) -> int:
             print("no churn events recorded — nothing to explain")
         return 0
     try:
-        events = store.churn_list(limit=1, session_hash=args.session)
+        try:
+            events = store.churn_list(limit=1, session_hash=args.session)
+        except sqlite3.Error:
+            # E2E-009 defensive layer: a wrong-schema store that slipped
+            # past the probe (probe/read race) reads as honest-empty.
+            _print_empty_store_notice(store.db_path)
+            if args.session:
+                print("no churn events recorded for this session — nothing to explain")
+            else:
+                print("no churn events recorded — nothing to explain")
+            return 0
     finally:
         store.close()
     if not events:

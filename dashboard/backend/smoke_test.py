@@ -633,6 +633,99 @@ def main() -> int:
                 corrupt_server.shutdown()
                 corrupt_server.server_close()
 
+            print("== wrong-schema DB -> honest empty store (E2E-009) ==")
+            # A VALID SQLite file with an unrelated schema (no CachePilot
+            # telemetry tables) passes PRAGMA quick_check but not the
+            # schema probe: it must behave EXACTLY like a missing/corrupt
+            # DB — every CLI read command exits 0 with honest empty output
+            # and a stderr notice naming the path (no "no such table"
+            # traceback), and the dashboard /api endpoints return HTTP 200
+            # with their empty JSON, never a 500.
+            wrong_schema_path = tmp_path / "wrong-schema.db"
+            wrong_conn = sqlite3.connect(wrong_schema_path)
+            try:
+                wrong_conn.execute(
+                    "CREATE TABLE unrelated (id INTEGER PRIMARY KEY, name TEXT)"
+                )
+                wrong_conn.commit()
+            finally:
+                wrong_conn.close()
+            # The schema probe adds the sqlite_master check on top of
+            # quick_check, so the readable-probe verdict flips to False.
+            from cachepilot_cli.churn import open_read_only_store
+
+            check(
+                "wrong-schema store probe rejects (not CachePilot schema)",
+                open_read_only_store(str(wrong_schema_path)) is None,
+                str(wrong_schema_path),
+            )
+            # All 8 CLI read commands share open_read_only_store, whose
+            # probe now rejects a wrong-schema file like a corrupt one.
+            for cli_sub in (
+                "status",
+                "leases",
+                "costs",
+                "routes",
+                "churn",
+                "explain-miss",
+                "ttl",
+                "topology",
+            ):
+                out_buf, err_buf = io.StringIO(), io.StringIO()
+                with redirect_stdout(out_buf), redirect_stderr(err_buf):
+                    cli_code = cli_main([cli_sub, "--db", str(wrong_schema_path)])
+                cli_err = err_buf.getvalue()
+                check(
+                    f"wrong-schema CLI {cli_sub} exits 0",
+                    cli_code == 0,
+                    f"exit {cli_code}",
+                )
+                check(
+                    f"wrong-schema CLI {cli_sub} stderr names path + empty",
+                    str(wrong_schema_path) in cli_err and "empty store" in cli_err,
+                    cli_err.strip(),
+                )
+                check(
+                    f"wrong-schema CLI {cli_sub} no traceback / no such table",
+                    "Traceback" not in cli_err
+                    and "no such table" not in cli_err
+                    and "sqlite3." not in cli_err,
+                    cli_err.strip(),
+                )
+            # Dashboard /api/* endpoints return HTTP 200 empty-state JSON.
+            wrong_schema_server = DashboardServer(
+                ("127.0.0.1", 0), Handler, db_path=str(wrong_schema_path)
+            )
+            wrong_schema_port = int(wrong_schema_server.server_address[1])
+            wrong_schema_thread = threading.Thread(
+                target=wrong_schema_server.serve_forever, daemon=True
+            )
+            wrong_schema_thread.start()
+            try:
+                status, payload = fetch(wrong_schema_port, "/api/leases")
+                check(
+                    "wrong-schema leases 200 []",
+                    status == 200 and payload == {"leases": []},
+                    f"{status} {payload}",
+                )
+                status, payload = fetch(wrong_schema_port, "/api/status")
+                check(
+                    "wrong-schema stats 200 zero",
+                    status == 200
+                    and payload["stats"]["total"] == 0
+                    and payload["providers"] == [],
+                    f"{status} {payload}",
+                )
+                status, payload = fetch(wrong_schema_port, "/api/costs")
+                check(
+                    "wrong-schema costs 200 zero",
+                    status == 200 and payload["total_usd"] == 0.0,
+                    f"{status} {payload}",
+                )
+            finally:
+                wrong_schema_server.shutdown()
+                wrong_schema_server.server_close()
+
             print("== write refusal ==")
             refused_error = {"error": "the dashboard backend is read-only (GET only)"}
             # E2E-007: every non-GET method (POST/PUT/DELETE/PATCH/OPTIONS/
