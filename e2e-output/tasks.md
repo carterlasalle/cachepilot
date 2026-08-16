@@ -684,3 +684,76 @@ test-artifact observation recorded (not a defect): `hygiene.py self-test`'s
 `--clean` step auto-kills all 908x occupants including a live tick's own
 services, so verifications depending on live 908x services must run BEFORE
 the self-test step (see run14/README.md).
+
+---
+
+### RUN 15 (2026-08-16) — zero new finding; all prior E2E-002..E2E-011 FIXED
+
+**Worker:** DS-V4-Flash (CLI/API, test-only tick — no src/ packages/
+dashboard/backend/ logic modified). **Repo:** cachepilot @ main, clean.
+
+**Fresh deploy (quality gate) — all green:** uv sync --group dev → 33 pkgs /
+32 checked OK; **488 pytest (-x -q) 77.98s**; ruff check src/ packages/
+dashboard/backend/ e2e-output/hygiene.py → All checks passed!; mypy (uvx
+--python-executable .venv/bin/python --native-parser --python-version 3.12
+--follow-imports=skip src packages) → Success, 74 files; dashboard yarn build
+→ 43 modules (1.97s); smoke_test.py → SMOKE TEST PASSED (144 PASS, exit 0).
+
+**Live user journey (fresh current-build services, E2E-011 hygiene used
+throughout):** relay 9082→9081 mock upstream — control `GET /cachepilot/health`
+→ 200 `{"service":"cachepilot-relay","status":"ok"}` (CL 44); relay GET
+`/upstream/resource` **byte-identical via `cmp`** (direct 32B == relay 32B) +
+`x-upstream-marker: mock`; relay POST `/upstream/posts` body
+`{"payload":"echo-me-15"}` **byte-identical via `cmp`** (24B == 24B) + marker;
+upstream 503 forwarded **byte-identical** through relay 9097→9092 (503 / 0B on
+both). Dashboard backend 9083 on seeded telemetry DB — all 9 `/api/*` GET
+(health/status/leases/costs/ttl/churn/routes/topology/miss) → real seeded
+JSON (status total=3, costs total_usd=0.00033, leases 1022B). All 8 CLI read
+commands (status/leases/costs/ttl/churn/explain-miss/routes/topology)
+consistent; seeded DB sha `c44d5c28` byte-stable before/after (read-only
+proven).
+
+**Re-verification of all prior findings (live evidence):** E2E-002 relay
+readouts `Relay: healthy`(9082)/`Relay: unreachable`(9998 closed)/`Relay:
+unreachable`(9091 foreign); startup occupant detection → **both `cachepilotd`
+(9089) and `dashboard/backend/server.py` (9084) exit 2** with actionable
+error naming port + override. E2E-003/007 uniform **405 application/json;
+charset=utf-8** for POST/PUT/DELETE/PATCH/OPTIONS/TRACE on /api/status
+(read-only refusal body). E2E-004 missing `--db` path → exit 0 honest-empty,
+**no file / no parent dir created**. E2E-005 status `churn events 2` +
+`route-change churn events 0` footnote vs routes `route switches 1`
+(disambiguated). E2E-006 `styles.css:414 @media (max-width: 768px) {` + built
+bundle `@media (max-width: 768px){`. E2E-008/009 corrupt (random bytes) +
+wrong-schema (unrelated table) → all 8 CLI read commands exit 0, no traceback,
+no "no such table"; dashboard `/api/*` on 9086/9087 → 200 `{"leases": []}`
+empty JSON. E2E-010 HEAD mirrors GET → 200, 0 body, CL mirrors (incl. real
+asset `/assets/index-NcpMpYl1.js` CL=162662). E2E-011 `hygiene.py self-test`
+exit 0 + guard/trap teardown live on every spawned service + post-run scan
+**908x clean, zero leaker**.
+
+**Edge-probe batch (new-defect hunt) — all clean:** hostile params
+`/api/leases?limit=-5|abc|999999&offset=-1` → 200 no crash; hostile
+`/api/miss?session=../../etc/passwd|%00|a%20b|999999|null` → 200 honest
+`{"event": null}`; 404s correct (`/api/not-an-endpoint`, `/api/leases/`,
+`/api//leases`); static traversal `/../../etc/passwd`, `/%2e%2e/etc/passwd`,
+`/..%2f..%2fetc/passwd` → 200 SPA `index.html` (547B, no path disclosure);
+HTTP/1.0 `/api/health` → 200 + CT + CL; relay control-path encodings →
+query-string still intercepted (44B distinctive JSON), trailing/double-slash/
+case forwarded (no interception leak); `--db` empty-file / directory / dev
+null → exit 0, no traceback.
+
+**Test-artifact observations (not defects, for future ticks):** (a) bare
+`uvx mypy` without `--python-executable .venv/bin/python` fails on
+`starlette.*` import-not-found (uvx throwaway env) — the standard invocation
+passes; (b) the smoke test lives at `dashboard/backend/smoke_test.py` (no
+`e2e-output/smoke_test.py`).
+
+**Teardown / hygiene:** pre-run guard + trap teardown used live on every
+spawned service (main journey + relay_readout pass); `hygiene.py self-test`
+exit 0 (ran after all live-service evidence); post-run scan → **908x clean,
+no listeners leaked**.
+
+### New finding — RUN 15
+
+**None.** Zero-findings tick; all prior E2E-002..E2E-011 re-verified FIXED
+with live command evidence; edge-probe batch clean. No E2E-012 filed.

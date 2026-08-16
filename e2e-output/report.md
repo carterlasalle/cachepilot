@@ -1112,3 +1112,111 @@ filed.
    honestly.
 5. no implementation logic modified; test-only artifacts + report + tasks.md
    + board note committed and pushed.
+
+## Run 15 — CLI/API variant (2026-08-16) — gates green, all prior re-verified FIXED, zero new finding
+
+Date: 2026-08-16 · Repo: cachepilot @ main (test-only tick) · Worker: DS-V4-Flash (CLI/API)
+
+Scope: fresh deploy (quality gate), full live user journey (relay, dashboard
+backend, all 8 CLI reads), regression re-verification of E2E-002..E2E-011, and
+an edge-probe batch hunting for a new gap. **Zero new findings — no E2E-012
+filed.** E2E-011's test-hygiene guard/teardown used live throughout on every
+spawned service (908x clean pre-run, trap-killed, no leaker post-run).
+
+### 1. Quality gate — PASS
+
+```
+uv sync --group dev                    → Resolved 33 packages / Checked 32, OK
+.venv/bin/python -m pytest -x -q       → 488 passed in 77.98s
+.venv/bin/python -m ruff check src/ packages/ dashboard/backend/ e2e-output/hygiene.py
+                                       → All checks passed! (exit 0)
+uvx mypy --python-executable .venv/bin/python --native-parser
+     --python-version 3.12 --follow-imports=skip src packages → Success: no issues in 74 files
+cd dashboard && yarn build             → ✓ 43 modules transformed, built in 1.97s
+.venv/bin/python dashboard/backend/smoke_test.py
+                                       → SMOKE TEST PASSED, 144 PASS lines, exit 0
+```
+
+488 = 482 base + 6 E2E-011 hygiene tests. All green. Two test-artifact notes
+(not defects): (a) the bare `uvx mypy --native-parser … src packages` spelling
+in the task fails on `starlette.*` import-not-found because `uvx` runs mypy in
+a throwaway env; with `--python-executable .venv/bin/python` (all prior runs'
+invocation) it is `Success, no issues found in 74 source files`; (b)
+`e2e-output/smoke_test.py` does not exist — the smoke test is
+`dashboard/backend/smoke_test.py` (path used by all prior runs).
+
+### 2. Live user journey — PASS (fresh current-build services)
+
+Relay 9082 → mock 9081 (byte-echo `x-upstream-marker: mock`):
+
+- control `GET /cachepilot/health` **intercepted** with distinctive JSON
+  `{"service":"cachepilot-relay","status":"ok"}` (content-length 44).
+- GET `/upstream/resource` — **byte-identical pass-through proven with `cmp`**:
+  direct upstream body 32B == relay body 32B (both
+  `{"ok": true, "upstream": "mock"}`), marker present.
+- POST `/upstream/posts` body `{"payload":"echo-me-15"}` — **byte-identical
+  via `cmp`**: direct 24B == relay 24B, marker present.
+- upstream **503 forwarded byte-identical** through relay 9097→9092: direct
+  HTTP 503 body 0B, relay HTTP 503 body 0B.
+
+Dashboard backend 9083 on the seeded telemetry DB: **all 9 `/api/*` GET**
+(`health`, `status`, `leases`, `costs`, `ttl`, `churn`, `routes`, `topology`,
+`miss`) return **real seeded JSON** (`/api/status` stats.total=3,
+`/api/leases` populated 1022B, `/api/costs` total_usd=0.00033, ttl 572B,
+churn 1329B, routes 588B, topology 1764B, miss 762B). All 8 CLI read commands
+(`status/leases/costs/ttl/churn/explain-miss/routes/topology`) consistent;
+seeded DB sha `c44d5c28…` byte-stable before/after all reads (read-only
+proven).
+
+### 3. Re-verify all prior findings — FIXED (live evidence)
+
+| Finding | Result | Live evidence |
+|---------|--------|---------------|
+| E2E-002 | **FIXED** | `CACHEPILOT_RELAY_LISTEN=127.0.0.1:9082` → `Relay: healthy`; `=127.0.0.1:9998` (closed) → `Relay: unreachable`; `=127.0.0.1:9091` (foreign listener) → `Relay: unreachable`. `cachepilotd --listen 127.0.0.1:9089` (held) → **exit 2** naming port + `--listen`/`CACHEPILOT_RELAY_LISTEN` override; `server.py --port 9084` (held) → **exit 2** "already in use". |
+| E2E-003 | **FIXED** | POST/PUT/DELETE/PATCH /api/status → **405 application/json; charset=utf-8**, body `{"error": "the dashboard backend is read-only (GET only)"}`. |
+| E2E-004 | **FIXED** | `status --db /tmp/r15-noclidb/nope.db` → exit 0, honest-empty notice, **no file / no parent dir** created. |
+| E2E-005 | **FIXED** | `status` → `churn events 2` + `route-change churn events 0` footnote; `routes` → `route switches 1` (disambiguated; churn total varies 1..2 per seed timestamp, footnote + switch count stable). |
+| E2E-006 | **FIXED** | `styles.css:414 @media (max-width: 768px) {` present + built bundle `@media (max-width: 768px){` (code/build). |
+| E2E-007 | **FIXED** | OPTIONS/TRACE /api/status → 405 JSON; uniform with POST/PUT/DELETE/PATCH. |
+| E2E-008 | **FIXED** | Corrupt random-bytes DB → all 8 CLI exit 0, no traceback, no "no such table"; dashboard `/api/*` (9086) → **200 `{"leases": []}`** empty JSON. |
+| E2E-009 | **FIXED** | Wrong-schema DB → all 8 CLI exit 0, no traceback; dashboard `/api/*` (9087) → **200 `{"leases": []}`** empty JSON. |
+| E2E-010 | **FIXED** | HEAD `/api/health` → 200 CL=12 0B; `/api/leases` → 200 CL=1022 0B; `/` → 200 CL=547 0B; **real asset `/assets/index-NcpMpYl1.js` → 200 CL=162662, body 0B**. |
+| E2E-011 | **FIXED** | `hygiene.py self-test` exit 0; pre-run guard + trap teardown live on every service (twice: main journey + relay_readout pass); post-run scan → **908x clean, zero leaker**. |
+
+### 4. Edge probes — all clean, no new defect
+
+Hostile params `/api/leases?limit=-5|abc|999999&offset=-1` → 200 honest JSON
+no crash; hostile `/api/miss?session=../../etc/passwd|%00|a%20b|999999|null`
+→ 200 honest `{"event": null, ...}` JSON; 404s correct
+(`/api/not-an-endpoint`, `/api/leases/`, `/api//leases`); static traversal
+`/../../etc/passwd`, `/%2e%2e/etc/passwd`, `/..%2f..%2fetc/passwd` → 200 SPA
+`index.html` (547B, no path disclosure); HTTP/1.0 `/api/health` →
+`HTTP/1.0 200 OK` + `Content-Type: application/json; charset=utf-8` +
+`Content-Length: 12`; relay control-path encodings → query-string
+`/cachepilot/health?x=1` still intercepted (44B distinctive JSON),
+trailing-slash `/cachepilot/health/`, double-slash `/cachepilot//health`, case
+`/CachePilot/health` all forwarded upstream (32B mock body) — no interception
+leak; `--db` empty-file / directory-as-db / `/dev/null` → honest-empty exit 0,
+no traceback. No code/implementation changed.
+
+### 5. New finding
+
+**None.** Verdict: all eleven prior findings (E2E-002..E2E-011) re-verified
+FIXED with live command evidence; edge probes per task. Test-artifact
+observations (mypy bare-`uvx` env resolution needing `--python-executable`;
+smoke-test real path `dashboard/backend/smoke_test.py`) recorded for future
+ticks — not product defects. No E2E-012 filed.
+
+### 6. Acceptance criteria
+
+1. gates green — YES (488 pytest 77.98s, ruff All checks passed, mypy 74 files
+   clean, yarn build 43 modules, smoke_test 144 PASS exit 0).
+2. full user journey — YES (relay 9082→9081 pass-through byte-identical via
+   cmp GET + POST + upstream 503, control health 200 distinctive JSON,
+   dashboard 9083 all 9 /api/* real JSON, all 8 CLI reads consistent, seeded
+   DB byte-stable).
+3. E2E-002..E2E-011 re-verified FIXED — YES (11/11, live evidence).
+4. new findings filed — NO new findings this run; zero-findings tick reported
+   honestly.
+5. no implementation logic modified; test-only artifacts + report + tasks.md
+   + board note committed and pushed.
