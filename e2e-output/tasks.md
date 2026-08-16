@@ -336,3 +336,94 @@ as the E2E-002 occupancy live-check.
 - Full CLI/API user journey on the seeded DB consistent: all 8 CLI commands return real, mutually consistent data (`status` 3 requests / 50.0% / churn 1; `leases` ARMED 118s/300s; `costs` $0.000330 openai; `ttl` 288s/120-600s/conf 0.85/survival P=1.00; `routes` 1 switch / route_instability; `churn` tools+cache key / "tool list mutation"; `explain-miss` cause+conf 0.82+~1234 tokens; `topology` 2 sessions / 1 pair / tool schemas 0.0%). All 9 `/api/*` GET endpoints return real JSON; write methods / HEAD/OPTIONS/TRACE all 405 JSON, HEAD body 0 bytes.
 - Relay pass-through live-verified this tick: `GET /hello` and `POST /v1/chat/completions` forwarded to the mock upstream byte-identical; relay control `GET /cachepilot/health` intercepted (distinctive JSON) while `HEAD`/`POST /cachepilot/health` and non-control paths pass through unchanged.
 - Browser/visual at 320/768/1280px and live console: NOT re-run this tick (CLI/API variant; browser follow-up lives with the Luna variant as in prior runs). E2E-006 verified by code/build state only.
+
+---
+
+## RUN 9 — 2026-08-16 — CLI/API variant (E2E-001-R9)
+
+Run date: 2026-08-16 · repo `main` (E2E-001-R9 tick) · CLI/API E2E variant
+(no browser). Fresh deploy + full CLI/API user journey against a live relay
+and live dashboard backend; re-verify all prior findings (E2E-002..E2E-009);
+hunt for new protocol/contract-level gaps on the read path. Test-only tick
+— no source modified; only `e2e-output/report.md`, `e2e-output/tasks.md`,
+`.coding-hermes/tasks.md`, and test fixtures under `e2e-output/run9/` changed.
+
+**Verdict: 1 new LOW finding (E2E-010). All eight prior findings
+E2E-002..E2E-009 re-verified as no-longer-reproducing (fixed).** No fabricated
+numbers; the seeded store served honest, mutually consistent data on every
+surface.
+
+### Re-verification of prior findings — ALL FIXED
+
+| ID | Severity | Result | Evidence (live) |
+|----|----------|--------|-----------------|
+| E2E-002 | MEDIUM | **FIXED** | `cachepilot status` with relay on 9082 → `Relay: healthy`; `CACHEPILOT_RELAY_LISTEN=127.0.0.1:9099` (closed) → `unreachable`; default (8787 squatted foreign python) → `occupied by another service` (never `healthy`). Relay control `GET /cachepilot/health` → `{"service":"cachepilot-relay","status":"ok"}`; `HEAD`/`POST /cachepilot/health` pass through upstream (narrow PRD §27). Startup occupant detection covered by smoke PASS. |
+| E2E-003 | LOW | **FIXED** | `POST`/`PUT`/`DELETE`/`PATCH /api/leases` → **405 application/json; charset=utf-8** read-only refusal body. |
+| E2E-004 | LOW | **FIXED** | All 8 `cachepilot <cmd> --db /tmp/r9-missing/telemetry.db` → honest stderr notice + empty output, **exit 0**, **no file/parent dir created**. |
+| E2E-005 | LOW | **FIXED** | `status` → `route-change churn events 0` + footnote; `routes` → `route switches 1`. Disambiguated. |
+| E2E-006 | MEDIUM | **FIXED** | `dashboard/src/styles.css:414` `@media (max-width:768px)` mobile collapse; code/build state confirms. |
+| E2E-007 | LOW | **FIXED** | `OPTIONS`/`TRACE` → 405 JSON; `HEAD /api/leases` → 405 + JSON + `Content-Length: 58`, **0 body bytes**. |
+| E2E-008 | LOW | **FIXED** | Corrupt DB → all CLI exit 0 no traceback + honest empty; all `/api/*` (9086) 200 empty JSON. |
+| E2E-009 | LOW | **FIXED** | Wrong-schema SQLite DB → all 8 CLI exit 0 + stderr schema notice, no crash/leak; all `/api/*` (9087) 200 empty JSON (smoke 28 asserts). |
+
+### New finding
+
+| ID | Severity | Component | Summary |
+|----|----------|-----------|---------|
+| E2E-010 | LOW | dashboard backend (server.py `do_HEAD` → `_write_refused`) | **Every dashboard resource that returns 200 to GET answers `HEAD` with 405 + read-only JSON**, contradicting RFC 9110 §9.3.2 (HEAD must mirror GET: identical status + headers, no body). The E2E-003→E2E-007 uniform-405 fix was correct for mutating methods (POST/PUT/DELETE/PATCH/TRACE) but over-broadened to HEAD, a read-only method — so a `curl -I`/HEAD-based liveness check on `/`, `/api/health`, or any `/api/*` GET cannot confirm the dashboard is serving. |
+
+## E2E-010 — LOW — Dashboard backend answers 405 to HEAD on every GET-200 resource (RFC 9110 §9.3.2 violation)
+
+- **Component**: `dashboard/backend/server.py` `Handler.do_HEAD` → routes to
+  `_write_refused(body=False)`. The body-suppression part is correct (HEAD
+  omits the body) but the status/contract is wrong: HEAD is a read-only
+  (GET-equivalent) method and must not be refused on a resource the backend
+  is actively serving via GET.
+- **Reproduction** (live, seeded dashboard on 9083):
+  ```
+  GET  /                    200 text/html         HEAD /                    405 application/json "read-only"
+  GET  /leases (SPA)        200                    HEAD /leases              405 application/json
+  GET  /assets/index-*.js   200 text/javascript   HEAD /assets/index-*.js    405 application/json
+  GET  /api/health          200 {"ok":true}       HEAD /api/health          405 application/json
+  GET  /api/leases          200 [...]             HEAD /api/leases          405 application/json
+  ```
+  `curl -s -I http://127.0.0.1:9083/` → `HTTP/1.0 405 Method Not Allowed`,
+  `Content-Type: application/json; charset=utf-8`, `Content-Length: 58`
+  (the read-only refusal body announced but not transmitted — HEAD semantics).
+- **Expected**: RFC 9110 §9.3.2 — HEAD is identical to GET except the server
+  MUST NOT send content. So HEAD on any GET-200 resource returns **200** with
+  the same headers GET would send, no body. A `curl -I`/HEAD health check
+  should confirm the dashboard is up and serving.
+- **Actual**: HEAD is classified with the write-refusal methods → **405** on a
+  read-only probe of a resource that GET-returns 200. Read-only integrity IS
+  preserved (nothing written; seeded DB sha `636bbf30…` byte-stable across all
+  GET + HEAD probes). Severity LOW: no data loss / no mutation; it is an
+  HTTP-semantics contract defect and a practical gap for HEAD-based health /
+  liveness monitoring (`curl -I`, some authed/proxy checkers).
+- **Context / why it escaped prior runs**: the E2E-003 fix correctly made
+  POST/PUT/DELETE/PATCH a machine-readable JSON 405, and E2E-007 (RUN 3)
+  extended this to OPTIONS/TRACE/HEAD stating "HEAD omits the body but carries
+  the JSON content-type" — that run asserted HEAD as **405**, treating it with
+  the mutating bans. It did not check the GET-mirror semantic for HEAD, so the
+  over-broadening was baked in and smoke_test.py only asserts HEAD → 405.
+- **Suggested fix direction** (NOT changed this tick — tester): in `do_HEAD`,
+  for any path that GET would serve with 200 (root/SPA fallback, static asset,
+  `/api/*` GET endpoint), implement HEAD semantics by running the GET handler
+  logic and suppressing the body (status 200, same headers, Content-Length of
+  the would-be body, 0 body bytes). Keep 405 for truly-mutating methods
+  (POST/PUT/DELETE/PATCH/TRACE) and for HEAD on an unknown/invalid route
+  (`/api/not-an-endpoint` should stay 404/405 as appropriate). Extend
+  `smoke_test.py` with a HEAD-on-read assertion (e.g. `/api/health` and `/`
+  → 200, empty body) so the contract is gate-visible; update `docs/dashboard.md`
+  (currently "every non-GET method (…/HEAD) is refused" at line 108/145).
+
+### RUN 9 zero-finding areas / gates
+
+- Quality gate: **482 pytest passed (41.53s)**; `ruff check src/ packages/ dashboard/backend/` → "All checks passed!"; mypy (CI invocation) → Success, 74 files; `uv sync --group dev` clean.
+- Frontend gate: `cd dashboard && yarn build` → **43 modules transformed**, built in 1.98s, dist emitted.
+- `dashboard/backend/smoke_test.py` → **SMOKE TEST PASSED** (seeded + empty + corrupt + wrong-schema + relay probe + startup occupant detection + 7-method 405 + byte-identical read-only DB).
+- Full CLI/API user journey on the seeded DB consistent: all 8 CLI commands return real, mutually consistent data; all 9 `/api/*` GET endpoints return real JSON.
+- Relay pass-through byte-identical live-verified: `GET /hello` and `POST` bodies byte-identical direct (9081) vs via relay (9082); upstream `x-upstream-marker: mock` preserved; control `GET /cachepilot/health` intercepted while `HEAD`/`POST /cachepilot/health` pass through upstream. Relay's default telemetry store (`~/.hermes/cachepilot/cachepilot.db`) written while relaying (observation fail-open preserved) — recorded, not a bug.
+- Edge probes clean: empty-string `CACHEPILOT_TELEMETRY_DB` → honest default (`~/.hermes/cachepilot/cachepilot.db`) handle, no stray root file; `--db` on a directory path → honorable empty, exit 0; bogus/negative query params (`/api/leases?limit=-5`) → still 200 JSON; `/api/miss?session=` with `999999`/`null`/path-traversal → honest `{"event": null}`; `Accept: text/plain` → still JSON 200; HTTP/1.0 `/api/health` → 200 + Content-Length.
+- Read-only proof: seeded DB sha `636bbf30…` byte-identical across all live reads + relay path.
+- Browser/visual at 320/768/1280px and live console: NOT re-run this tick (CLI/API variant); E2E-006 verified by code/build state only.

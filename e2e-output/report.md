@@ -505,3 +505,141 @@ in `e2e-output/tasks.md` and on the board.
 3. all 8 prior findings re-verified fixed — YES (E2E-002..E2E-008).
 4. new findings filed with exact reproduction — YES (E2E-009).
 5. No source, CLI, relay, or backend code modified — YES (only report/tasks/board).
+
+---
+
+## RUN 9 — CLI/API variant (2026-08-16)
+
+Run date: 2026-08-16 · repo `main` (E2E-001-R9 tick) · CLI/API E2E variant
+(no browser). Fresh deploy: `uv sync --group dev` clean, **482 pytest passed
+(41.53s)**, `ruff check src/ packages/ dashboard/backend/` → "All checks
+passed!", mypy clean (74 files), `yarn build` → **43 modules transformed**,
+`dashboard/backend/smoke_test.py` → **SMOKE TEST PASSED**. Live relay
+(`cachepilotd` 127.0.0.1:9082 → mock upstream 9081) + live dashboard backend
+(9083) on a seeded temp telemetry DB under `e2e-output/run9/` (seeded via
+`seed.py` → exact `seed_store()` fixture from smoke_test). Ports 8787/8788 are
+squatted by foreign processes on this host (hermes-webui / `mcp serve`), used
+as the E2E-002 occupancy live-check. All services were killed after the tick;
+the seeded DB (a binary artifact) was not committed.
+
+### 1. Quality gate (deploy/build) — PASS
+
+```
+uv sync --group dev   → Resolved 33 packages, OK
+uv run pytest -q      → 482 passed in 41.53s
+uv run ruff check src/ packages/ dashboard/backend/ → All checks passed!
+uvx mypy --python-executable .venv/bin/python --native-parser
+     --python-version 3.12 --follow-imports=skip src packages → Success, 74 files
+cd dashboard && yarn build → tsc --noEmit && vite build: ✓ 43 modules transformed, built in 1.98s
+uv run python dashboard/backend/smoke_test.py → SMOKE TEST PASSED
+```
+
+Full suite green (P00–P12). No pre-existing or new failures.
+
+### 2. Live relay pass-through — PASS, re-verified E2E-002
+
+`cachepilotd --listen 127.0.0.1:9082 --upstream http://127.0.0.1:9081`
+(mock upstream on 9081, byte-echo + `x-upstream-marker: mock`).
+
+| Check | Result |
+|---|---|
+| `GET /hello` direct (9081) vs via relay (9082) | body `{"ok": true, "upstream": "mock"}` **byte-identical** (`cmp` OK), upstream `x-upstream-marker: mock` header preserved |
+| `POST /v1/chat/completions` body echo | echoed **byte-identical** direct vs via relay |
+| Relay readout `status` (relay on 9082) | `Relay: healthy` |
+| Relay readout `CACHEPILOT_RELAY_LISTEN=127.0.0.1:9099` (closed) | `Relay: unreachable` |
+| Relay readout default (8787 squatted foreign python) | `Relay: occupied by another service` (never `healthy`) |
+| Control `GET /cachepilot/health` via relay | `{"service":"cachepilot-relay","status":"ok"}` (intercepted) |
+| Control `HEAD` / `POST /cachepilot/health` | pass through upstream unchanged (narrow PRD §27 GET-only interception) |
+
+### 3. Live dashboard backend — PASS, re-verified E2E-003/E2E-007
+
+Started on the seeded DB at 9083. All 9 `/api/*` GET endpoints return real
+JSON: `/api/status` (total=3, hit_rate=0.5, providers=[anthropic,openai],
+plugin=active, relay=occupied-by-foreign-default), `/api/leases` (1 ARMED,
+cache_age≈100s), `/api/costs` ($0.000330, openai), `/api/ttl` (288s,
+120–600s, conf 0.85), `/api/routes` (1 route_instability switch),
+`/api/churn` (tools+cache-key, "tool list mutation"), `/api/miss`
+(cause+conf 0.82+~1234 tokens), `/api/topology` (2 sessions, 1 pair,
+tool schemas 0.0%), `/api/health` `{"ok":true}`.
+
+Write-refusal (identical to RUN 7): `POST`/`PUT`/`DELETE`/`PATCH`/
+`OPTIONS`/`TRACE /api/leases` → **405 `application/json; charset=utf-8`**
+`{"error":"the dashboard backend is read-only (GET only)"}`; `HEAD` → 405 +
+JSON content-type + `Content-Length: 58`, **0 body bytes** (HTTP HEAD
+semantics). `GET /` → 200 text/html; `/leases` SPA fallback → 200;
+`/assets/index-NcpMpYl1.js` → 200 text/javascript; unknown `/api/*` → 404.
+
+### 4. Live CLI — PASS, re-verified E2E-004/E2E-005
+
+All 8 read commands on the seeded DB return real, mutually consistent output
+(same fixture values as RUN 7). 
+
+E2E-004 re-verified: all 8 `cachepilot <cmd> --db /tmp/r9-missing/telemetry.db`
+print the read-only stderr notice naming the path + honest empty output,
+**exit 0**, and **no file / no parent dir created** (`ls` confirms). Note: the
+stderr notice is on stderr while stdout carries the honest empty report.
+
+E2E-005 re-verified: `status` → `route-change churn events 0` **+ footnote**
+("= churn events attributed to a route change (churn_events.route_changed);
+all observed switches: cachepilot routes"); `routes` → `route switches 1`.
+
+### 5. Re-verify E2E-008 — FIXED
+
+Corrupt/garbage DB (`printf 'this is not a sqlite database' > /tmp/r9-corrupt.db`):
+all 8 CLI reads → stderr "is corrupt or not SQLite — treating it as an empty
+store" notice + honest empty output, **exit 0, no traceback**; dashboard
+`/api/*` on the corrupt DB (9086) → all **200 empty JSON** (status total=0
+hit_rate=null providers=[], leases [], costs 0.0, ttl [], routes empty churn
+zero-layers miss event=null topology zeros).
+
+### 6. Re-verify E2E-009 — FIXED
+
+Wrong-schema SQLite DB (`CREATE TABLE unrelated (id INTEGER PRIMARY KEY,
+name TEXT)`): all 8 CLI reads (status/churn/explain-miss/leases/costs/routes/
+topology/ttl) → stderr "is corrupt, not SQLite, or lacks the expected telemetry
+schema — treating it as an empty store" notice + honest empty output, **exit 0,
+no traceback, no "no such table" leak**; dashboard `/api/*` on the wrong-schema
+DB (9087) → all **200 empty JSON** (status total=0 providers=[], leases []).
+(smoke 28 asserts green.)
+
+### 7. Re-verify E2E-006 — FIXED (by code/build state)
+
+`dashboard/src/styles.css:414` `@media (max-width: 768px)` collapses the 230px
+`.sidebar` into a row sticky top nav and reflows to single column; desktop
+≥768px untouched. Browser render not re-run in this CLI/API variant.
+
+### 8. New finding → E2E-010 (LOW)
+
+**Every dashboard resource that GET-returns 200 answers `HEAD` with 405 +
+read-only JSON**, contradicting RFC 9110 §9.3.2 (HEAD must mirror GET:
+identical status + headers, no body). The E2E-003→E2E-007 uniform-405 fix was
+correct for mutating methods (POST/PUT/DELETE/PATCH/TRACE) but over-broadened
+to HEAD, a read-only method. Reproduced live on 9083:
+
+```
+GET  /                    200 text/html         HEAD /                    405 application/json "read-only"
+GET  /leases (SPA)        200                    HEAD /leases              405 application/json
+GET  /assets/index-*.js   200 text/javascript   HEAD /assets/index-*.js    405 application/json
+GET  /api/health          200 {"ok":true}       HEAD /api/health          405 application/json
+GET  /api/leases          200 [...]             HEAD /api/leases          405 application/json
+```
+
+`curl -s -I http://127.0.0.1:9083/` → `HTTP/1.0 405`, `Content-Type:
+application/json; charset=utf-8`, `Content-Length: 58` (refusal body announced
+but not transmitted). Expected: 200 with GET headers, no body. Actual: 405.
+Impact: a `curl -I`/HEAD-based liveness or cache check on the dashboard
+(`/`, `/api/health`, any `/api/*` GET) cannot confirm the service is serving.
+LOW severity: read-only integrity preserved (DB sha `636bbf30…` stable under
+all GET + HEAD probes), no mutation risk. Full repro + fix direction
+(start HEAD → run GET logic + suppress body; keep 405 for mutating methods AND
+for HEAD on unknown null routes) filed as E2E-010 in `e2e-output/tasks.md` and
+on the board.
+
+### 9. Acceptance criteria
+
+1. gates ran green — YES (ruff pass; 482 pytest; mypy; yarn build; smoke test PASS).
+2. e2e-output/report.md + tasks.md carry RUN 9 evidence — YES.
+3. all 8 prior findings re-verified fixed — YES (E2E-002..E2E-009).
+4. new findings filed with exact reproduction — YES (E2E-010).
+5. No source, CLI, relay, or backend code modified — YES (only report/tasks)
+   and only test-only fixtures added under e2e-output/run9/.
