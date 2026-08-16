@@ -522,3 +522,49 @@ principle; POST/OPTIONS and non-control HEAD still pass through.
   `dashboard/backend/server.py` test process is already listening, so a stale
   process cannot silently become the "live" target; (c) treat the 908x
   ephemeral range as reserved test-only and document it.
+
+### RUN 12 (2026-08-16) — no new finding; all ten prior FIXED
+
+**Verdict: no new finding this run — a zero-findings tick.** All prior
+E2E-002..E2E-011 re-verified FIXED with live command evidence (run12 artifacts
+under e2e-output/run12/). Edge-probe batch clean. No E2E-012 filed.
+
+| ID | Severity | Result | Evidence (live, 9082/9083) |
+|----|----------|--------|-----------------|
+| E2E-002 | MEDIUM | **FIXED** | healthy/unreachable/occupied readouts via CACHEPILOT_RELAY_LISTEN; cachepilotd on 9083 and server.py on 9097 both **exit 2** with actionable errors naming port + override. Relay control GET /cachepilot/health intercepted (distinct JSON); POST-on-control + OPTIONS + non-control HEAD pass through. |
+| E2E-003 | LOW | **FIXED** | POST/PUT/DELETE/PATCH /api/health -> **405 application/json** read-only refusal. |
+| E2E-004 | LOW | **FIXED** | status --db /tmp/r12-nodb/... exit 0, honest-empty notice, no file / no parent dir; --db dir + /dev/null honest-empty exit 0. |
+| E2E-005 | LOW | **FIXED** | status route-change churn events 0 + footnote; routes route switches 1. |
+| E2E-006 | MEDIUM | **FIXED** | styles.css:414 @media (max-width:768px) present in source AND built CSS (code/build). |
+| E2E-007 | LOW | **FIXED** | OPTIONS/TRACE -> 405 JSON; uniform with POST/PUT/DELETE/PATCH. |
+| E2E-008 | LOW | **FIXED** | Corrupt random-bytes DB -> all 8 CLI reads exit 0 no traceback; dashboard /api/* (9086) 200 empty JSON. |
+| E2E-009 | LOW | **FIXED** | Wrong-schema (unrelated table) -> all 8 CLI reads exit 0, no traceback, no "no such table"; dashboard /api/* (9087) 200 empty JSON. |
+| E2E-010 | LOW | **FIXED** | HEAD /api/health, /, /leases, /assets/*.js -> 200, 0 body, content-length mirrors GET. |
+| E2E-011 | LOW | **FIXED** | hygiene.py self-test exit 0; guard + trap teardown used live on every spawned service; post-run ss confirms 908x clean, no leaker. |
+
+**Gate + journey** (all green, live): uv sync --group dev clean; **488 pytest
+passed (-x -q, 55.44s)**; ruff check src/ packages/ dashboard/backend/ -> All
+checks passed!; mypy (uvx --native-parser --python-version 3.12
+--follow-imports=skip src packages) -> Success, 74 files; yarn build -> 43
+modules (1.75s); smoke_test.py -> SMOKE TEST PASSED (144 PASS, exit 0); relay
+9082->9081 pass-through GET/POST byte-identical incl. upstream **503 forwarded
+byte-identical** (relay 9097->9092); dashboard 9083 all 9 /api/* real JSON;
+all 8 CLI read commands consistent; seeded DB sha e11c5b66e627... byte-stable
+(read-only).
+
+**Edge probes clean** (no new defect): Accept: text/plain -> JSON; /api/leases
+limit=-5|abc|999999, offset=-1 -> 200; /api/miss hostile values -> honest
+{event:null}; /api/not-an-endpoint 404, /api/leases/ 404, bare /api 200 SPA;
+traversal %2e%2e/etc/passwd -> index.html (no disclosure); relay control-path
+query-string/trailing-slash/double-slash answered 200 no interception leak;
+CLI --db directory + /dev/null -> honest-empty exit 0.
+
+**Observations (recorded, NOT defects):** none new this run — the two cosmetic
+quirks seen in Run 11 (uv run ruff check src/ printing [], relay local
+HEAD-mirror on the control path) are unchanged and documented; neither affects
+the gate verdict.
+
+### New finding — RUN 12
+
+**None.** Zero-findings tick; all prior E2E-002..E2E-011 re-verified FIXED.
+No E2E-012 task added to the board.
