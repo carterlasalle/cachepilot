@@ -13,7 +13,10 @@ every commit to a `gitreins task complete`.
 
 | ID | Task | Pri | Cpx | Deps | Tags | Model | Reasoning | Fallback |
 |----|------|-----|-----|------|------|-------|-----------|----------|
-| E2E-001 | E2E Testing Tick (self-improving loop) — spawn Luna (browser/screenshots) or Step 3.7 Flash (CLI/API). Deploy/build, Playwright, screenshots, endpoints, console. → e2e-output/tasks.md → inject into board. Every 5-10 ticks. Run 1 (2026-08-13, e838b28): 463 pytest pass, smoke 52/52, yarn build ✓, relay pass-through ✓, 4 findings → E2E-002..005. Run 2 (2026-08-13, 3300078, browser/Luna variant): console clean, visual at 1280/768/320px, live polling ✓, read-only contract ✓, 1 finding → E2E-006 (fixed 1095a97, judge PASS e210e179). Run 3 (2026-08-15, 064c098, CLI/API): 482 pytest, smoke ✓, all gates green; E2E-002..006 re-verified FIXED; 1 new finding → E2E-007. Run 4 (2026-08-15, 42249bb via E2E-007 fix): re-verified 405 contract exhaustive. Run 5 (2026-08-15, this tick, CLI/API): 482 pytest, ruff/mypy, yarn build (43 modules), smoke ✓; E2E-002..007 re-verified FIXED; 1 new finding → E2E-008 (corrupt-DB contract). Run 6 (2026-08-15, 449c76b via E2E-008 fix): re-verified corrupt-DB contract closed — all 8 CLI read commands + /api/* return honest empty on a corrupt/non-SQLite DB. Run 7 (2026-08-16, this tick, CLI/API): 482 pytest, ruff, yarn build (43 modules), smoke ✓; E2E-002..008 re-verified FIXED; 1 new finding → E2E-009 (wrong-schema SQLite crashes CLI + 500 on dashboard). Run 8 (2026-08-16, 2a56880 via E2E-009 fix): E2E-009 wrong-schema contract re-verified CLOSED (28 smoke asserts). Run 9 (2026-08-16, this tick, CLI/API): 482 pytest/mypy/ruff/yarn build (43 modules)/smoke ✓; E2E-002..009 re-verified FIXED (healthy/unreachable/occupied relay, 405 contract + HEAD 0-body, no stray --db, churn-vs-switches, corrupt + wrong-schema all honest-empty exit 0 / 200 empty JSON); 1 new finding → E2E-010 (dashboard HEAD 405 on every GET-200 resource — RFC 9110 §9.3.2 mirror-GET violated; over-broadened write-refusal from E2E-003/007). Run 10 (2026-08-16, this tick via E2E-010 fix 9bc2616): re-verified HEAD-mirrors-GET closed (live curl -I /api/health → 200, 0 body; smoke 144 PASS exit 0 incl. HEAD section). Next run: every 5-10 ticks. | High | 4±1 | P12 | ++testing, +browser, +vision | GPT-5.6 Luna | Visual verification | Step 3.7 Flash |
+| E2E-001 | E2E Testing Tick (self-improving loop) — spawn Luna (browser/screenshots) or Step 3.7 Flash (CLI/API). Deploy/build, Playwright, screenshots, endpoints, console. → e2e-output/tasks.md → inject into board. Every 5-10 ticks. Run 1 (2026-08-13, e838b28): 463 pytest pass, smoke 52/52, yarn build ✓, relay pass-through ✓, 4 findings → E2E-002..005. Run 2 (2026-08-13, 3300078, browser/Luna variant): console clean, visual at 1280/768/320px, live polling ✓, read-only contract ✓, 1 finding → E2E-006 (fixed 1095a97, judge PASS e210e179). Run 3 (2026-08-15, 064c098, CLI/API): 482 pytest, smoke ✓, all gates green; E2E-002..006 re-verified FIXED; 1 new finding → E2E-007. Run 4 (2026-08-15, 42249bb via E2E-007 fix): re-verified 405 contract exhaustive. Run 5 (2026-08-15, this tick, CLI/API): 482 pytest, ruff/mypy, yarn build (43 modules), smoke ✓; E2E-002..007 re-verified FIXED; 1 new finding → E2E-008 (corrupt-DB contract). Run 6 (2026-08-15, 449c76b via E2E-008 fix): re-verified corrupt-DB contract closed — all 8 CLI read commands + /api/* return honest empty on a corrupt/non-SQLite DB. Run 7 (2026-08-16, this tick, CLI/API): 482 pytest, ruff, yarn build (43 modules), smoke ✓; E2E-002..008 re-verified FIXED; 1 new finding → E2E-009 (wrong-schema SQLite crashes CLI + 500 on dashboard). Run 8 (2026-08-16, 2a56880 via E2E-009 fix): E2E-009 wrong-schema contract re-verified CLOSED (28 smoke asserts). Run 9 (2026-08-16, this tick, CLI/API): 482 pytest/mypy/ruff/yarn build (43 modules)/smoke ✓; E2E-002..009 re-verified FIXED (healthy/unreachable/occupied relay, 405 contract + HEAD 0-body, no stray --db, churn-vs-switches, corrupt + wrong-schema all honest-empty exit 0 / 200 empty JSON); 1 new finding → E2E-010 (dashboard HEAD 405 on every GET-200 resource — RFC 9110 §9.3.2 mirror-GET violated; over-broadened write-refusal from E2E-003/007). Run 10 (2026-08-16, this tick via E2E-010 fix 9bc2616): re-verified HEAD-mirrors-GET closed (live curl -I /api/health → 200, 0 body; smoke 144 PASS exit 0 incl. HEAD section). Next run: every 5-10 ticks. Run 11 (2026-08-16, this tick, CLI/API): fresh deploy green — 482 pytest (-x -q, 39.82s), ruff All checks passed, mypy 74 files clean, yarn build 43 modules, smoke_test 144 PASS; live relay 9082→9081 pass-through (GET/POST + upstream 503 byte-identical), dashboard 9083 all 9 /api/* real JSON, 8 CLI reads consistent; E2E-002..010 re-verified FIXED via live evidence (relay healthy/unreachable/occupied + startup occupant detection exit 2 on both daemons, durable 405 contract + HEAD-mirrors-GET 0 body, no stray --db, churn-vs-switches, corrupt + wrong-schema honest-empty); 1 new finding → E2E-011 (test-hygiene leak: run-9 mock upstream + relay still alive on 9081/9082 ~4h after "all killed" — run-11 fresh binds failed and the initial relay footprint ran against the stale survivors; re-verified fresh, leaks killed). | High | 4±1 | P12 | ++testing, +browser, +vision | GPT-5.6 Luna | Visual verification | Step 3.7 Flash |
+| E2E-011 | E2E test-hygiene: E2E ticks leak ephemeral test services across runs — run-9's mock upstream (e2e-output/run9/mock_upstream.py 9081) + relay (cachepilotd 9082) were still alive ~4h after run 9 claimed "all services killed" (survived the E2E-010 fix tick + 10 idle ticks); run-11 fresh binds failed (Address already in use) and its initial relay footprint ran against the stale survivors (functionally identical — re-verified fresh this tick; leaks killed). Fix: trap-based per-tick teardown killing every spawned service + post-run ss/ps clean-check + pre-run guard failing on any listening e2e-output/*/mock_upstream.py / cachepilotd --listen / backend/server.py; 908x reserved test-only. | Low | 1±1 | — | — | DS-V4-Flash | — | — |
+
+## [ ] E2E-011 — E2E ticks leak ephemeral test services across runs (run-9 mock + relay alive ~4h after "all killed"): repro = run-11 fresh binds on 9081/9082 fail "Address already in use" (mock exit 1, relay exit 2) while ss -tlnp shows 127.0.0.1:9081 owned by `python e2e-output/run9/mock_upstream.py 9081` (pid 2955253, started Sat Aug 15 21:59:59) and 127.0.0.1:9082 by `cachepilotd --listen 127.0.0.1:9082 --upstream http://127.0.0.1:9081` (pid 2955310, started 22:00:01) — run-9's report/tasks.md claim "All services were killed after the tick" is thereby contradicted; the survivors made run-11's initial relay footprint verify a stale (though functionally identical) service. Expected: every ephemeral test service (mock upstream, cachepilotd relay, dashboard backend) is killed by tick teardown and the host verified clean before the next run begins. Actual: two test processes from run 9 leaked for ~4 hours across the E2E-010 fix tick + 10 idle ticks until killed during run 11. Fix direction (test-hygiene, NOT product code): (a) each E2E tick wraps its services in trap-based teardown that kills every spawned PID and re-verifies with `ss`/`ps` that no `e2e-output/*/mock_upstream.py`, `cachepilotd --listen`, or `dashboard/backend/server.py` process remains; (b) add a pre-run guard that FAILS (or cleans) when any such test process is already listening, so run N+1 can never silently bind-test a stale service; (c) document the 908x ephemeral port range as reserved test-only.
 
 ## Completed
 
@@ -46,6 +49,52 @@ every commit to a `gitreins task complete`.
 | P-BOOT | Bootstrap — repo, AGENTS.md, docs/PRD.md (full spec), task board, gitreins, hilo, scheduler registration | Critical | 2±1 | — | DS-V4-Flash |
 
 ## Tick Log
+
+- **2026-08-16 (work tick — E2E-001 Run 11, CLI/API)**: Board had only
+  perpetual fixtures but E2E-001 was DUE (Run 10 was the E2E-010 fix tick
+  db37f7b/9bc2616) → picked E2E-001, dispatched the CLI/API E2E worker (Step
+  3.7 Flash / DS-V4-Flash). Worker ran a full CLI/API verification tick:
+  **fresh deploy** (`uv sync --group dev` clean; **482 pytest passed -x -q
+  39.82s**; `ruff check src/ packages/ dashboard/backend/` → All checks passed
+  via .venv binary — the `uv run ruff check src/` form prints a cosmetic `[]`
+  noted as a non-defect observation; **mypy Success 74 files**; `yarn build` →
+  **43 modules** (2.00s); `smoke_test.py` → **SMOKE TEST PASSED, 144 PASS,
+  exit 0**). **Full user journey**: live relay `cachepilotd` 9082 → mock
+  upstream 9081 (GET/POST pass-through **byte-identical**, control `GET
+  /cachepilot/health` distinctive JSON intercepted, + live upstream **503
+  forwarded byte-identical** via a second relay 9097→9092, HEAD/OPTIONS on
+  non-control paths pass through — mock 501 proves forwarding), live dashboard
+  backend 9083 on a seeded temp telemetry DB (all 9 `/api/*` GET endpoints
+  real JSON), all 8 CLI read commands consistent. **All nine prior findings
+  E2E-002..E2E-010 re-verified FIXED** with live command evidence (relay
+  readouts healthy/unreachable/occupied + startup occupant detection exit 2 on
+  **both** daemons with actionable errors; uniform JSON 405 ×6 methods +
+  HEAD-mirrors-GET 200/0-body on /api/health, /, /leases; missing `--db` never
+  created; churn-vs-switches disambiguated; corrupt + wrong-schema → all 8 CLI
+  honest-empty exit 0 no traceback + dashboard 200 empty JSON; 320px media
+  query via code/build state). **1 new finding → E2E-011 (LOW, test-hygiene)**:
+  run-9's mock upstream (`e2e-output/run9/mock_upstream.py 9081`, pid
+  2955253) + relay (`cachepilotd --listen 127.0.0.1:9082`, pid 2955310) were
+  still ALIVE ~4h after run 9 claimed "all services were killed" — run-11's
+  fresh binds failed ("Address already in use", mock exit 1 / relay exit 2)
+  and the initial relay footprint ran against those stale survivors
+  (functionally identical — same installed binary/source — re-verified this
+  tick against freshly-started services, then leaks killed). Fix direction:
+  trap-based per-tick teardown + post-run ss/ps clean-check + pre-run stale-
+  process guard; 908x reserved test-only. Rest of the extended edge-probe
+  batch clean; 2 non-defect observations recorded: (1) `uv run ruff check
+  src/` cosmetic `[]` vs CI-form "All checks passed!" (same binary 0.16.2,
+  exit 0, zero findings); (2) relay answers `HEAD /cachepilot/health` locally
+  as a HTTP-correct GET-mirror via Starlette auto-HEAD on the GET route (RFC
+  9110 §9.3.2, consistent with the E2E-010 principle). Worker committed
+  **test-only** changes (`e2e-output/report.md`, `e2e-output/tasks.md`,
+  `e2e-output/run11/` artifacts + board note + E2E-011 Active task; **NO
+  src/packages/dashboard/backend implementation modified**), then PUSHED and
+  verified remote HEAD (unpushed=0). Board updated (E2E-001 gained Run 11;
+  E2E-011 added to Active). Only perpetual fixtures remain
+  (E2E-001 not due, NEVER-DONE + E2E-011 pending) — foreman layer: gitreins
+  judge + cooldown reset to 43200s (idle) per the established idle-tick
+  pattern.
 
 - **2026-08-16 (idle tick, 6b2a4ee..HEAD)**: Board = only perpetual fixtures (E2E-001 Run 10 was done in the E2E-010 work tick db37f7b — 5 commits ago, window 5-10, not due; NEVER-DONE audit). No real pending work → idle. Git-history cross-ref + GitReins dual-source check: **gitreins task store 0 pending (No tasks found)**, no committed work behind pending board tasks, **upstream synced (unpushed=0, behind=0)**, git clean tree. Lightweight verification (board heavily audited, zero gaps, across prior idle+work ticks this cycle): **482 pytest pass in 40.12s**, **ruff check src/ packages/ dashboard/backend/ All checks passed**, gitreins judge configured (check-gitreins-judge.py PASS, model deepseek/deepseek-v4-flash-0731). CHK8 CI: **3/3 recent runs success** (gh run list fresh, carterlasalle/cachepilot — latest idle-tick chore runs green, no failures). Zero new tasks found. Scheduler cooldown had reverted 43200→900 by daemon ApplyFleetConfig — re-applied **43200s (idle)** via API PUT, verified GET (cooldown_s=43200, enabled=true).
 

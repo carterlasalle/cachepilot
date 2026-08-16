@@ -427,3 +427,88 @@ surface.
 - Edge probes clean: empty-string `CACHEPILOT_TELEMETRY_DB` → honest default (`~/.hermes/cachepilot/cachepilot.db`) handle, no stray root file; `--db` on a directory path → honorable empty, exit 0; bogus/negative query params (`/api/leases?limit=-5`) → still 200 JSON; `/api/miss?session=` with `999999`/`null`/path-traversal → honest `{"event": null}`; `Accept: text/plain` → still JSON 200; HTTP/1.0 `/api/health` → 200 + Content-Length.
 - Read-only proof: seeded DB sha `636bbf30…` byte-identical across all live reads + relay path.
 - Browser/visual at 320/768/1280px and live console: NOT re-run this tick (CLI/API variant); E2E-006 verified by code/build state only.
+
+### RUN 11 (2026-08-16) — 1 new finding (E2E-011); all nine prior FIXED
+
+**Verdict: 1 new LOW finding (E2E-011, test-hygiene process leak).** All prior
+E2E-002..E2E-010 re-verified FIXED with live command evidence (run11 artifacts
+under `e2e-output/run11/`).
+
+| ID | Severity | Result | Evidence (live, 9082/9083) |
+|----|----------|--------|-----------------|
+| E2E-002 | MEDIUM | **FIXED** | `CACHEPILOT_RELAY_LISTEN=127.0.0.1:9082` `status` → `Relay: healthy`; `=127.0.0.1:9099` (closed) → `unreachable`; `=127.0.0.1:9083` (foreign dashboard) → `occupied by another service`. Occupant detection: `cachepilotd` + `server.py` on squatted 9099 both **exit 2** with actionable errors naming port + override. Relay control `GET /cachepilot/health` intercepted; POST/OPTIONS + non-control HEAD pass through (mock 501/echo). |
+| E2E-003 | LOW | **FIXED** | POST/PUT/DELETE/PATCH (/api/leases) → **405 application/json** read-only refusal. |
+| E2E-004 | LOW | **FIXED** | `cachepilot status --db /tmp/r11-nodb/telemetry.db` → exit 0, stderr notice, honest empty; `ls` proves **no file / no parent dir created**. `--db` directory and `--db /dev/null` → same honest-empty exit 0. |
+| E2E-005 | LOW | **FIXED** | `status` → `route-change churn events 0` + footnote; `routes` → `route switches 1`. |
+| E2E-006 | MEDIUM | **FIXED** | `dashboard/src/styles.css:414` `@media (max-width:768px)` collapse; code/build state (yarn 43 modules built this tick). |
+| E2E-007 | LOW | **FIXED** | OPTIONS/TRACE → 405 JSON; POST/PUT/DELETE/PATCH uniform JSON 405. |
+| E2E-008 | LOW | **FIXED** | Corrupt DB → all 8 CLI exit 0 no traceback; all `/api/*` (9086) 200 empty JSON. |
+| E2E-009 | LOW | **FIXED** | Wrong-schema SQLite → all 8 CLI exit 0, no traceback, **no "no such table" leak**; /api/* (9087) 200 empty JSON. |
+| E2E-010 | LOW | **FIXED** | `curl -I /api/health`, `/`, `/leases` → **200, 0 body bytes**, headers mirror GET (RFC 9110 §9.3.2). |
+
+**Gate + journey** (all green, live): `uv sync --group dev` clean; **482
+pytest passed (-x -q, 39.82s)**; `ruff check src/ packages/ dashboard/backend/`
+→ All checks passed!; mypy (CI invocation) → Success, 74 files; `yarn build` →
+43 modules (2.00s); `smoke_test.py` → SMOKE TEST PASSED (144 PASS, exit 0);
+relay 9082→9081 pass-through GET/POST **byte-identical** incl. an upstream
+**503 forwarded byte-identical** (relay 9097→9092); dashboard 9083 all 9
+`/api/*` real JSON; all 8 CLI read commands consistent.
+
+**Edge probes clean** (no new defect): `Accept: text/plain` → JSON;
+`/api/leases?limit=-5|abc|999999`, `offset=-1` → 200; `/api/miss?session=`
+hostile values → honest `{event:null}`; `/api/not-an-endpoint` 404,
+`/api/leases/` 404, `/api` 200 SPA; traversal `/etc/passwd` + `%2e%2e/…` →
+index.html (no disclosure); relay control-path `?x=1|/|//` forwarded; `--db`
+dir & `/dev/null` → honest empty exit 0; `CACHEPILOT_TELEMETRY_DB=""` → no
+stray file; read-only sha `899f6d6b…` byte-stable.
+
+**Observations (recorded, NOT defects):** (1) `uv run ruff check src/` prints
+`[]` (JSON empty-findings) while `uv run --group dev ruff check .` (CI form),
+`.venv/bin/ruff …`, and `--output-format full` all print "All checks passed!"
+— same 0.16.2 binary + same config, exit 0 + zero findings in every variant
+(cosmetic local quirk). (2) Relay answers `HEAD /cachepilot/health` locally
+with a GET-mirror (200, CL 44, 0 body) via Starlette auto-HEAD on the GET
+route — HTTP-correct per RFC 9110 §9.3.2 and consistent with the E2E-010
+principle; POST/OPTIONS and non-control HEAD still pass through.
+
+### New finding — RUN 11
+
+| ID | Severity | Component | Summary |
+|----|----------|-----------|---------|
+| E2E-011 | LOW | E2E harness / run teardown hygiene | **E2E ticks leak their test services across runs** — run 9's mock upstream (`e2e-output/run9/mock_upstream.py 9081`, pid 2955253) and relay (`cachepilotd --listen 127.0.0.1:9082`, pid 2955310) were STILL ALIVE ~4h later (started Sat Aug 15 21:59:59 / 22:00:01, surviving the E2E-010 fix tick + 10 idle ticks), contradicting run-9's "All services were killed after the tick" claim. Run 11's fresh binds FAILED (`Address already in use`, exit 1/2) and its initial relay evidence ran against these stale run-9 survivors. Verified functionally identical to a fresh instance (same installed binary/source) and re-verified this tick against freshly-started services; leaks then killed. |
+
+## E2E-011 — LOW — E2E ticks leak ephemeral test services across runs (run-9 mock + relay alive ~4h after "all killed")
+
+- **Component**: E2E verification harness / run teardown procedure (not a
+  product defect — no product code involved).
+- **Reproduction** (live, this host, during Run 11):
+  ```
+  # 1. Run 11 starts its own mock upstream on 9081 -> bind FAILS (exit 1):
+  python e2e-output/run11/mock_upstream.py 9081
+  #   OSError: [Errno 98] Address already in use
+  # 2. Run 11 starts its own relay on 9082 -> bind FAILS (exit 2):
+  cachepilotd --listen 127.0.0.1:9082 --upstream http://127.0.0.1:9081
+  #   cachepilotd: error: listen address 127.0.0.1:9082 is already in use ...
+  # 3. The ports are held by RUN-9 survivors (checked via ss/ps):
+  ss -tlnp   ->  127.0.0.1:9081  python  e2e-output/run9/mock_upstream.py 9081   (pid 2955253, started Sat Aug 15 21:59:59)
+                 127.0.0.1:9082  cachepilotd --listen 127.0.0.1:9082 --upstream http://127.0.0.1:9081  (pid 2955310, started Sat Aug 15 22:00:00)
+  ```
+  run-9 `e2e-output/report.md` + `tasks.md` state "All services were killed
+  after the tick" — contradicted by pids/alive-since times above.
+- **Expected**: after every E2E tick every ephemeral test service is
+  terminated and the host is verified clean, so Run N+1 always binds fresh
+  current-build services.
+- **Actual**: two test processes from run 9 survived ~4 hours across the
+  E2E-010 fix tick and 10 subsequent idle ticks; Run 11 initially verified the
+  relay footprint against these stale survivors (functionally equivalent —
+  same installed binary/source — the evidence was re-confirmed this tick
+  against freshly-started services, then the leaks were killed). Low severity:
+  no product/data impact; it leaks ~2 small processes and contaminates
+  verification integrity / wastes debugging time on "why did my bind fail".
+- **Fix direction** (test-hygiene, not product code): (a) teardown in each E2E
+  tick uses `trap`/`kill $PIDS` for every service it spawned and re-verifies
+  with `ss`/`ps` that none remain; (b) add a pre-run guard that fails (or
+  cleans) if any `e2e-output/*/mock_upstream.py` / `cachepilotd --listen` /
+  `dashboard/backend/server.py` test process is already listening, so a stale
+  process cannot silently become the "live" target; (c) treat the 908x
+  ephemeral range as reserved test-only and document it.

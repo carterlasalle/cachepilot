@@ -1,0 +1,200 @@
+== seeded DB ==
+== populated store ==
+[dashboard] 127.0.0.1 "GET /api/status HTTP/1.1" 200 -
+  PASS status 200 — 200
+  PASS status stats.total == 3 — 3
+  PASS status hit_rate is a number — 0.5
+  PASS status providers recorded — [{'provider': 'anthropic', 'requests': 1, 'recorded_cost_usd': None}, {'provider': 'openai', 'requests': 2, 'recorded_cost_usd': 0.00033}]
+  PASS status relay readout — unreachable
+  PASS status plugin readout — active
+[dashboard] 127.0.0.1 "GET /api/leases HTTP/1.1" 200 -
+  PASS leases 200 — 200
+  PASS leases non-empty — 1
+  PASS lease state armed — armed
+  PASS lease cache age computed — 60.084938049316406
+  PASS lease targets — ['target-1']
+[dashboard] 127.0.0.1 "GET /api/costs HTTP/1.1" 200 -
+  PASS costs 200 — 200
+  PASS costs total > 0 — 0.00033
+  PASS costs per-provider — {'openai': 0.00033}
+  PASS costs recent series — 2
+  PASS costs honest note — recorded-cost-only: cost data are incomplete; net savings are unknown (PRD §79, AGENTS.md invariant 4)
+[dashboard] 127.0.0.1 "GET /api/ttl HTTP/1.1" 200 -
+  PASS ttl 200 — 200
+  PASS ttl profiles non-empty — 1
+  PASS ttl estimate present — 288.0
+  PASS ttl survival curve — {'sample_count': 4, 'horizon_s': 300.0, 'p_survive_at_ttl': 1.0, 'median_s': 300.0, 'steps': [{'age_s': 300.0, 'survival': 0.0, 'at_risk': 1, 'events': 1}]}
+  PASS ttl survival steps — 1
+  PASS ttl survival at-ttl defined — 1.0
+[dashboard] 127.0.0.1 "GET /api/routes HTTP/1.1" 200 -
+  PASS routes 200 — 200
+  PASS routes events non-empty — 1
+  PASS routes instability verdict — route_instability
+  PASS routes stats — {'route_switches': 1, 'instability_verdicts': 1, 'short_ttl_verdicts': 0, 'last_switch_at': '2026-08-16T08:06:22+00:00'}
+[dashboard] 127.0.0.1 "GET /api/churn HTTP/1.1" 200 -
+  PASS churn 200 — 200
+  PASS churn events non-empty — 1
+  PASS churn tools layer changed — {'layer': 'tools', 'changed': 1, 'total': 1, 'frequency': 'changed 1/1 churn events'}
+  PASS churn top causes — [{'cause': 'tool list mutation', 'count': 1}]
+[dashboard] 127.0.0.1 "GET /api/miss HTTP/1.1" 200 -
+  PASS miss 200 — 200
+  PASS miss explains latest — {'timestamp': '2026-08-16T08:06:22+00:00', 'session_hash': 'hash-session-1', 'previous_cache_fingerprint': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'new_cache_fingerprint': 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'provider': 'openai', 'model': 'gpt-4o-mini', 'route_hash': 'route-1', 'system_changed': False, 'tools_changed': True, 'history_changed': False, 'route_changed': False, 'cache_key_changed': True, 'model_changed': False, 'likely_cause': 'tool list mutation', 'confidence': 0.82, 'estimated_prefix_loss_tokens': 1234, 'first_divergent_offset': 4096, 'first_divergent_layer': 'tool schemas', 'id': 1}
+  PASS miss changed layers — ['system', 'history', 'route', 'model'] / ['tools', 'cache key']
+  PASS miss prefix loss — {'timestamp': '2026-08-16T08:06:22+00:00', 'session_hash': 'hash-session-1', 'previous_cache_fingerprint': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'new_cache_fingerprint': 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'provider': 'openai', 'model': 'gpt-4o-mini', 'route_hash': 'route-1', 'system_changed': False, 'tools_changed': True, 'history_changed': False, 'route_changed': False, 'cache_key_changed': True, 'model_changed': False, 'likely_cause': 'tool list mutation', 'confidence': 0.82, 'estimated_prefix_loss_tokens': 1234, 'first_divergent_offset': 4096, 'first_divergent_layer': 'tool schemas', 'id': 1}
+[dashboard] 127.0.0.1 "GET /api/miss?session=hash-session-2 HTTP/1.1" 200 -
+  PASS miss unknown session empty — None
+[dashboard] 127.0.0.1 "GET /api/topology HTTP/1.1" 200 -
+  PASS topology 200 — 200
+  PASS topology pair measured — 1
+  PASS topology churn pair — 1
+[dashboard] 127.0.0.1 "GET /api/health HTTP/1.1" 200 -
+  PASS health 200 ok — {'ok': True}
+[dashboard] 127.0.0.1 "GET /api/not-an-endpoint HTTP/1.1" 404 -
+  PASS unknown endpoint 404 — 404
+== read-only proof ==
+  PASS DB bytes unchanged — cfc494f6908a… vs cfc494f6908a…
+  PASS no files created other than SQLite WAL sidecars — ['telemetry.db-shm', 'telemetry.db-wal']
+== empty store (missing DB) ==
+[dashboard] 127.0.0.1 "GET /api/leases HTTP/1.1" 200 -
+  PASS empty leases [] — {'leases': []}
+[dashboard] 127.0.0.1 "GET /api/status HTTP/1.1" 200 -
+  PASS empty stats zero — {'stats': {'total': 0, 'confirmed_hits': 0, 'misses': 0, 'unverified': 0, 'failed': 0, 'churn_events': 0, 'route_changes': 0, 'telemetry_observed': 0, 'hit_rate': None}, 'relay': 'unreachable', 'plugin': 'active (no telemetry recorded yet)', 'providers': []}
+  PASS empty plugin honest — active (no telemetry recorded yet)
+[dashboard] 127.0.0.1 "GET /api/costs HTTP/1.1" 200 -
+  PASS empty costs zero — {'total_usd': 0.0, 'per_provider': {}, 'note': 'recorded-cost-only: cost data are incomplete; net savings are unknown (PRD §79, AGENTS.md invariant 4)', 'recent': []}
+[dashboard] 127.0.0.1 "GET /api/ttl HTTP/1.1" 200 -
+  PASS empty ttl [] — {'profiles': []}
+[dashboard] 127.0.0.1 "GET /api/routes HTTP/1.1" 200 -
+  PASS empty routes — {'events': [], 'stats': {'route_switches': 0, 'instability_verdicts': 0, 'short_ttl_verdicts': 0, 'last_switch_at': None}}
+[dashboard] 127.0.0.1 "GET /api/churn HTTP/1.1" 200 -
+  PASS empty churn layers zero — [{'layer': 'system', 'changed': 0, 'total': 0, 'frequency': 'no observations'}, {'layer': 'tools', 'changed': 0, 'total': 0, 'frequency': 'no observations'}, {'layer': 'history', 'changed': 0, 'total': 0, 'frequency': 'no observations'}, {'layer': 'route', 'changed': 0, 'total': 0, 'frequency': 'no observations'}, {'layer': 'cache key', 'changed': 0, 'total': 0, 'frequency': 'no observations'}, {'layer': 'model', 'changed': 0, 'total': 0, 'frequency': 'no observations'}]
+[dashboard] 127.0.0.1 "GET /api/miss HTTP/1.1" 200 -
+  PASS empty miss null — {'event': None, 'stable': [], 'changed': []}
+[dashboard] 127.0.0.1 "GET /api/topology HTTP/1.1" 200 -
+  PASS empty topology zero — {'sessions': 0, 'total_pairs': 0, 'churn_pairs': 0, 'prefix_stability_pct': None, 'attribution_gaps': 0, 'unattributed_loss_tokens': 0, 'layers': [], 'tool_ordering': []}
+== corrupt DB -> honest empty store (E2E-008) ==
+  PASS corrupt probe quick_check raises file-is-not-a-database — file is not a database
+  PASS corrupt CLI status exits 0 — exit 0
+  PASS corrupt CLI status stderr names path + corrupt — telemetry database at /tmp/tmpa9s4dpxb/corrupt.db is corrupt, not SQLite, or lacks the expected telemetry schema — treating it as an empty store (CLI reads are read-only; the relay creates the DB on first write)
+  PASS corrupt CLI status no traceback — telemetry database at /tmp/tmpa9s4dpxb/corrupt.db is corrupt, not SQLite, or lacks the expected telemetry schema — treating it as an empty store (CLI reads are read-only; the relay creates the DB on first write)
+  PASS corrupt CLI leases exits 0 — exit 0
+  PASS corrupt CLI leases stderr names path + corrupt — telemetry database at /tmp/tmpa9s4dpxb/corrupt.db is corrupt, not SQLite, or lacks the expected telemetry schema — treating it as an empty store (CLI reads are read-only; the relay creates the DB on first write)
+  PASS corrupt CLI leases no traceback — telemetry database at /tmp/tmpa9s4dpxb/corrupt.db is corrupt, not SQLite, or lacks the expected telemetry schema — treating it as an empty store (CLI reads are read-only; the relay creates the DB on first write)
+  PASS corrupt CLI costs exits 0 — exit 0
+  PASS corrupt CLI costs stderr names path + corrupt — telemetry database at /tmp/tmpa9s4dpxb/corrupt.db is corrupt, not SQLite, or lacks the expected telemetry schema — treating it as an empty store (CLI reads are read-only; the relay creates the DB on first write)
+  PASS corrupt CLI costs no traceback — telemetry database at /tmp/tmpa9s4dpxb/corrupt.db is corrupt, not SQLite, or lacks the expected telemetry schema — treating it as an empty store (CLI reads are read-only; the relay creates the DB on first write)
+  PASS corrupt CLI churn exits 0 — exit 0
+  PASS corrupt CLI churn stderr names path + corrupt — telemetry database at /tmp/tmpa9s4dpxb/corrupt.db is corrupt, not SQLite, or lacks the expected telemetry schema — treating it as an empty store (CLI reads are read-only; the relay creates the DB on first write)
+  PASS corrupt CLI churn no traceback — telemetry database at /tmp/tmpa9s4dpxb/corrupt.db is corrupt, not SQLite, or lacks the expected telemetry schema — treating it as an empty store (CLI reads are read-only; the relay creates the DB on first write)
+  PASS corrupt CLI topology exits 0 — exit 0
+  PASS corrupt CLI topology stderr names path + corrupt — telemetry database at /tmp/tmpa9s4dpxb/corrupt.db is corrupt, not SQLite, or lacks the expected telemetry schema — treating it as an empty store (CLI reads are read-only; the relay creates the DB on first write)
+  PASS corrupt CLI topology no traceback — telemetry database at /tmp/tmpa9s4dpxb/corrupt.db is corrupt, not SQLite, or lacks the expected telemetry schema — treating it as an empty store (CLI reads are read-only; the relay creates the DB on first write)
+[dashboard] 127.0.0.1 "GET /api/leases HTTP/1.1" 200 -
+  PASS corrupt leases 200 [] — 200 {'leases': []}
+[dashboard] 127.0.0.1 "GET /api/status HTTP/1.1" 200 -
+  PASS corrupt stats 200 zero — 200 {'stats': {'total': 0, 'confirmed_hits': 0, 'misses': 0, 'unverified': 0, 'failed': 0, 'churn_events': 0, 'route_changes': 0, 'telemetry_observed': 0, 'hit_rate': None}, 'relay': 'unreachable', 'plugin': 'active (no telemetry recorded yet)', 'providers': []}
+[dashboard] 127.0.0.1 "GET /api/costs HTTP/1.1" 200 -
+  PASS corrupt costs 200 zero — 200 {'total_usd': 0.0, 'per_provider': {}, 'note': 'recorded-cost-only: cost data are incomplete; net savings are unknown (PRD §79, AGENTS.md invariant 4)', 'recent': []}
+== wrong-schema DB -> honest empty store (E2E-009) ==
+telemetry database at /tmp/tmpa9s4dpxb/wrong-schema.db is corrupt, not SQLite, or lacks the expected telemetry schema — treating it as an empty store (CLI reads are read-only; the relay creates the DB on first write)
+  PASS wrong-schema store probe rejects (not CachePilot schema) — /tmp/tmpa9s4dpxb/wrong-schema.db
+  PASS wrong-schema CLI status exits 0 — exit 0
+  PASS wrong-schema CLI status stderr names path + empty — telemetry database at /tmp/tmpa9s4dpxb/wrong-schema.db is corrupt, not SQLite, or lacks the expected telemetry schema — treating it as an empty store (CLI reads are read-only; the relay creates the DB on first write)
+  PASS wrong-schema CLI status no traceback / no such table — telemetry database at /tmp/tmpa9s4dpxb/wrong-schema.db is corrupt, not SQLite, or lacks the expected telemetry schema — treating it as an empty store (CLI reads are read-only; the relay creates the DB on first write)
+  PASS wrong-schema CLI leases exits 0 — exit 0
+  PASS wrong-schema CLI leases stderr names path + empty — telemetry database at /tmp/tmpa9s4dpxb/wrong-schema.db is corrupt, not SQLite, or lacks the expected telemetry schema — treating it as an empty store (CLI reads are read-only; the relay creates the DB on first write)
+  PASS wrong-schema CLI leases no traceback / no such table — telemetry database at /tmp/tmpa9s4dpxb/wrong-schema.db is corrupt, not SQLite, or lacks the expected telemetry schema — treating it as an empty store (CLI reads are read-only; the relay creates the DB on first write)
+  PASS wrong-schema CLI costs exits 0 — exit 0
+  PASS wrong-schema CLI costs stderr names path + empty — telemetry database at /tmp/tmpa9s4dpxb/wrong-schema.db is corrupt, not SQLite, or lacks the expected telemetry schema — treating it as an empty store (CLI reads are read-only; the relay creates the DB on first write)
+  PASS wrong-schema CLI costs no traceback / no such table — telemetry database at /tmp/tmpa9s4dpxb/wrong-schema.db is corrupt, not SQLite, or lacks the expected telemetry schema — treating it as an empty store (CLI reads are read-only; the relay creates the DB on first write)
+  PASS wrong-schema CLI routes exits 0 — exit 0
+  PASS wrong-schema CLI routes stderr names path + empty — telemetry database at /tmp/tmpa9s4dpxb/wrong-schema.db is corrupt, not SQLite, or lacks the expected telemetry schema — treating it as an empty store (CLI reads are read-only; the relay creates the DB on first write)
+  PASS wrong-schema CLI routes no traceback / no such table — telemetry database at /tmp/tmpa9s4dpxb/wrong-schema.db is corrupt, not SQLite, or lacks the expected telemetry schema — treating it as an empty store (CLI reads are read-only; the relay creates the DB on first write)
+  PASS wrong-schema CLI churn exits 0 — exit 0
+  PASS wrong-schema CLI churn stderr names path + empty — telemetry database at /tmp/tmpa9s4dpxb/wrong-schema.db is corrupt, not SQLite, or lacks the expected telemetry schema — treating it as an empty store (CLI reads are read-only; the relay creates the DB on first write)
+  PASS wrong-schema CLI churn no traceback / no such table — telemetry database at /tmp/tmpa9s4dpxb/wrong-schema.db is corrupt, not SQLite, or lacks the expected telemetry schema — treating it as an empty store (CLI reads are read-only; the relay creates the DB on first write)
+  PASS wrong-schema CLI explain-miss exits 0 — exit 0
+  PASS wrong-schema CLI explain-miss stderr names path + empty — telemetry database at /tmp/tmpa9s4dpxb/wrong-schema.db is corrupt, not SQLite, or lacks the expected telemetry schema — treating it as an empty store (CLI reads are read-only; the relay creates the DB on first write)
+  PASS wrong-schema CLI explain-miss no traceback / no such table — telemetry database at /tmp/tmpa9s4dpxb/wrong-schema.db is corrupt, not SQLite, or lacks the expected telemetry schema — treating it as an empty store (CLI reads are read-only; the relay creates the DB on first write)
+  PASS wrong-schema CLI ttl exits 0 — exit 0
+  PASS wrong-schema CLI ttl stderr names path + empty — telemetry database at /tmp/tmpa9s4dpxb/wrong-schema.db is corrupt, not SQLite, or lacks the expected telemetry schema — treating it as an empty store (CLI reads are read-only; the relay creates the DB on first write)
+  PASS wrong-schema CLI ttl no traceback / no such table — telemetry database at /tmp/tmpa9s4dpxb/wrong-schema.db is corrupt, not SQLite, or lacks the expected telemetry schema — treating it as an empty store (CLI reads are read-only; the relay creates the DB on first write)
+  PASS wrong-schema CLI topology exits 0 — exit 0
+  PASS wrong-schema CLI topology stderr names path + empty — telemetry database at /tmp/tmpa9s4dpxb/wrong-schema.db is corrupt, not SQLite, or lacks the expected telemetry schema — treating it as an empty store (CLI reads are read-only; the relay creates the DB on first write)
+  PASS wrong-schema CLI topology no traceback / no such table — telemetry database at /tmp/tmpa9s4dpxb/wrong-schema.db is corrupt, not SQLite, or lacks the expected telemetry schema — treating it as an empty store (CLI reads are read-only; the relay creates the DB on first write)
+[dashboard] 127.0.0.1 "GET /api/leases HTTP/1.1" 200 -
+  PASS wrong-schema leases 200 [] — 200 {'leases': []}
+[dashboard] 127.0.0.1 "GET /api/status HTTP/1.1" 200 -
+  PASS wrong-schema stats 200 zero — 200 {'stats': {'total': 0, 'confirmed_hits': 0, 'misses': 0, 'unverified': 0, 'failed': 0, 'churn_events': 0, 'route_changes': 0, 'telemetry_observed': 0, 'hit_rate': None}, 'relay': 'unreachable', 'plugin': 'active (no telemetry recorded yet)', 'providers': []}
+[dashboard] 127.0.0.1 "GET /api/costs HTTP/1.1" 200 -
+  PASS wrong-schema costs 200 zero — 200 {'total_usd': 0.0, 'per_provider': {}, 'note': 'recorded-cost-only: cost data are incomplete; net savings are unknown (PRD §79, AGENTS.md invariant 4)', 'recent': []}
+== write refusal ==
+[dashboard] 127.0.0.1 "POST /api/leases HTTP/1.1" 405 -
+  PASS POST refused 405 — 405
+  PASS POST refused JSON content type — application/json; charset=utf-8
+  PASS POST refused documented error body — {"error": "the dashboard backend is read-only (GET only)"}
+[dashboard] 127.0.0.1 "PUT /api/leases HTTP/1.1" 405 -
+  PASS PUT refused 405 — 405
+  PASS PUT refused JSON content type — application/json; charset=utf-8
+  PASS PUT refused documented error body — {"error": "the dashboard backend is read-only (GET only)"}
+[dashboard] 127.0.0.1 "DELETE /api/leases HTTP/1.1" 405 -
+  PASS DELETE refused 405 — 405
+  PASS DELETE refused JSON content type — application/json; charset=utf-8
+  PASS DELETE refused documented error body — {"error": "the dashboard backend is read-only (GET only)"}
+[dashboard] 127.0.0.1 "PATCH /api/leases HTTP/1.1" 405 -
+  PASS PATCH refused 405 — 405
+  PASS PATCH refused JSON content type — application/json; charset=utf-8
+  PASS PATCH refused documented error body — {"error": "the dashboard backend is read-only (GET only)"}
+[dashboard] 127.0.0.1 "OPTIONS /api/leases HTTP/1.1" 405 -
+  PASS OPTIONS refused 405 — 405
+  PASS OPTIONS refused JSON content type — application/json; charset=utf-8
+  PASS OPTIONS refused documented error body — {"error": "the dashboard backend is read-only (GET only)"}
+[dashboard] 127.0.0.1 "TRACE /api/leases HTTP/1.1" 405 -
+  PASS TRACE refused 405 — 405
+  PASS TRACE refused JSON content type — application/json; charset=utf-8
+  PASS TRACE refused documented error body — {"error": "the dashboard backend is read-only (GET only)"}
+== HEAD mirrors GET (RFC 9110 §9.3.2, E2E-010) ==
+[dashboard] 127.0.0.1 "GET /api/health HTTP/1.1" 200 -
+[dashboard] 127.0.0.1 "HEAD /api/health HTTP/1.1" 200 -
+  PASS HEAD /api/health status mirrors GET — HEAD 200 vs GET 200
+  PASS HEAD /api/health empty body — b''
+  PASS HEAD /api/health content-length consistent with GET body length — HEAD CL=12 vs GET 12 bytes (tol 2)
+  PASS HEAD /api/health content-type == GET — application/json; charset=utf-8
+[dashboard] 127.0.0.1 "GET /api/leases HTTP/1.1" 200 -
+[dashboard] 127.0.0.1 "HEAD /api/leases HTTP/1.1" 200 -
+  PASS HEAD /api/leases status mirrors GET — HEAD 200 vs GET 200
+  PASS HEAD /api/leases empty body — b''
+  PASS HEAD /api/leases content-length consistent with GET body length — HEAD CL=1022 vs GET 1023 bytes (tol 2)
+  PASS HEAD /api/leases content-type == GET — application/json; charset=utf-8
+[dashboard] 127.0.0.1 "GET / HTTP/1.1" 200 -
+[dashboard] 127.0.0.1 "HEAD / HTTP/1.1" 200 -
+  PASS HEAD / (index.html) status mirrors GET — HEAD 200 vs GET 200
+  PASS HEAD / (index.html) empty body — b''
+  PASS HEAD / (index.html) content-length consistent with GET body length — HEAD CL=22 vs GET 22 bytes (tol 0)
+  PASS HEAD / (index.html) content-type == GET — text/html
+[dashboard] 127.0.0.1 "GET /assets/app.js HTTP/1.1" 200 -
+[dashboard] 127.0.0.1 "HEAD /assets/app.js HTTP/1.1" 200 -
+  PASS HEAD /assets/app.js status mirrors GET — HEAD 200 vs GET 200
+  PASS HEAD /assets/app.js empty body — b''
+  PASS HEAD /assets/app.js content-length consistent with GET body length — HEAD CL=26 vs GET 26 bytes (tol 0)
+  PASS HEAD /assets/app.js content-type == GET — text/javascript
+[dashboard] 127.0.0.1 "GET /leases HTTP/1.1" 200 -
+[dashboard] 127.0.0.1 "HEAD /leases HTTP/1.1" 200 -
+  PASS HEAD /leases (SPA fallback) status mirrors GET — HEAD 200 vs GET 200
+  PASS HEAD /leases (SPA fallback) empty body — b''
+  PASS HEAD /leases (SPA fallback) content-length consistent with GET body length — HEAD CL=22 vs GET 22 bytes (tol 0)
+  PASS HEAD /leases (SPA fallback) content-type == GET — text/html
+== relay health probe (E2E-002) ==
+[dashboard] 127.0.0.1 "GET /api/status HTTP/1.1" 200 -
+  PASS relay readout unreachable when port closed — unreachable
+[dashboard] 127.0.0.1 "GET /api/status HTTP/1.1" 200 -
+  PASS relay readout healthy against real relay — healthy
+[dashboard] 127.0.0.1 "GET /api/status HTTP/1.1" 200 -
+  PASS relay readout occupied by foreign HTTP server — occupied by another service
+  PASS relay readout never healthy for foreign server — occupied by another service
+== startup occupant detection (E2E-002) ==
+  PASS dashboard main exits 2 on occupied port — 2
+  PASS dashboard error names the port and --port override — [dashboard] error: listen address 127.0.0.1:48063 is already in use — another process owns it (on a stock Hermes host this is typically hermes_cli's 'mcp serve'). Pick a free port with --port PORT and update the /api proxy target in dashboard/vite.config.ts.
+  PASS dashboard error names the vite proxy override — [dashboard] error: listen address 127.0.0.1:48063 is already in use — another process owns it (on a stock Hermes host this is typically hermes_cli's 'mcp serve'). Pick a free port with --port PORT and update the /api proxy target in dashboard/vite.config.ts.
+
+SMOKE TEST PASSED — dashboard backend verified against a seeded TelemetryStore, empty-store states, and a byte-identical read-only DB.
