@@ -601,3 +601,23 @@ always finds something.
 
 - **2026-08-16 (idle tick, THIS TICK — f70efd2..HEAD)**: Board = only perpetual fixtures (E2E-001 Run 13 was done in the immediately-prior work tick f70efd2, 0 commits since — not due, window 5-10; NEVER-DONE audit). No real pending work → idle. Git-history cross-ref + GitReins dual-source check: **gitreins task store 0 pending (No tasks found)**, no committed work behind pending board tasks, **upstream synced (git fetch: unpushed=0, behind=0, origin/main==HEAD f70efd2)**, git clean tree (no untracked/staged). Lightweight verification (board heavily audited, zero gaps, across the many prior idle+work ticks this cycle): **488 pytest pass in 73.16s**, **ruff check src/ packages/ dashboard/backend/ → All checks passed!**, **gitreins judge configured** (defaults at root: model deepseek/deepseek-v4-flash-0731, api_key_env GITREINS_LLM_API_KEY; evaluator caps 60 iter / 1M in / 400k out / 20m; guard test_timeout 300). Leak check: **no 908x listener** (ss -tlnp clean — E2E-011 hygiene premise holds). CHK8 CI: **5/5 recent runs success** (gh run list fresh, carterlasalle/cachepilot — E2E-001 Run 13 commit runs + prior idle-tick chore runs all green, no failures to file). Zero new tasks found. Scheduler cooldown had reverted 43200→900 by daemon ApplyFleetConfig (field lowercase `cooldown_s`) — re-applied **43200s (idle)** via API PUT, verified GET (cooldown_s=43200, enabled=true).
 - **2026-08-16 (idle tick, this session — THIS TICK)**: Board = only perpetual fixtures (E2E-001 Run 12 was done in the work tick a48287e/65c25f8 — 2 commits ago, window 5-10, not due; NEVER-DONE audit). No real pending work → idle. Git-history cross-ref + GitReins dual-source check: **gitreins task store 0 pending (No tasks found)**, no committed work behind pending board tasks, **upstream synced (unpushed=0, behind=0, origin/main==HEAD a48287e)**, git clean tree. Lightweight verification (board heavily audited, zero gaps, across prior idle+work ticks this cycle): **488 pytest pass in 56.04s**, **ruff check src/ packages/ dashboard/backend/ → All checks passed!**, **gitreins judge configured** (defaults at root: model deepseek/deepseek-v4-flash-0731, api_key_env GITREINS_LLM_API_KEY; evaluator caps 60 iter / 1M in / 400k out / 20m — verified via .gitreins/config.yaml manual inspection since check-gitreins-judge.py needs yaml absent from python this session). CHK8 CI: **4/4 recent runs success** (gh run list fresh, carterlasalle/cachepilot — latest E2E-001 Run 12 closeout runs green, no failures). Zero new tasks found. Scheduler cooldown had reverted 43200→900 by daemon ApplyFleetConfig (field lowercase `cooldown_s`) — re-applied **43200s (idle)** via API PUT, verified GET (cooldown_s=43200, enabled=true).
+- **2026-08-16 (idle tick, THIS TICK — 9abae99..HEAD)**: Board = only
+  perpetual fixtures (E2E-001 Run 14 was done in the work tick 789e899 +
+  closeout ee407e2, then idle chores 5ae0e56/a4def02/9abae99 — 4 commits
+  ago, not due, window 5-10; NEVER-DONE audit). No real pending work →
+  idle. Git-history cross-ref + GitReins dual-source check: **gitreins task
+  store 0 pending (No tasks found)**, no committed work behind pending board
+  tasks, **upstream synced (git fetch: unpushed=0, behind=0,
+  origin/main==HEAD 9abae99)**, git clean tree. Lightweight verification
+  (board heavily audited, zero gaps, across the many prior idle+work ticks
+  this cycle): **488 pytest pass in 54.88s**, **ruff check src/ packages/
+  dashboard/backend/ e2e-output/hygiene.py → All checks passed!**. Leak
+  check: **no 908x listener** (ss -tlnp clean — only schedulerd on 9090, the
+  scheduler daemon, out of the E2E test-reserved range — E2E-011 hygiene
+  premise holds). CHK8 CI: **3/3 recent runs success** (gh run list fresh,
+  carterlasalle/cachepilot — latest idle-tick chore runs green, no failures
+  to file). Zero new tasks found (E2E-001 not due, NEVER-DONE audit added
+  nothing — board continuously audited across the many prior idle+work ticks
+  this cycle). Scheduler cooldown had reverted 43200→900 by daemon
+  ApplyFleetConfig (field lowercase cooldown_s) — re-applied **43200s
+  (idle)** via API PUT, verified GET (cooldown_s=43200, enabled=True).
