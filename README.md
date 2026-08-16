@@ -107,6 +107,42 @@ core package imports it, and deleting `dashboard/` changes nothing. See the
 [Dashboard runbook](docs/dashboard.md) for the full API + view/empty-state
 walkthrough.
 
+## Test hygiene (E2E ephemeral test services)
+
+The `908x` port range (9080-9089) is **reserved TEST-ONLY**. No product
+service may bind it; every E2E tick uses it for ephemeral mock upstream,
+relay (`cachepilotd --listen`), and dashboard backend (`server.py`) processes
+that must NEVER leak across runs.
+
+To keep a tick from leaking a test service into the next run (E2E-011) and
+to stop a stale process from silently becoming the next run's "live" target,
+use [`e2e-output/hygiene.py`](e2e-output/hygiene.py) (stdlib-only) and/or
+source the shell wrapper [`e2e-output/hygiene.sh`](e2e-output/hygiene.sh):
+
+```bash
+# Pre-run: fail the tick if any stale process already listens on 908x.
+python e2e-output/hygiene.py pre-run                # exit 1 if occupied
+python e2e-output/hygiene.py pre-run --clean        # auto-kill stale occupants
+
+# Post-run: kill the spawned test PIDs and verify 908x is clean via ss/ps.
+python e2e-output/hygiene.py teardown <pid1> <pid2>
+
+# Or source the shell helper: spawn every service via e2e_spawn, wrap with
+# e2e_wrap, and let trap-based teardown fire on EXIT/INT/ERR.
+source e2e-output/hygiene.sh
+e2e_guard_pre_run && e2e_wrap
+e2e_spawn python e2e-output/runN/mock_upstream.py 9081
+e2e_spawn uv run cachepilotd --listen 127.0.0.1:9082 --upstream http://127.0.0.1:9081
+e2e_teardown   # kill spawned + re-verify 908x clean
+
+python e2e-output/hygiene.py self-test              # live guard+teardown proof
+```
+
+Every E2E tick must: (1) run the pre-run guard before spawning anything,
+(2) wrap its spawned services in trap-based teardown, and (3) after the tick
+re-verify via `ss`/`ps` that no process remains on `908x`. See
+[docs/e2e-testing.md](docs/e2e-testing.md) for the full runbook.
+
 ## Configuration
 
 All settings are `CACHEPILOT_*` environment variables, read at startup; malformed values fall back to defaults (fail open for traffic). Full inventory in the docs above; the essentials:

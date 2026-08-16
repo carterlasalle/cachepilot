@@ -6,6 +6,16 @@ All findings below were reproduced live against a fresh deploy (uv workspace
 sync, yarn install/build, seeded temp telemetry DB, real relay + mock upstream).
 None are fabricated; every task row carries reproduction evidence.
 
+> **TEST-HYGIENE CONVENTION (E2E-011):** the `908x` ephemeral port range
+> (9080-9089) is **reserved TEST-ONLY**. Every E2E tick MUST (1) run the
+> pre-run guard (`python e2e-output/hygiene.py pre-run` / `--clean`) before
+> spawning anything, (2) wrap spawned services in trap-based teardown
+> (`source e2e-output/hygiene.sh` → `e2e_wrap`/`e2e_spawn`), and (3) verify
+> with `ss`/`ps` after the tick that NO process remains on `908x`. Any tick
+> that leaves a `908x` listener behind (or that proceeds while a stale
+> listener holds the range) is a hygiene failure. Runbook:
+> `docs/e2e-testing.md`.
+
 ## Findings
 
 | ID | Severity | Component | Summary |
