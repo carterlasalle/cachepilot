@@ -91,10 +91,20 @@ every commit to a `gitreins task complete`.
   `e2e-output/run11/` artifacts + board note + E2E-011 Active task; **NO
   src/packages/dashboard/backend implementation modified**), then PUSHED and
   verified remote HEAD (unpushed=0). Board updated (E2E-001 gained Run 11;
-  E2E-011 added to Active). Only perpetual fixtures remain
-  (E2E-001 not due, NEVER-DONE + E2E-011 pending) — foreman layer: gitreins
-  judge + cooldown reset to 43200s (idle) per the established idle-tick
-  pattern.
+  E2E-011 added to Active). Foreman layer (trust-but-verify, not just worker
+  claim): **482 pytest pass 61.16s**, **ruff clean**, **mypy Success 74 files**
+  (authoritative `uvx mypy --native-parser --python-version 3.12
+  --follow-imports=skip src packages`; the bare-invocation arg-type errors are
+  the known artifact), **yarn build ✓ 1.81s (43 modules)**, **smoke_test PASS**
+  — all independently re-run; plus live `ss -tlnp`/`ps` confirmed NO leaked
+  e2e/mock/relay/backend services remain listening on 908x (E2E-011's premise
+  holds, leaks cleaned). GitReins lifecycle: create E2E-001-R11 → start →
+  worker committed b0fea62 (pushed) → **judge PASS 62531008** (all 4 criteria
+  ✓ with live command evidence) → task deleted, store clean (0 pending).
+  MANDATORY PUSH verified (remote b0fea62, unpushed=0 behind=0). CI: run-11
+  commit runs **success**, no failures. E2E-011 (Low) is now real PENDING work
+  → **project ACTIVE** → scheduler cooldown set **900s** via API PUT, verified
+  GET (cooldown_s=900, enabled=true).
 
 - **2026-08-16 (idle tick, 6b2a4ee..HEAD)**: Board = only perpetual fixtures (E2E-001 Run 10 was done in the E2E-010 work tick db37f7b — 5 commits ago, window 5-10, not due; NEVER-DONE audit). No real pending work → idle. Git-history cross-ref + GitReins dual-source check: **gitreins task store 0 pending (No tasks found)**, no committed work behind pending board tasks, **upstream synced (unpushed=0, behind=0)**, git clean tree. Lightweight verification (board heavily audited, zero gaps, across prior idle+work ticks this cycle): **482 pytest pass in 40.12s**, **ruff check src/ packages/ dashboard/backend/ All checks passed**, gitreins judge configured (check-gitreins-judge.py PASS, model deepseek/deepseek-v4-flash-0731). CHK8 CI: **3/3 recent runs success** (gh run list fresh, carterlasalle/cachepilot — latest idle-tick chore runs green, no failures). Zero new tasks found. Scheduler cooldown had reverted 43200→900 by daemon ApplyFleetConfig — re-applied **43200s (idle)** via API PUT, verified GET (cooldown_s=43200, enabled=true).
 
