@@ -49,6 +49,55 @@ every commit to a `gitreins task complete`.
 
 ## Tick Log
 
+- **2026-08-16 (work tick — E2E-001 Run 15, b661562)**: Board had only
+  perpetual fixtures but E2E-001 was DUE (Run 14 was 6 commits ago, 789e899;
+  both prior runs Run 13→14 and Run 12→13 triggered at exactly "6 commits
+  ago", window 5-10) → picked E2E-001, created gitreins task E2E-001-R15,
+  dispatched the CLI/API E2E worker (DS-V4-Flash / deepseek-v4-flash-0731 @
+  openrouter). Worker ran a full CLI/API verification tick: **fresh deploy
+  green** (488 pytest -x -q pass in 77.98s, **ruff check src/ packages/
+  dashboard/backend/ e2e-output/hygiene.py → All checks passed!**, mypy 74
+  files clean, **yarn build → 43 modules**, **smoke_test → SMOKE TEST PASSED,
+  144 PASS, exit 0**). **Full live user journey**: relay 9082→9081 GET + POST
+  pass-through **byte-identical via cmp** (32B==32B / 24B==24B) + control `GET
+  /cachepilot/health` 200 distinctive JSON; upstream **503 forwarded
+  byte-identical** (relay 9097→9092); dashboard backend 9083 on a seeded
+  telemetry DB — all 9 `/api/*` real seeded JSON; all 8 CLI read commands
+  consistent, seeded DB sha `c44d5c28` byte-stable (read-only proven). **All
+  eleven prior findings E2E-002..E2E-011 re-verified FIXED with live
+  evidence** (relay healthy/unreachable×2 + startup occupant detection exit 2
+  on BOTH cachepilotd + server.py with actionable error; uniform JSON 405 ×6
+  non-GET methods + HEAD-mirrors-GET 200/0-body incl. real asset; missing --db
+  never created + exit 0 honest empty; churn-vs-switches disambiguated;
+  corrupt + wrong-schema → all 8 CLI honest-empty exit 0 no traceback +
+  dashboard /api/* 200 empty JSON; 320px mobile CSS via code/build). **Edge-
+  probe batch all clean** (hostile params/sessions → 200 honest JSON no crash,
+  correct 404s, traversal → SPA index.html no path disclosure, HTTP/1.0 200
+  +CT+CL, relay control-path encodings query-string intercepted only, --db
+  empty/dir//dev/null → exit 0). **NO new finding — zero-findings tick; no
+  E2E-012 filed.** Worker committed **test-only** changes (b661562:
+  e2e-output/run15/ fixtures incl. live_journey.sh + mock_upstream.py +
+  upstream_503.py + seed.py + make_wrongschema.py + relay_readout.sh +
+  README.md, e2e-output/report.md + tasks.md RUN 15 note, E2E-001 board row
+  Run 15 note; **NO src/packages/dashboard/backend implementation modified**),
+  pushed, remote HEAD verified. GitReins lifecycle: task E2E-001-R15 (created
+  by foreman, in_progress) → judge **PASS d8888d82** (tier1 lint/secrets/
+  tests PASS; tier2 COMPLETE, Overall ✓, all 5 criteria with fresh live
+  command evidence: 488 pytest, ruff, mypy 74, yarn 43 mod + smoke PASS, full
+  live journey, E2E-002..011 re-verified FIXED via fresh live_journey.sh
+  rerun, zero-findings documented, test-only commit b661562 pushed with remote
+  HEAD matching) → task deleted, store clean (**0 pending**). Foreman layer
+  (trust-but-verify, not just worker claim): independently re-ran **488 pytest
+  pass in 61.12s**, **ruff check → All checks passed!**, **smoke_test → SMOKE
+  TEST PASSED (dashboard/backend/smoke_test.py)** — all green in my own
+  session. MANDATORY PUSH verified: commit b661562 pushed, remote HEAD at
+  b661562, **unpushed=0 behind=0** (git fetch + rev-list). Leak check: **no
+  908x listener** (ss -tlnp clean — E2E-011 hygiene premise holds). CI: Run 15
+  commit runs **success** (recent runs green, no failures to file). Only
+  perpetual fixtures (E2E-001 not due, NEVER-DONE) remain → **project idle**
+  → scheduler cooldown re-applied **43200s (idle)** via API PUT (field
+  `cooldown_s`, had reverted to 900 by daemon ApplyFleetConfig), verified GET.
+
 - **2026-08-16 (idle tick, THIS TICK — ade0059..HEAD)**: Board = only
   perpetual fixtures (E2E-001 Run 14 was done in the work tick 789e899 +
   closeout ee407e2, then idle chores 5ae0e56/a4def02/9abae99/ade0059 —
