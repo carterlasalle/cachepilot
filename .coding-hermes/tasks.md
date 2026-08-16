@@ -49,6 +49,7 @@ every commit to a `gitreins task complete`.
 
 ## Tick Log
 
+- **2026-08-16 (idle tick, this session — THIS TICK)**: Board = only perpetual fixtures (E2E-001 Run 12 was done in the E2E-001 Run 12 work tick a48287e/65c25f8 — 2 commits ago, window 5-10, not due; NEVER-DONE audit). No real pending work → idle. Git-history cross-ref + GitReins dual-source check: **gitreins task store 0 pending (No tasks found)**, no committed work behind pending board tasks, **upstream synced (unpushed=0, behind=0, origin/main==HEAD 4f94875)**, git clean tree. Lightweight verification (board heavily audited, zero gaps, across prior idle+work ticks this cycle): **488 pytest pass in 56.78s**, **ruff check src/ packages/ dashboard/backend/ e2e-output/hygiene.py → All checks passed!**, **gitreins judge configured (check-gitreins-judge.py PASS, model deepseek/deepseek-v4-flash-0731)**. Leak check: **no 908x listener** (ss -tlnp clean — E2E-011 hygiene premise holds). CHK8 CI: **4/4 recent runs success** (gh run list fresh, carterlasalle/cachepilot — latest idle-tick chore runs green, no failures). Zero new tasks found. Scheduler cooldown had reverted 43200→900 by daemon ApplyFleetConfig (field lowercase `cooldown_s`) — re-applied **43200s (idle)** via API PUT, verified GET (cooldown_s=43200, enabled=true).
 - **2026-08-16 (work tick — E2E-001 Run 12, CLI/API)**: Board had only
   perpetual fixtures but E2E-001 was DUE → picked E2E-001, ran the 12th CLI/API
   E2E verification tick (test-only: e2e-output notes + board; no src/,
