@@ -591,11 +591,14 @@ def classify(
     """Classify one previous→current request transition (PRD §25 detector).
 
     Content path: full classification including the first-divergent-byte hint
-    and the estimated reusable prefix lost in tokens (~4 chars/token heuristic;
-    longest common prefix of the canonical serializations — 0 for identical
-    requests). P11 (PRD §138): a prefix-only divergence is additionally judged
-    for leaked volatile values (:func:`_refine_prefix_volatility`). Detection
-    only: inputs are never mutated and no rewrite is ever produced (PRD §25).
+    and the estimated reusable prefix LOST in tokens (~4 chars/token
+    heuristic). Under exact-prefix caching the longest common prefix of the two
+    canonical serializations is what stays reusable, so the loss is everything
+    of the previous request BEYOND it — ``len(previous) - common_prefix`` — and
+    it is 0 for identical requests. P11 (PRD §138): a prefix-only divergence is
+    additionally judged for leaked volatile values
+    (:func:`_refine_prefix_volatility`). Detection only: inputs are never
+    mutated and no rewrite is ever produced (PRD §25).
     """
     classification = _classify_snapshots(previous.to_hashes(), current.to_hashes())
     previous_text = previous.serialize()
@@ -603,9 +606,8 @@ def classify(
     if previous_text == current_text:
         classification.estimated_prefix_loss_tokens = 0
     else:
-        classification.estimated_prefix_loss_tokens = (
-            _common_prefix_length(previous_text, current_text) // _CHARS_PER_TOKEN
-        )
+        lost_chars = len(previous_text) - _common_prefix_length(previous_text, current_text)
+        classification.estimated_prefix_loss_tokens = lost_chars // _CHARS_PER_TOKEN
     classification.first_divergent_byte = _first_divergence(previous, current)
     _refine_prefix_volatility(classification, current)
     return classification

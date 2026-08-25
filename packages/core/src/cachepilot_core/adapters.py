@@ -267,10 +267,21 @@ class OpenAICompatibleAdapter:
     def build_warm_request(self, original: PhysicalRequest) -> PhysicalRequest | None:
         """Bounded cache-equivalent replay (PRD §31).
 
-        Deep-copies the snapshot, then sets the FIRST present output-bound
-        field to ``1`` (``max_tokens``, else ``max_completion_tokens``, else
+        Deep-copies the snapshot, forces ``stream`` off when the original
+        carried it, then sets the FIRST present output-bound field to ``1``
+        (``max_tokens``, else ``max_completion_tokens``, else
         ``max_output_tokens``). Nothing else is invented or mutated — a
-        provider field the original did not support is never added.
+        provider field the original did not support is never added, and
+        ``stream`` is never introduced into a request that lacked it.
+
+        Disabling ``stream`` does not change cache identity: ``stream`` is one
+        of the output-bounding fields deliberately excluded from
+        :data:`~cachepilot_core.fingerprint.CACHE_IDENTITY_FIELDS` (PRD §23,
+        invariant 8), so the warm still replays the same physical cache
+        identity. It is required for verification: an SSE body cannot be parsed
+        for usage, so a streamed warm can only ever be classified
+        SUCCESS_UNVERIFIED — spend with no evidence, and two of those open the
+        §94 circuit breaker.
 
         Returns ``None`` (skip, fail closed) when no output-bound field
         exists: the stream-cancel fallback of PRD §31 is NOT used because
@@ -283,6 +294,8 @@ class OpenAICompatibleAdapter:
                 "carries only hashes and cannot be replayed"
             )
         warm = copy.deepcopy(dict(original))
+        if "stream" in warm:
+            warm["stream"] = False
         for bound_field in self._OUTPUT_BOUND_FIELDS:
             if bound_field in warm:
                 warm[bound_field] = 1

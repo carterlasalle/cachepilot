@@ -351,20 +351,35 @@ def test_classify_earliest_content_layer_wins_cause():
 # -- first divergent byte + estimated loss ------------------------------------
 
 
-def test_estimated_prefix_loss_tokens_heuristic():
-    long_static = "a" * 400
-    previous = _content(messages=[{"role": "user", "content": long_static + " one"}])
-    current = _content(messages=[{"role": "user", "content": long_static + " two"}])
-    classification = classify(previous, current)
-    assert classification.estimated_prefix_loss_tokens is not None
-    assert classification.estimated_prefix_loss_tokens > 0  # ~100+ tokens shared
-    # longer shared prefix ⇒ larger estimate (monotonic)
-    shorter = classify(
-        _content(messages=[{"role": "user", "content": "one"}]),
-        _content(messages=[{"role": "user", "content": "two"}]),
+def test_estimated_prefix_loss_counts_the_lost_suffix_not_the_kept_prefix():
+    """PRD §25: the loss is what stops being reusable, not what survives.
+
+    Under exact-prefix caching the longest common prefix is exactly the part
+    that stays cached, so a change at the very tail of a large request loses
+    almost nothing while the same-sized request changed at the head loses
+    nearly all of it. Direction, not magic numbers.
+    """
+    long_static = "a" * 4000
+    tail_change = classify(
+        _content(messages=[{"role": "user", "content": long_static + " one"}]),
+        _content(messages=[{"role": "user", "content": long_static + " two"}]),
     )
-    assert shorter.estimated_prefix_loss_tokens is not None
-    assert classification.estimated_prefix_loss_tokens > shorter.estimated_prefix_loss_tokens
+    head_change = classify(
+        _content(messages=[{"role": "user", "content": "one " + long_static}]),
+        _content(messages=[{"role": "user", "content": "two " + long_static}]),
+    )
+    assert tail_change.estimated_prefix_loss_tokens is not None
+    assert head_change.estimated_prefix_loss_tokens is not None
+    # A 4000-char (~1000-token) shared prefix survives a tail edit: only the
+    # short canonical remainder after the divergence is lost, nowhere near what
+    # the prefix itself is worth.
+    assert tail_change.estimated_prefix_loss_tokens < 100
+    # The same request edited at the head loses essentially the whole prefix.
+    assert head_change.estimated_prefix_loss_tokens > 900
+    assert (
+        head_change.estimated_prefix_loss_tokens
+        > 10 * tail_change.estimated_prefix_loss_tokens
+    )
 
 
 def test_estimated_prefix_loss_identical_requests_zero():

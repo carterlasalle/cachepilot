@@ -172,14 +172,16 @@ class TTLProfile(BaseModel):
         - MISS_REBUILT at idle age A → ``upper_bound = min(upper, A)``
           (or A when unset); confidence rises, unless it contradicts a
           known lower bound;
-        - SUCCESS_UNVERIFIED → counts as an observation but lowers
-          confidence (unverified response, §58);
+        - SUCCESS_UNVERIFIED → lowers confidence but is NOT counted as a
+          sample (unverified response, §58): only request-completion is known,
+          so it is not TTL evidence and must never help a profile clear the
+          resolver's ``sample_count >= minimum_samples`` gate for the learned
+          tier (PRD §59);
         - FAILED → no TTL evidence; nothing changes (invariant 3).
         """
         if outcome is Outcome.FAILED:
             return
         if outcome is Outcome.SUCCESS_UNVERIFIED:
-            self.sample_count += 1
             self._adjust_confidence(_UNVERIFIED_DELTA)
         elif idle_age_s is not None and idle_age_s >= 0:
             self.sample_count += 1

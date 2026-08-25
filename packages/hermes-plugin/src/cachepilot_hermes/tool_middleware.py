@@ -7,7 +7,11 @@
   tells the ``apply_*_middleware`` runner "no change" — the effective args
   stay the original object, exactly as stock behaves with zero middleware.
 - Returning ``{"args": ..., "source": ..., "reason": ...}`` replaces the
-  effective args (PRD §40 terminal auto-backgrounding).
+  effective args (PRD §40 terminal auto-backgrounding). A promotion also
+  registers a ``process`` background target (PRD §46) so the session's cache
+  lease stays armed for the command it just backgrounded — that arming is the
+  whole point of auto-backgrounding, and the matching release happens in the
+  ``post_tool_call`` hook when the command completes.
 
 ``tool_execution`` middleware wraps tool execution: calling ``next_call``
 once with the original args and returning its result reproduces stock
@@ -22,12 +26,19 @@ stock.
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable, Mapping
 from typing import Any
 
 from cachepilot_hermes.classifier import LONG_RUNNING, LongTaskClassifier
 from cachepilot_hermes.config import PLUGIN_LOGGER_NAME, CachePilotConfig, emit_debug
 from cachepilot_hermes.duration_history import CommandDurationHistory
+from cachepilot_hermes.session import current_session_id
+from cachepilot_hermes.targets import (
+    BackgroundTarget,
+    BackgroundTargetRegistry,
+    process_target_id,
+)
 
 logger = logging.getLogger(PLUGIN_LOGGER_NAME)
 
@@ -41,6 +52,9 @@ def make_tool_request_middleware(
     config: CachePilotConfig,
     classifier: LongTaskClassifier | None = None,
     history: CommandDurationHistory | None = None,
+    targets: BackgroundTargetRegistry | None = None,
+    *,
+    session_id_provider: Callable[[], str] = current_session_id,
 ) -> Callable[..., Any]:
     """Return a ``tool_request`` middleware callback with auto-backgrounding.
 
@@ -49,6 +63,13 @@ def make_tool_request_middleware(
         classifier: Deterministic classifier; built from *config* when None.
         history: Optional duration learner whose learned stats feed the
             classifier (PRD §43 promotion). None disables learned promotion.
+        targets: Optional background-target registry (PRD §46). When present, a
+            promoted command registers a ``process`` target keyed on the Hermes
+            session id, which is what arms the relay's cache lease. None
+            disables target registration; the promotion itself is unaffected.
+        session_id_provider: Hermes session id source for the registered
+            target — the same identity ``llm_middleware`` reads the count back
+            under. Injectable so tests are deterministic.
     """
     classifier = classifier or LongTaskClassifier(config)
 
@@ -98,6 +119,10 @@ def make_tool_request_middleware(
             updated["background"] = True
             if config.long_tasks.notify_on_complete:
                 updated["notify_on_complete"] = True
+            # PRD §46: the promotion is only half the feature — the lease has
+            # to be armed for the command that is now running in the
+            # background, or the relay sees zero targets and stops warming.
+            _register_process_target(targets, args, session_id_provider)
             return {
                 "args": updated,
                 "source": _PROMOTION_SOURCE,
@@ -136,6 +161,33 @@ def make_tool_execution_middleware(
         return next_call(args)
 
     return _tool_execution_middleware
+
+
+def _register_process_target(
+    targets: BackgroundTargetRegistry | None,
+    args: Mapping[str, Any],
+    session_id_provider: Callable[[], str],
+) -> None:
+    """Arm a ``process`` background target for a promoted command (PRD §46).
+
+    No registry, or a command the id cannot be derived from, → nothing is
+    registered: the promotion still stands (fail open for traffic). The target
+    is keyed on the Hermes session id so the ``llm_request`` middleware counts
+    it, and released by ``post_tool_call`` when the command completes.
+    """
+    if targets is None:
+        return
+    command = args.get("command")
+    if not isinstance(command, str) or not command.strip():
+        return
+    targets.register(
+        BackgroundTarget(
+            id=process_target_id(command),
+            kind="process",
+            session_id=session_id_provider(),
+            started_at=time.time(),
+        )
+    )
 
 
 def _keys(payload: Any) -> tuple[str, ...]:

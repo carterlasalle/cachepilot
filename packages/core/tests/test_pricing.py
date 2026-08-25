@@ -38,6 +38,26 @@ def test_estimate_resume_costs_shapes():
     assert cold > cached
 
 
+def test_cold_resume_falls_back_to_plain_input_rate_without_a_write_rate():
+    """PRD §60/§65: a cold resume always pays for the prefix, write rate or not.
+
+    Providers whose cache writes are free publish ``cache_write_per_mtok = 0``.
+    Pricing the cold side purely at that rate makes a cold resume look free, so
+    ``avoidable = cold - cached <= 0`` and the economic controller returns
+    SKIP_NOT_ECONOMIC forever — CachePilot never warms on those providers.
+    """
+    free_writes = PricingTable(
+        input_per_mtok=Decimal("0.80"),
+        output_per_mtok=Decimal("2.40"),
+        cache_read_per_mtok=Decimal("0.08"),
+        cache_write_per_mtok=Decimal(0),
+    )
+    cold, cached = estimate_resume_costs(prefix_tokens=4000, pricing=free_writes)
+    assert cold == Decimal("0.00320")  # 4000 * 0.80 / 1M — full input price
+    assert cached == Decimal("0.00032")  # 4000 * 0.08 / 1M
+    assert cold > cached
+
+
 def test_cost_resolver_priority_provider_returned_wins():
     usage = TokenUsage(prompt_tokens=100, completion_tokens=50, cost=Decimal("0.0032"))
     resolution = resolver.resolve(usage, pricing=PRICING, override=Decimal("9.99"))

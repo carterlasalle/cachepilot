@@ -60,15 +60,30 @@ def estimate_resume_costs(
 ) -> tuple[Decimal, Decimal]:
     """Return ``(cold_resume_cost, cached_resume_cost)`` for a prefix.
 
-    A cold resume must write the prefix into the cache (``cache_write``); a
-    cached resume is served from cache (``cache_read``). The difference is the
-    avoidable loss at the heart of the economic controller (PRD §60).
+    A cold resume pays for the whole prefix as fresh input; a cached resume is
+    served from cache (``cache_read``). The difference is the avoidable loss at
+    the heart of the economic controller (PRD §60).
+
+    The cold side is priced at the cache-write rate when the provider publishes
+    one (Anthropic-style: the write rate replaces the base input rate), and at
+    the plain input rate otherwise. Providers whose cache writes are free
+    report ``cache_write_per_mtok = 0``, and pricing a cold resume purely at
+    that rate makes it look free — ``avoidable = cold - cached`` then goes
+    negative and the controller returns SKIP_NOT_ECONOMIC forever, so
+    CachePilot never warms even though the cold resume genuinely costs full
+    input price (PRD §65).
     """
-    cold = TokenUsage(
-        prompt_tokens=prefix_tokens,
-        completion_tokens=completion_tokens,
-        cache_write_tokens=prefix_tokens,
-    )
+    if pricing.cache_write_per_mtok > 0:
+        cold = TokenUsage(
+            prompt_tokens=prefix_tokens,
+            completion_tokens=completion_tokens,
+            cache_write_tokens=prefix_tokens,
+        )
+    else:
+        cold = TokenUsage(
+            prompt_tokens=prefix_tokens,
+            completion_tokens=completion_tokens,
+        )
     cached = TokenUsage(
         prompt_tokens=prefix_tokens,
         completion_tokens=completion_tokens,

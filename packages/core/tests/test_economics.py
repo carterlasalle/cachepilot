@@ -230,3 +230,29 @@ def test_decision_is_explainable():
     assert decision.max_warm_budget == Decimal("0.4788")  # 0.70 * 0.684
     assert decision.remaining_budget == decision.max_warm_budget
     assert decision.safety_margin == Decimal(0)
+
+
+def test_provider_without_a_cache_write_rate_still_warms():
+    """A free cache write must not make warming look economically pointless.
+
+    ``cache_write_per_mtok = 0`` with a real input rate is the OpenAI-style
+    shape. When the cold resume is priced at the write rate, ``avoidable`` is 0
+    or negative and the controller returns SKIP_NOT_ECONOMIC on every tick, so
+    a whole class of providers can never be warmed at all.
+    """
+    free_writes = PricingTable(
+        input_per_mtok=Decimal("0.80"),
+        output_per_mtok=Decimal("2.40"),
+        cache_read_per_mtok=Decimal("0.08"),
+        cache_write_per_mtok=Decimal(0),
+    )
+    decision = controller.evaluate_resume(
+        prefix_tokens=1_000_000,
+        pricing=free_writes,
+        resume_probability=0.95,
+        next_warm_cost=Decimal("0.01"),
+        cumulative_warm_cost=Decimal(0),
+    )
+    assert decision.expected_avoidable_loss > 0
+    assert decision.action is WarmAction.WARM
+    assert decision.should_warm

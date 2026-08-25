@@ -114,7 +114,11 @@ class CachePilotPlugin:
         )
         self.targets = BackgroundTargetRegistry()
         self.middleware: dict[str, Callable[..., Any]] = {
-            "tool_request": make_tool_request_middleware(self.config, history=self.history),
+            # PRD §40/§46: promoting a long command to the background also
+            # registers the ``process`` target that arms the cache lease.
+            "tool_request": make_tool_request_middleware(
+                self.config, history=self.history, targets=self.targets
+            ),
             "tool_execution": make_tool_execution_middleware(self.config),
             # Phase 5 (PRD §132): the target registry feeds the active
             # background-target COUNT into the X-CachePilot-Targets header so

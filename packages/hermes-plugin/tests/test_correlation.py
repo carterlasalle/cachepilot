@@ -23,8 +23,8 @@ from cachepilot_hermes.llm_middleware import (
     compute_turn_id,
     make_correlation_headers,
     make_llm_request_middleware,
-    process_session_id,
 )
+from cachepilot_hermes.session import process_session_id
 from cachepilot_hermes.targets import BackgroundTarget, BackgroundTargetRegistry
 
 # Deterministic id providers for the middleware tests.

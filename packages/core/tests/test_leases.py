@@ -96,6 +96,43 @@ def _default_manager(clock: FakeClock, **settings) -> LeaseManager:
     )
 
 
+# -- §53/§54 safe deadline ---------------------------------------------------
+
+
+def test_next_deadline_jitter_scales_the_interval_not_the_epoch():
+    """PRD §54: ±jitter_fraction of the WAIT, never of the Unix timestamp.
+
+    Applied to an absolute epoch, the default 3% displaces a
+    ``time.time()``-scale deadline by ~±1.7 years: negative jitter makes every
+    lease permanently due (warm on every tick), positive makes it unreachable.
+    """
+    now = 1_772_000_000.0  # realistic time.time() scale, not a fake 0/1e6
+    manager = LeaseManager(
+        LeaseSettings(pricing=PRICING),  # default jitter_fraction=0.03
+        time_fn=lambda: now,
+        latency_p95_s=4.0,
+    )
+    ttl = manager.settings.default_ttl_s
+    # §53: min(ttl * 0.80, ttl - network_margin) — the un-jittered wait.
+    interval = min(ttl * manager.settings.warm_fraction, ttl - manager.network_margin())
+    deadlines = []
+    for index in range(12):
+        lease = _make_lease(manager, session_id=f"sess-{index}", cache_fp=f"cache-fp-{index}")
+        manager.target_started(lease.lease_id, "t1")
+        manager.before_normal_request(lease.lease_id)
+        manager.after_normal_request(lease.lease_id, Outcome.CONFIRMED_HIT)
+        deadline = manager.next_deadline(lease)
+        assert deadline is not None
+        # The deadline is a real deadline: strictly in the future and strictly
+        # before the cache can have expired.
+        assert now < deadline < now + ttl
+        assert now + interval * 0.97 <= deadline <= now + interval * 1.03
+        deadlines.append(deadline)
+    # Jitter is genuinely applied in both directions (§54 spreads the fleet),
+    # so the bounds above are not passing merely because jitter is inert.
+    assert min(deadlines) < now + interval < max(deadlines)
+
+
 # -- state machine (§49-50) --------------------------------------------------
 
 
@@ -968,3 +1005,38 @@ def test_real_warm_path_race_targets_finished_skips_no_targets():
     assert decision is LeaseDecision.SKIPPED_NO_TARGETS
     assert lease.state is LeaseState.INACTIVE
     assert executor.calls == []
+
+
+def test_warm_scheduled_then_overtaken_by_real_request_skips_stale():
+    """§51: the generation captured at SCHEDULE time is what authorizes a warm.
+
+    No race, no lock interleaving: the warm is scheduled on one tick, a natural
+    request happens and completes, and the warm that comes due afterwards must
+    be recognised as stale rather than re-validated against the generation it
+    is being sent with.
+    """
+    clock = FakeClock()
+    executor = _RecordingExecutor()
+    manager = _real_warm_manager(clock, executor)
+    lease = _armed_touched_lease(manager, clock)
+    _store_snapshot(manager, lease)
+
+    # Tick 1: not due yet → the warm is SCHEDULED for this generation.
+    assert asyncio.run(manager.evaluate_lease(lease.lease_id)) is LeaseDecision.SCHEDULED
+    scheduled_generation = lease.generation
+
+    # A natural request happens in between and completes (real requests win).
+    manager.before_normal_request(lease.lease_id)
+    manager.after_normal_request(lease.lease_id, Outcome.CONFIRMED_HIT)
+    assert lease.generation > scheduled_generation
+
+    # Tick 2: the scheduled warm is now due, but it belongs to a generation
+    # the lease has moved past → no request is sent.
+    clock.advance(1000)
+    assert asyncio.run(manager.evaluate_lease(lease.lease_id)) is LeaseDecision.SKIPPED_STALE
+    assert executor.calls == []
+
+    # The record is one-shot: the lease is not pinned to SKIPPED_STALE and the
+    # next tick warms normally.
+    assert asyncio.run(manager.evaluate_lease(lease.lease_id)) is not LeaseDecision.SKIPPED_STALE
+    assert executor.calls != []

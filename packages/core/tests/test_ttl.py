@@ -124,14 +124,28 @@ def test_confidence_increases_on_consistent_observations():
     assert profile.sample_count == 2
 
 
-def test_unverified_lowers_confidence_but_counts_as_observation():
+def test_unverified_lowers_confidence_but_is_not_a_sample():
+    """§58: SUCCESS_UNVERIFIED is explicitly not evidence, so it is not a sample.
+
+    Counting it toward ``sample_count`` lets pure non-evidence clear the
+    resolver's ``sample_count >= minimum_samples`` gate and promote a profile to
+    the learned tier (PRD §59).
+    """
     profile = _fresh_profile()
     profile.observe(Outcome.CONFIRMED_HIT, 100.0)
     profile.observe(Outcome.SUCCESS_UNVERIFIED, None)
     assert profile.confidence == pytest.approx(0.50)
-    assert profile.sample_count == 2
+    assert profile.sample_count == 1  # the hit only
     # bounds are untouched by an unverified response
     assert profile.lower_bound_s == 100.0
+
+
+def test_unverified_observations_alone_never_accumulate_samples():
+    profile = _fresh_profile()
+    for _ in range(5):
+        profile.observe(Outcome.SUCCESS_UNVERIFIED, None)
+    assert profile.sample_count == 0
+    assert profile.confidence < 0.5  # non-evidence only ever lowers confidence
 
 
 def test_inconsistent_evidence_lowers_confidence():
@@ -440,6 +454,32 @@ def test_resolver_minimum_samples_gate(tmp_path):
     store = _store(tmp_path)
     _learn_four_hits(store)  # 4 samples, confidence 0.70
     resolver = TTLResolver(store.profile_for, default_ttl_s=300.0, minimum_samples=5)
+    result = _resolve(resolver)
+    assert result.source == "default"
+    assert result.ttl_s == 300.0
+    store.close()
+
+
+def test_unverified_observations_cannot_promote_a_profile_to_learned(tmp_path):
+    """§58/§59: non-evidence must never carry a profile over the samples gate.
+
+    The profile below is two clean samples short of nothing but the gate: high
+    confidence, a real lower bound, ``minimum_samples=3``. A SUCCESS_UNVERIFIED
+    response adds no knowledge, so it must not be the observation that makes the
+    learned TTL authoritative.
+    """
+    store = _store(tmp_path)
+    profile = _fresh_profile()
+    profile.confidence = 0.95
+    profile.sample_count = 2
+    profile.lower_bound_s = 400.0
+    profile.estimated_ttl_s = profile.estimate()
+    profile.observe(Outcome.SUCCESS_UNVERIFIED, None)
+    assert profile.sample_count == 2
+    assert profile.confidence >= HIGH_CONFIDENCE_THRESHOLD  # confidence is not the gate here
+    store.upsert_profile(profile)
+
+    resolver = TTLResolver(store.profile_for, default_ttl_s=300.0, minimum_samples=3)
     result = _resolve(resolver)
     assert result.source == "default"
     assert result.ttl_s == 300.0
