@@ -379,7 +379,11 @@ def _only_system_changed(classification: ChurnClassification) -> bool:
     )
 
 
-def _primary_cause(classification: ChurnClassification) -> tuple[str | None, float | None]:
+def _primary_cause(
+    classification: ChurnClassification,
+    *,
+    cache_identity_changed: bool = False,
+) -> tuple[str | None, float | None]:
     """Pick the dominant cause and its base confidence.
 
     Priority: identity-level destruction first (route, then model — they
@@ -390,6 +394,13 @@ def _primary_cause(classification: ChurnClassification) -> tuple[str | None, flo
     pattern in its purest form (``system_suffix_churn``), sharper than the
     generic suffix cause used when other layers also moved. Every layer beyond
     the primary reduces confidence.
+
+    ``cache_identity_changed`` is the caller's assertion that the physical
+    cache fingerprint moved. When it did and no tracked layer explains it, the
+    remaining identity fields (auth scope, endpoint, api_mode, provider) are
+    what moved — :data:`_RESIDUAL`, PRD §137's "cache key churn". Without that
+    signal the honest answer for an unexplained pair is still ``(None, None)``:
+    two identical requests must never be given a cause.
     """
     if classification.route_changed:
         return _CAUSE_AND_BASE[LAYER_ROUTE]
@@ -414,11 +425,20 @@ def _primary_cause(classification: ChurnClassification) -> tuple[str | None, flo
         return _FLAT_FALLBACKS["history"]
     if classification.cache_key_changed:
         return _CAUSE_AND_BASE[LAYER_CACHE_KEY]
+    if cache_identity_changed:
+        return _RESIDUAL
     return None, None
 
 
 def _confidence(base: float, classification: ChurnClassification) -> float:
-    """Base confidence minus 0.10 per extra changed flat layer (floor 0.50)."""
+    """Base confidence minus 0.10 per EXTRA changed flat layer (floor 0.50).
+
+    ``max(0, ...)`` matters: a cause can be reached with zero changed FLAT
+    layers (a layered-only snapshot via :func:`classify_hashes`, or the
+    residual cause), and ``changed - 1`` would then be ``-1`` and *raise*
+    confidence by 0.10 — rewarding the case with the least evidence, and able
+    to exceed the field's own ``le=1`` bound for any base above 0.90.
+    """
     changed = sum(
         1
         for flag in (
@@ -431,10 +451,15 @@ def _confidence(base: float, classification: ChurnClassification) -> float:
         )
         if flag
     )
-    return round(max(0.50, base - 0.10 * (changed - 1)), 2)
+    return round(max(0.50, base - 0.10 * max(0, changed - 1)), 2)
 
 
-def _classify_snapshots(previous: LayeredHashes, current: LayeredHashes) -> ChurnClassification:
+def _classify_snapshots(
+    previous: LayeredHashes,
+    current: LayeredHashes,
+    *,
+    cache_identity_changed: bool = False,
+) -> ChurnClassification:
     """Booleans + cause + confidence from two hash snapshots (flat + layered).
 
     Flat booleans compare the same hashes the relay persists, so they stay
@@ -461,7 +486,9 @@ def _classify_snapshots(previous: LayeredHashes, current: LayeredHashes) -> Chur
             previous.history_tail_hash, current.history_tail_hash
         ),
     )
-    cause, base = _primary_cause(classification)
+    cause, base = _primary_cause(
+        classification, cache_identity_changed=cache_identity_changed
+    )
     if cause is not None and base is not None:
         classification.likely_cause = cause
         classification.confidence = _confidence(base, classification)
@@ -492,7 +519,10 @@ def _snippet(text: str, offset: int) -> str:
 
 
 def _first_divergence(
-    previous: RequestContent, current: RequestContent
+    previous: RequestContent,
+    current: RequestContent,
+    previous_hashes: LayeredHashes,
+    current_hashes: LayeredHashes,
 ) -> DivergenceHint | None:
     """First divergent byte across the PRD §24 content layers, in prefix order.
 
@@ -500,9 +530,12 @@ def _first_divergence(
     bounded in-memory snippet of the CURRENT content around the offset.
     Identity layers (route/model/cache key) have no content position and are
     not located here — they surface through the booleans and the cause.
+
+    The layered hashes are passed in rather than recomputed: :func:`classify`
+    already built them, and each :meth:`RequestContent.to_hashes` call is 8
+    SHA-256 digests over up-to-megabyte canonical serializations of the whole
+    request.
     """
-    previous_hashes = previous.to_hashes()
-    current_hashes = current.to_hashes()
     previous_texts: dict[str, str] = {
         LAYER_SYSTEM_PREFIX: split_system_layers(previous.system or "")[0],
         LAYER_SYSTEM_SUFFIX: split_system_layers(previous.system or "")[1],
@@ -586,7 +619,10 @@ def _refine_prefix_volatility(
 
 
 def classify(
-    previous: RequestContent, current: RequestContent
+    previous: RequestContent,
+    current: RequestContent,
+    *,
+    cache_identity_changed: bool = False,
 ) -> ChurnClassification:
     """Classify one previous→current request transition (PRD §25 detector).
 
@@ -599,8 +635,18 @@ def classify(
     additionally judged for leaked volatile values
     (:func:`_refine_prefix_volatility`). Detection only: inputs are never
     mutated and no rewrite is ever produced (PRD §25).
+
+    ``cache_identity_changed`` tells the classifier the physical cache
+    fingerprint moved, which lets it name PRD §137's "cache key churn" when no
+    tracked layer explains the move (auth scope / endpoint / api_mode /
+    provider are outside :class:`LayeredHashes`). Callers that classify a pair
+    for any other reason leave it False and keep the honest ``None`` cause.
     """
-    classification = _classify_snapshots(previous.to_hashes(), current.to_hashes())
+    previous_hashes = previous.to_hashes()
+    current_hashes = current.to_hashes()
+    classification = _classify_snapshots(
+        previous_hashes, current_hashes, cache_identity_changed=cache_identity_changed
+    )
     previous_text = previous.serialize()
     current_text = current.serialize()
     if previous_text == current_text:
@@ -608,22 +654,30 @@ def classify(
     else:
         lost_chars = len(previous_text) - _common_prefix_length(previous_text, current_text)
         classification.estimated_prefix_loss_tokens = lost_chars // _CHARS_PER_TOKEN
-    classification.first_divergent_byte = _first_divergence(previous, current)
+    classification.first_divergent_byte = _first_divergence(
+        previous, current, previous_hashes, current_hashes
+    )
     _refine_prefix_volatility(classification, current)
     return classification
 
 
 def classify_hashes(
-    previous: LayeredHashes, current: LayeredHashes
+    previous: LayeredHashes,
+    current: LayeredHashes,
+    *,
+    cache_identity_changed: bool = False,
 ) -> ChurnClassification:
     """Hash-only classification — booleans, cause and confidence without content.
 
     Used when only the stored hashes are available (e.g. the relay right after
     a restart, before any in-memory request snapshot exists). The divergence
     hint and the token loss estimate are unavailable and stay None — never
-    fabricated (PRD §25 honesty).
+    fabricated (PRD §25 honesty). ``cache_identity_changed`` has the same
+    meaning as in :func:`classify`.
     """
-    return _classify_snapshots(previous, current)
+    return _classify_snapshots(
+        previous, current, cache_identity_changed=cache_identity_changed
+    )
 
 
 def changed_frequency(changed_flags: Sequence[bool], *, subject: str = "requests") -> str:

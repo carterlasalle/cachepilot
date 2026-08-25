@@ -10,6 +10,11 @@ Warm safety (PRD §32, §97):
   never re-enters the relay's observation or forwarding path (no recursive
   lease tracking, no re-observation, no telemetry recording, no tool
   execution);
+- the warm resends the snapshot's ``replay_headers`` (the adapter's allowlist
+  applied at capture time), so a provider whose credential or API-version pin
+  is not an ``Authorization`` header still accepts it — synthesizing only
+  ``content-type`` + ``authorization`` silently restricts warming to the
+  OpenAI-compatible dialect;
 - generated content is discarded: only usage/outcome/cost are returned;
 - an uncertain warm (the adapter declined to bound the request) is skipped
   — nothing is sent, nothing is paid for (fail closed for warming,
@@ -59,9 +64,10 @@ class HttpWarmExecutor:
         if body is None:
             # Uncertain warm → skip (invariant 9). Nothing was sent.
             return WarmResult(outcome=None, usage=TokenUsage(), cost_usd=Decimal(0))
-        headers = {"content-type": "application/json"}
-        if snapshot.authorization:
-            headers["authorization"] = snapshot.authorization
+        # PRD §31: replay the captured request's own headers. ``content-type``
+        # is ours (the body is re-serialized as JSON) and never overridden by
+        # the snapshot; nothing outside the adapter's allowlist is present.
+        headers = {**snapshot.replay_headers, "content-type": "application/json"}
         try:
             response = await self._client.post(
                 snapshot.upstream_url,

@@ -5,9 +5,13 @@ import { fmtCost, fmtSeconds, fmtTime, shortHash } from '../format';
 
 const LEASE_POLL_MS = 5000;
 
+// The five resting states LeaseState can actually hold (core: leases.py).
+// 'confirmed_hit' / 'miss_rebuilt' / 'success_unverified' / 'expired' /
+// 'failed' were coloured here but the core never produces them: they are
+// warm OUTCOMES, carried by the telemetry views, not lease states.
 function stateTone(state: string): 'ok' | 'warn' | 'bad' | 'neutral' {
-  if (state === 'armed' || state === 'confirmed_hit') return 'ok';
-  if (state === 'economic_stop' || state === 'miss_rebuilt') return 'bad';
+  if (state === 'armed') return 'ok';
+  if (state === 'economic_stop' || state === 'invalidated') return 'bad';
   if (state === 'warming' || state === 'warm_scheduled') return 'warn';
   return 'neutral';
 }

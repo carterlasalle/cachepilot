@@ -300,6 +300,58 @@ def test_learner_churn_between_invalidates_pair(tmp_path):
     store.close()
 
 
+def test_churn_at_a_window_endpoint_invalidates_the_pair(tmp_path):
+    """PRD §56: the window is inclusive, so an endpoint-collision is not CLEAN.
+
+    The relay writes the request event, the churn event and the TTL observation
+    for one request at effectively the same instant, so a churn event landing
+    exactly on an endpoint is the common case, not a corner case. With strict
+    ``>``/``<`` it was invisible and a demonstrably dirty pair was allowed to
+    refine the TTL bounds — a MISS_REBUILT caused by an identity change would
+    cap ``upper_bound_s`` at a tiny idle age.
+    """
+    for endpoint_offset in (0.0, 183.0):
+        store = _store(tmp_path / f"endpoint-{endpoint_offset}")
+        learner = TTLLearner(store)
+        learner.learn(_obs(Outcome.CONFIRMED_HIT, age_s=0.0))
+        store.record_churn(
+            ChurnEvent(
+                timestamp=T0 + timedelta(seconds=endpoint_offset),
+                session_hash="s1",
+                previous_cache_fingerprint="other-fp",
+                new_cache_fingerprint=FP,
+            )
+        )
+        assert learner.learn(_obs(Outcome.MISS_REBUILT, age_s=183.0)) is None
+        row = store.last_ttl_observation(FP)
+        assert row is not None and not row.clean
+        store.close()
+
+
+def test_stored_timestamps_keep_sub_second_precision(tmp_path):
+    """Truncating to whole seconds biased every idle age upward by up to 1s.
+
+    ``idle_age_s`` is a live microsecond clock minus a STORED timestamp, so a
+    floored write is a one-directional over-estimate that inflates both learned
+    TTL bounds (PRD §55) and makes the scheduler warm later than the evidence
+    supports.
+    """
+    store = _store(tmp_path)
+    precise = T0 + timedelta(seconds=7, microseconds=250_000)
+    store.record_ttl_observation(
+        timestamp=precise,
+        cache_fingerprint=FP,
+        route_hash=ROUTE,
+        idle_age_s=7.25,
+        outcome=Outcome.CONFIRMED_HIT,
+        clean=True,
+    )
+    row = store.last_ttl_observation(FP)
+    assert row is not None
+    assert row.timestamp == precise  # no silent flooring
+    store.close()
+
+
 def test_learner_failed_records_but_never_refines(tmp_path):
     store = _store(tmp_path)
     learner = TTLLearner(store)

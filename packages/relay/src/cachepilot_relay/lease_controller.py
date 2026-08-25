@@ -38,7 +38,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 
-from cachepilot_core.adapters import WarmExecutor
+from cachepilot_core.adapters import OpenAICompatibleAdapter, WarmExecutor
 from cachepilot_core.fingerprint import cache_fingerprint, request_fingerprint
 from cachepilot_core.leases import CacheLease, LeaseDecision, LeaseManager, LeaseSettings
 from cachepilot_core.pricing import estimate_resume_costs
@@ -101,12 +101,22 @@ class LeaseController:
         affinity_config: AffinityConfig | None = None,
         affinity_extra_cost_usd: Decimal | float = Decimal("0.0"),
         affinity_registry: RouteAffinityRegistry | None = None,
+        replay_headers: frozenset[str] | None = None,
     ) -> None:
         self.settings = settings or LeaseSettings()
         #: Memory-only request snapshots (PRD §30). A controller constructed
         #: without one never stores snapshots and its leases stay
         #: non-warmable (fail closed for warming, invariant 9).
         self.snapshot_store = snapshot_store
+        #: PRD §31/§90: the adapter's allowlist of request headers a warm must
+        #: resend. Mirrors ``RelayProxy``'s adapter default so a controller
+        #: wired without an explicit adapter still authenticates its warms;
+        #: the proxy passes ``adapter.replay_headers`` for any other dialect.
+        self.replay_headers = (
+            replay_headers
+            if replay_headers is not None
+            else OpenAICompatibleAdapter.replay_headers
+        )
         self.store = store
         #: P08 (PRD §59): the TTL override chain — force_seconds >
         #: high-confidence learned TTL > adapter hint > default. The profile
@@ -467,11 +477,17 @@ class LeaseController:
     ) -> None:
         """Remember the request body for a due warm — IN MEMORY ONLY (PRD §30).
 
-        The raw body (prompts, history, tool arguments) and the
-        Authorization header live only in this memory store: they are never
-        persisted, never logged. A body that is not valid JSON is skipped
-        (uncertain warm = skip, invariant 9). Fail-open: a snapshot error
-        never breaks forwarding.
+        The raw body (prompts, history, tool arguments) and the credential
+        headers live only in this memory store: they are never persisted,
+        never logged. A body that is not valid JSON is skipped (uncertain warm
+        = skip, invariant 9). Fail-open: a snapshot error never breaks
+        forwarding.
+
+        Only the adapter's ``replay_headers`` allowlist is retained (PRD §31:
+        the warm replays the actual request). Keeping just ``authorization``
+        would silently restrict warming to dialects whose credential is a
+        bearer token — an ``x-api-key`` provider's warm is rejected upstream,
+        earns no cache telemetry and opens the §94 circuit breaker.
         """
         if self.snapshot_store is None:
             return
@@ -489,10 +505,20 @@ class LeaseController:
                 cache_fingerprint=lease.cache_fingerprint,
                 body=parsed,
                 upstream_url=upstream_url,
-                authorization=(request_headers or {}).get("authorization"),
+                replay_headers=self._replay_headers(request_headers),
                 stored_at=time.time(),
             )
         )
+
+    def _replay_headers(self, request_headers: Mapping[str, str] | None) -> dict[str, str]:
+        """The allowlisted subset of *request_headers* a warm may resend."""
+        if not request_headers:
+            return {}
+        return {
+            name.lower(): value
+            for name, value in request_headers.items()
+            if name.lower() in self.replay_headers
+        }
 
     def _prune_snapshots(self) -> None:
         """Forget snapshots for cache identities the manager no longer tracks

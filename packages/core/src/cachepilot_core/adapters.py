@@ -100,9 +100,17 @@ class CacheProviderAdapter(Protocol):
     the PRD's abstract signature models PRD §31's stream-cancel fallback,
     which only adapters that can *verify* it may use; this phase's
     OpenAI-compatible adapter cannot, so skip is expressed as ``None``.
+
+    ``replay_headers`` is the dialect's allowlist of request headers a warm
+    must resend to be accepted upstream (PRD §31: replay the actual request,
+    do not synthesize one). It is an ALLOWLIST, never passthrough: hop-by-hop
+    headers and the relay's own ``X-CachePilot-*`` correlation headers can
+    then never reach the provider, and the set of secret-bearing values a
+    memory-only snapshot may hold stays enumerable (PRD §30, §90).
     """
 
     capabilities: CacheCapabilities
+    replay_headers: frozenset[str]
 
     def canonical_cache_identity(
         self,
@@ -220,6 +228,22 @@ class OpenAICompatibleAdapter:
         route_identity_available=False,
         # No route-affinity mechanism in the generic dialect.
         route_affinity_available=False,
+    )
+
+    #: PRD §31/§90: the request headers a warm must resend for this dialect to
+    #: be accepted upstream. Lower-case, matched case-insensitively against the
+    #: incoming request. Held only in the memory-only snapshot (PRD §30) and
+    #: never persisted or logged. An allowlist by design — a provider header
+    #: this adapter has not verified is never replayed, and neither are
+    #: hop-by-hop or CachePilot correlation headers.
+    replay_headers = frozenset(
+        {
+            "authorization",
+            "api-key",
+            "openai-organization",
+            "openai-project",
+            "openai-beta",
+        }
     )
 
     _OUTPUT_BOUND_FIELDS = (

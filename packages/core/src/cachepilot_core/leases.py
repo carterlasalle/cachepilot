@@ -101,19 +101,30 @@ DEFAULT_DETACHED_RESUME_PROBABILITY = 0.20
 
 
 class LeaseState(str, Enum):
-    """Cache lease state machine — PRD §49."""
+    """Cache lease state machine — the RESTING states of PRD §49-50.
+
+    PRD §50 models ``CONFIRMED_HIT`` / ``SUCCESS_UNVERIFIED`` / ``MISS_REBUILT``
+    as transition labels that immediately resolve back to a resting state
+    (``→ ARMED``), not as states a lease sits in — so they are not members
+    here. That vocabulary already exists twice, in
+    :class:`~cachepilot_core.telemetry.Outcome` (what the provider disclosed)
+    and in :class:`LeaseDecision` (``WARMED_*``, what the scheduler did);
+    a third copy on the state machine could only ever be written and
+    immediately overwritten, so it would lie to ``cachepilot leases``.
+
+    ``EXPIRED`` and ``FAILED`` are likewise absent: PRD §50 gives neither a
+    transition, no expiry sweep exists, and ``estimated_ttl_s`` is an estimate
+    carrying ``ttl_confidence`` — declaring a lease EXPIRED from it would claim
+    knowledge the relay does not have (invariant 3). Repeated warm failure is
+    already handled by the §94 circuit breaker, not by an absorbing state.
+    """
 
     INACTIVE = "inactive"
     ARMED = "armed"
     WARM_SCHEDULED = "warm_scheduled"
     WARMING = "warming"
-    CONFIRMED_HIT = "confirmed_hit"
-    SUCCESS_UNVERIFIED = "success_unverified"
-    MISS_REBUILT = "miss_rebuilt"
     ECONOMIC_STOP = "economic_stop"
-    EXPIRED = "expired"
     INVALIDATED = "invalidated"
-    FAILED = "failed"
 
 
 @dataclass
@@ -571,11 +582,22 @@ class LeaseManager:
     def after_normal_request(self, lease_id: str, outcome: Outcome) -> None:
         """PRD §148: real request finished.
 
-        On success the cache was genuinely touched by a real request, so the
-        deadline resets (``last_cache_touch_at = now``, rearm). On FAILED the
-        cache is NOT refreshed — a failed provider call is never treated as
-        a cache touch (invariant 3, §148). An INVALIDATED lease is never
-        refreshed either (§21).
+        The deadline resets (``last_cache_touch_at = now``, rearm) for every
+        non-FAILED outcome, INCLUDING SUCCESS_UNVERIFIED — deliberately, and
+        asymmetrically to the warm path. PRD §64 ("natural requests are free
+        heartbeats": a normal request "already touches/reuses the cache" ⇒
+        "reset lease age") and §148's outcome-free ``lease.last_cache_touch =
+        now()`` both key on the PHYSICAL act: the prefix was re-sent upstream,
+        so the provider's entry was touched whatever the response disclosed
+        about it. A warm is CachePilot's own speculative spend, so §147 plus
+        invariants 3 and 9 make it evidence-gated instead (see
+        :meth:`_apply_warm_result`). What is NOT reset without verified
+        evidence is the §94 circuit breaker, whose whole purpose is tracking
+        verifiability.
+
+        On FAILED the cache is NOT refreshed — a failed provider call is never
+        treated as a cache touch (invariant 3, §148). An INVALIDATED lease is
+        never refreshed either (§21).
         """
         lease = self._require(lease_id)
         runtime = self._runtime_for(lease_id)
@@ -584,10 +606,15 @@ class LeaseManager:
             return
         if outcome == Outcome.FAILED:
             return
-        # §94: a successful normal request produced fresh cache evidence —
-        # reopen the warm circuit (and clear the miss streak) if it was open.
-        runtime.circuit_open = False
-        runtime.consecutive_warm_misses = 0
+        # §94: reopen the warm circuit ONLY on a verified cache touch. The
+        # breaker exists to stop warming a lease whose cache activity cannot be
+        # verified, so a SUCCESS_UNVERIFIED response — which is every streaming
+        # response — must not clear it: that would defeat the guard on exactly
+        # the traffic it was built for. §64's free heartbeat justifies resetting
+        # the lease AGE (below), not a breaker that tracks verifiability.
+        if outcome in (Outcome.CONFIRMED_HIT, Outcome.MISS_REBUILT):
+            runtime.circuit_open = False
+            runtime.consecutive_warm_misses = 0
         now = self.time_fn()
         lease.last_cache_touch_at = now
         if outcome == Outcome.CONFIRMED_HIT:
@@ -902,6 +929,12 @@ class LeaseManager:
                 )
                 return LeaseDecision.SKIPPED_UNSUPPORTED
             runtime.warm_request_active = True
+            # §50: `no real request racing + economics positive → WARMING`.
+            # This is the one state the §78 CLI table can only show while a
+            # warm is physically in flight, so it is set here and resolved
+            # back to the resting state (§50 `→ ARMED`) below, whatever the
+            # outcome — the outcome itself travels in the LeaseDecision.
+            lease.state = LeaseState.WARMING
             try:
                 try:
                     result = await self.warm_executor.execute(snapshot)
@@ -920,6 +953,7 @@ class LeaseManager:
                     )
             finally:
                 runtime.warm_request_active = False
+                lease.arm()
             return self._apply_warm_result(lease, runtime, result)
 
     def _apply_warm_result(
@@ -930,8 +964,10 @@ class LeaseManager:
     ) -> LeaseDecision:
         """Fold one warm's parsed usage/outcome into the lease (PRD §147).
 
-        Invariant 3 / PRD §147 wording — ``last_cache_touch_at`` advances
-        ONLY on a verified cache touch:
+        Invariant 3 / PRD §147 wording — for a WARM (this method only; the
+        normal-request path follows §64/§148 instead, see
+        :meth:`after_normal_request`) ``last_cache_touch_at`` advances ONLY on a
+        verified cache touch:
 
         - CONFIRMED_HIT refreshes (provider telemetry proved the read);
         - MISS_REBUILT refreshes only when ``cache_write_tokens > 0`` — the

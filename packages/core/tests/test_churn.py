@@ -315,6 +315,98 @@ def test_classify_cache_key_churn():
     assert classification.confidence == 0.70
 
 
+
+# -- PRD §137 residual cause + confidence arithmetic --------------------------
+
+
+def test_residual_cause_names_untracked_identity_churn():
+    """PRD §137 "cache key churn": the fingerprint moved, no tracked layer did.
+
+    Auth scope, endpoint, api_mode and provider are part of physical cache
+    identity but are outside :class:`LayeredHashes`, so the classifier cannot
+    see them. Without the caller's identity-moved signal it returned no cause
+    at all and ``explain-miss`` printed "n/a (not classified)" for a whole
+    class of real cache destruction.
+    """
+    identical = _content()
+    classification = classify(identical, _content(), cache_identity_changed=True)
+    assert classification.likely_cause == "cache identity changed outside the tracked layers"
+    assert classification.confidence == 0.60
+
+
+def test_residual_cause_never_invents_one_without_the_signal():
+    """The honesty rule holds: an unexplained pair with no signal has no cause."""
+    classification = classify(_content(), _content())
+    assert classification.likely_cause is None
+    assert classification.confidence is None
+
+
+def test_a_tracked_layer_always_beats_the_residual_cause():
+    classification = classify(
+        _content(), _content(model="gpt-5.3"), cache_identity_changed=True
+    )
+    assert classification.likely_cause == "provider failover (model switched)"
+    assert classification.confidence == 0.85
+
+
+def test_residual_cause_works_on_the_hash_only_path():
+    hashes = _content().to_hashes()
+    classification = classify_hashes(hashes, hashes, cache_identity_changed=True)
+    assert classification.likely_cause == "cache identity changed outside the tracked layers"
+    assert classification.confidence == 0.60
+
+
+def test_confidence_never_rises_above_the_base_with_zero_flat_layers():
+    """``base - 0.10 * (changed - 1)`` ADDS 0.10 when no flat layer changed.
+
+    Reachable through the public hash-only API with a layered-but-not-flat
+    snapshot (documented in :class:`LayeredHashes` as the post-restart shape):
+    a cause is found from the layered hashes while every flat flag is False,
+    so the penalty term inverts into a bonus and the case with the LEAST
+    evidence scores highest.
+    """
+    previous = LayeredHashes(
+        system_prefix_hash=hash_content("stable prefix"),
+        system_suffix_hash=hash_content("suffix one"),
+    )
+    current = LayeredHashes(
+        system_prefix_hash=hash_content("stable prefix"),
+        system_suffix_hash=hash_content("suffix two"),
+    )
+    classification = classify_hashes(previous, current)
+    assert classification.system_changed is False  # no flat hashes to compare
+    # The suffix layer's base confidence is 0.85 and there is no EXTRA changed
+    # layer to penalise, so 0.85 is the ceiling for this pair.
+    assert classification.likely_cause == "volatile value inserted into prompt prefix"
+    assert classification.confidence == 0.85
+
+
+def test_residual_cause_confidence_is_its_base_not_a_bonus():
+    """The residual cause is reached with zero changed flat layers too."""
+    classification = classify(_content(), _content(), cache_identity_changed=True)
+    assert classification.confidence == 0.60  # never 0.70
+
+
+def test_classify_hashes_each_side_once(monkeypatch):
+    """PRD §24 layers are hashed once per side, not twice.
+
+    ``classify`` built the layered hashes and then ``_first_divergence``
+    recomputed both sides from scratch — 8 SHA-256 digests plus four canonical
+    JSON serializations per redundant call, over request bodies the relay
+    caches up to 1 MiB.
+    """
+    calls = {"n": 0}
+    original = RequestContent.to_hashes
+
+    def counting(self):
+        calls["n"] += 1
+        return original(self)
+
+    monkeypatch.setattr(RequestContent, "to_hashes", counting)
+    classify(_content(), _content(messages=[{"role": "user", "content": "other"}]))
+    assert calls["n"] == 2  # one per side
+
+
 def test_classify_route_dominates_content_churn():
     """A route change destroys the whole physical cache — it stays the primary
     cause even when content also moved; extra layers lower the confidence."""

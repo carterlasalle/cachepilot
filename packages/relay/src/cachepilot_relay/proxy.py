@@ -146,6 +146,9 @@ class RelayProxy:
                 store=self.observer.store if self.observer is not None else None,
                 enabled=config.observation_enabled,
                 snapshot_store=SnapshotStore(),
+                # PRD §31: the warm resends exactly the headers this dialect
+                # declares replay-safe.
+                replay_headers=self._adapter.replay_headers,
                 warm_executor=HttpWarmExecutor(
                     self._client,
                     self._adapter,
@@ -203,7 +206,31 @@ class RelayProxy:
             outcome = self._observe_failure(request, url, forward_body)
             # §148: a failed call must never be treated as a cache refresh.
             self._lease_end(lease_ctx, outcome or Outcome.FAILED)
-            return Response(b"", status_code=502)
+            # PRD §93 relay failure isolation: no response was ever received,
+            # so there is no upstream status/body/headers to mirror. A timeout
+            # is a distinct condition from an unreachable upstream and clients
+            # retry the two differently, so it gets its own status. The body
+            # names the condition only — never the exception text, which
+            # carries the upstream URL (and therefore any query-string
+            # credential, AGENTS.md rule 10).
+            timed_out = isinstance(exc, httpx.TimeoutException)
+            return Response(
+                json.dumps(
+                    {
+                        "error": {
+                            "type": "upstream_timeout" if timed_out else "upstream_unreachable",
+                            "message": (
+                                "the upstream provider did not respond in time"
+                                if timed_out
+                                else "the upstream provider could not be reached"
+                            ),
+                        }
+                    },
+                    separators=(",", ":"),
+                ).encode("utf-8"),
+                status_code=504 if timed_out else 502,
+                media_type="application/json",
+            )
         response_headers = strip_hop_by_hop(upstream.headers)
         # aiter_raw() keeps the body byte-exact (no transparent decompression).
         if should_stream(upstream):
