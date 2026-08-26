@@ -172,14 +172,16 @@ class TTLProfile(BaseModel):
         - MISS_REBUILT at idle age A → ``upper_bound = min(upper, A)``
           (or A when unset); confidence rises, unless it contradicts a
           known lower bound;
-        - SUCCESS_UNVERIFIED → counts as an observation but lowers
-          confidence (unverified response, §58);
+        - SUCCESS_UNVERIFIED → lowers confidence but is NOT counted as a
+          sample (unverified response, §58): only request-completion is known,
+          so it is not TTL evidence and must never help a profile clear the
+          resolver's ``sample_count >= minimum_samples`` gate for the learned
+          tier (PRD §59);
         - FAILED → no TTL evidence; nothing changes (invariant 3).
         """
         if outcome is Outcome.FAILED:
             return
         if outcome is Outcome.SUCCESS_UNVERIFIED:
-            self.sample_count += 1
             self._adjust_confidence(_UNVERIFIED_DELTA)
         elif idle_age_s is not None and idle_age_s >= 0:
             self.sample_count += 1
@@ -405,7 +407,17 @@ class TTLResolver:
         route_hash: str | None,
         adapter_hint: TTLHint | None = None,
     ) -> TTLResolution:
-        """Resolve the TTL for one route through the §59 hierarchy."""
+        """Resolve the TTL for one route through the §59 hierarchy.
+
+        ``TTLResolution.confidence`` is a PROVENANCE score for the resolved
+        value, not a :class:`TTLProfile` confidence: the ``force`` tier is an
+        explicit operator override and reports 1.0, which learning can never
+        reach because a learned profile is clamped to
+        :data:`CONFIDENCE_CEIL` (0.95, so evidence never claims certainty).
+        The two therefore live on different scales and must not be compared to
+        each other, or to a literal 1.0 — the only threshold that governs the
+        learned tier is :data:`HIGH_CONFIDENCE_THRESHOLD`.
+        """
         if self.force_seconds is not None:
             return TTLResolution(ttl_s=self.force_seconds, confidence=1.0, source="force")
         profile = None

@@ -60,7 +60,12 @@ Notes:
   bare `uv run pytest` can resync to default groups and drop them.
 - The full suite spans `packages/*/tests` plus root `tests/`; pytest 9
   requires unique test module basenames across the whole tree.
-- `benchmarks/` (if present) is not part of the test suite.
+- `benchmarks/benchmark_polling_reduction.py` IS exercised by the test suite
+  (`packages/hermes-plugin/tests/test_benchmark_polling_reduction.py` imports
+  and runs it). It is an arithmetic **simulation** of the polling model —
+  `ceil(task_duration / poll_interval)` stock calls versus a hardcoded `0` —
+  not a measurement of a real agent loop, so its output must never be cited
+  as a product benchmark.
 - mypy on the full tree is currently blocked by a pre-existing PEP-695
   syntax error in `packages/core/src/cachepilot_core/adapters.py:57` — run
   mypy per-file with `--follow-imports=skip` when the whole-tree run fails

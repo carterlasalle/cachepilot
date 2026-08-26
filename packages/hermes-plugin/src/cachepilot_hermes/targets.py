@@ -6,8 +6,10 @@ while its refcount is positive; the cache lease (Phase 5+) remains relevant
 while ``active_targets > 0`` (PRD §46).
 
 Subagent existence is driven EXCLUSIVELY by the ``subagent_start`` /
-``subagent_stop`` lifecycle hooks wired in ``lifecycle.py`` — never inferred
-from conversation text (PRD §48).
+``subagent_stop`` lifecycle hooks wired in ``lifecycle.py``; ``process``
+target existence is driven by the ``tool_request`` middleware's
+auto-background promotion and the matching ``post_tool_call`` completion —
+never inferred from conversation text (PRD §48).
 
 The registry is deliberately small and thread-safe (hooks may fire from
 different threads); refcounts clamp at zero and never go negative.
@@ -19,7 +21,28 @@ import threading
 from dataclasses import dataclass
 from typing import Literal
 
+from cachepilot_hermes.duration_history import normalize_signature
+
 TargetKind = Literal["process", "subagent", "external"]
+
+#: Namespace prefix for ``process`` target ids (PRD §46).
+PROCESS_TARGET_PREFIX = "process:"
+
+
+def process_target_id(command: str) -> str:
+    """Stable ``process`` target id for one auto-backgrounded terminal command.
+
+    Derived from the normalized command signature so the two surfaces that must
+    agree — the ``tool_request`` middleware that registers the target when it
+    promotes the call, and the ``post_tool_call`` hook that releases it on
+    completion — compute the same id from the payload they both receive
+    (``args["command"]``), without depending on a tool-call id only one of them
+    is guaranteed to be handed. Concurrent runs of the same command share the
+    id and are balanced by the registry's refcount. The signature is
+    normalized, so no raw command text becomes a persisted identity
+    (AGENTS.md rule 10).
+    """
+    return f"{PROCESS_TARGET_PREFIX}{normalize_signature(command)}"
 
 
 @dataclass(frozen=True)

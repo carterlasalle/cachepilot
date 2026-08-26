@@ -14,8 +14,9 @@ matching Hermes v0.20.0's middleware contract (hermes_cli/middleware.py):
   ``next_call``; invoking it once with the original request and returning
   its result reproduces stock behavior exactly.
 
-Correlation headers (PRD §29): ``X-CachePilot-Session`` (cached per
-process), ``X-CachePilot-Request`` (fresh per ``llm_request`` call) and
+Correlation headers (PRD §29): ``X-CachePilot-Session`` (the Hermes session id
+reported by the lifecycle hooks — see :mod:`cachepilot_hermes.session`),
+``X-CachePilot-Request`` (fresh per ``llm_request`` call) and
 ``X-CachePilot-Turn`` (deterministic per session/request pair). The relay
 strips them before forwarding upstream, so they never affect provider cache
 identity. Injection is strictly fail-open: it never raises, never mutates
@@ -36,6 +37,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from cachepilot_hermes.config import PLUGIN_LOGGER_NAME, CachePilotConfig, emit_debug
+from cachepilot_hermes.session import current_session_id
 from cachepilot_hermes.targets import BackgroundTargetRegistry
 
 logger = logging.getLogger(PLUGIN_LOGGER_NAME)
@@ -59,17 +61,6 @@ CORRELATION_HEADERS: tuple[str, ...] = (
 #: Fixed namespace (uuid.NAMESPACE_URL) so turn ids are deterministic for a
 #: given (session, request) pair across processes and restarts.
 _TURN_NAMESPACE = uuid.UUID("6ba7b811-9dad-11d1-80b4-00c04fd430c8")
-
-#: Per-process session id, cached for the lifetime of the process.
-_process_session_id: str | None = None
-
-
-def process_session_id() -> str:
-    """Return the per-process session id, creating it on first use."""
-    global _process_session_id
-    if _process_session_id is None:
-        _process_session_id = str(uuid.uuid4())
-    return _process_session_id
 
 
 def compute_turn_id(session_id: str, request_id: str) -> str:
@@ -117,7 +108,7 @@ def attach_correlation_headers(
 def make_llm_request_middleware(
     config: CachePilotConfig,
     *,
-    session_id_provider: Callable[[], str] = process_session_id,
+    session_id_provider: Callable[[], str] = current_session_id,
     request_id_provider: Callable[[], str] = lambda: str(uuid.uuid4()),
     targets_registry: BackgroundTargetRegistry | None = None,
 ) -> Callable[..., Any]:
@@ -125,7 +116,12 @@ def make_llm_request_middleware(
 
     Args:
         config: plugin settings (``correlation_headers`` gates injection).
-        session_id_provider: session id source (default: per-process cached).
+        session_id_provider: session id source. The default is the Hermes
+            session id published by the lifecycle hooks
+            (:func:`cachepilot_hermes.session.current_session_id`) — the same
+            identity background targets are registered under, which is what
+            makes ``X-CachePilot-Targets`` non-zero. A per-process uuid would
+            be a disjoint namespace and would always count 0 targets.
         request_id_provider: per-call request id source (default: fresh
             uuid4). Both are injectable so tests are deterministic.
         targets_registry: optional background-target registry (PRD §46).

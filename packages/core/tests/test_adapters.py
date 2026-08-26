@@ -12,6 +12,7 @@ from __future__ import annotations
 import httpx
 import pytest
 from cachepilot_core.adapters import CacheCapabilities, OpenAICompatibleAdapter
+from cachepilot_core.fingerprint import CACHE_IDENTITY_FIELDS
 from cachepilot_core.fingerprint import cache_fingerprint as fingerprint_of
 from cachepilot_core.identity import ApiMode, CanonicalRequest
 from cachepilot_core.telemetry import Outcome
@@ -93,6 +94,40 @@ def test_build_warm_request_no_bound_field_skips():
         )
         is None
     )
+
+
+def test_build_warm_request_disables_streaming():
+    """PRD §31/§70: a streamed warm can never be verified, so warms never stream.
+
+    An SSE body has no parseable ``usage``, so the outcome can only ever be
+    SUCCESS_UNVERIFIED — spend with zero evidence, and two of those open the §94
+    circuit breaker. ``stream`` is excluded from ``CACHE_IDENTITY_FIELDS``
+    (PRD §23, invariant 8), so clearing it keeps the same cache identity.
+    """
+    original = {
+        "model": "gpt-5.2",
+        "messages": _MESSAGES,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "max_tokens": 512,
+    }
+    warm = _adapter().build_warm_request(original)
+    assert warm is not None
+    assert warm["stream"] is False
+    assert warm["max_tokens"] == 1  # still output-bounded
+    assert original["stream"] is True  # the snapshot is never mutated
+    # Invariant 8 / PRD §23: neither field the warm rewrites is part of cache
+    # identity, so the replay still targets the same physical cache entry.
+    assert "stream" not in CACHE_IDENTITY_FIELDS
+    assert "max_tokens" not in CACHE_IDENTITY_FIELDS
+
+
+def test_build_warm_request_never_introduces_stream():
+    warm = _adapter().build_warm_request(
+        {"model": "gpt-5.2", "messages": _MESSAGES, "max_tokens": 8}
+    )
+    assert warm is not None
+    assert "stream" not in warm
 
 
 def test_build_warm_request_tool_policy_keeps_tools_and_tool_choice():

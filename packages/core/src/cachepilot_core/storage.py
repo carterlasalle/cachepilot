@@ -393,6 +393,20 @@ def _try_enable_wal(conn: sqlite3.Connection) -> bool:
         return False
 
 
+#: Timestamps are stored at MICROSECOND precision. Truncating to whole seconds
+#: made every stored instant up to 1s EARLIER than the event, which biased
+#: ``idle_age_s`` (a live microsecond clock minus a stored timestamp) upward and
+#: so inflated both learned TTL bounds (PRD §55) — and it made the PRD §56
+#: clean-check blind to a churn event that shared a second with either window
+#: endpoint, admitting a dirty observation pair as CLEAN.
+_TIMESPEC = "microseconds"
+
+
+def _iso(value: datetime) -> str:
+    """Canonical UTC storage form for a timestamp (microsecond precision)."""
+    return value.astimezone(UTC).isoformat(timespec=_TIMESPEC)
+
+
 def _decimal_to_text(value: Decimal | None) -> str | None:
     return None if value is None else str(value)
 
@@ -654,7 +668,7 @@ def _lease_row_values(lease: CacheLease) -> tuple[Any, ...]:
         None if lease.estimated_cold_resume_cost_usd is None else str(lease.estimated_cold_resume_cost_usd),
         None if lease.estimated_cached_resume_cost_usd is None else str(lease.estimated_cached_resume_cost_usd),
         lease.state.value,
-        datetime.now(UTC).isoformat(timespec="seconds"),
+        _iso(datetime.now(UTC)),
     )
 
 
@@ -787,7 +801,7 @@ class TelemetryStore:
                 """,
                 (
                     event.session_hash,
-                    event.timestamp.astimezone(UTC).isoformat(timespec="seconds"),
+                    _iso(event.timestamp),
                     event.provider,
                     event.model,
                     event.route_hash,
@@ -823,7 +837,7 @@ class TelemetryStore:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    churn.timestamp.astimezone(UTC).isoformat(timespec="seconds"),
+                    _iso(churn.timestamp),
                     churn.session_hash,
                     churn.previous_cache_fingerprint,
                     churn.new_cache_fingerprint,
@@ -1045,9 +1059,9 @@ class TelemetryStore:
                     profile.latency_p95_ms,
                     profile.sample_count,
                     (
-                        profile.updated_at.astimezone(UTC).isoformat(timespec="seconds")
+                        _iso(profile.updated_at)
                         if profile.updated_at is not None
-                        else datetime.now(UTC).isoformat(timespec="seconds")
+                        else _iso(datetime.now(UTC))
                     ),
                     profile.profile_key,
                 ),
@@ -1104,7 +1118,7 @@ class TelemetryStore:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    timestamp.astimezone(UTC).isoformat(timespec="seconds"),
+                    _iso(timestamp),
                     cache_fingerprint,
                     route_hash,
                     idle_age_s,
@@ -1177,25 +1191,34 @@ class TelemetryStore:
         start: datetime,
         end: datetime,
     ) -> bool:
-        """True when a churn event touched the fingerprint inside (start, end).
+        """True when a churn event touched the fingerprint inside [start, end].
 
         PRD §56 clean-check: an intervening identity change means the two
         observations are NOT consecutive with stable cache identity, so the
         pair must not refine TTL bounds.
+
+        The window is INCLUSIVE at both ends. The endpoints are the two
+        observations' own timestamps, and the relay writes the request event,
+        the churn event and the TTL observation for one request within the same
+        instant — with strict comparisons a churn event recorded at exactly an
+        endpoint was invisible, so a pair whose identity demonstrably changed
+        was admitted as CLEAN and allowed to refine the TTL bounds. Being
+        inclusive can only ever reject a pair, which is the safe direction for
+        the §56 guarantee.
         """
         with self._lock:
             row = self._require_conn().execute(
                 """
                 SELECT 1 FROM churn_events
                 WHERE (previous_cache_fingerprint = ? OR new_cache_fingerprint = ?)
-                  AND timestamp > ? AND timestamp < ?
+                  AND timestamp >= ? AND timestamp <= ?
                 LIMIT 1
                 """,
                 (
                     cache_fingerprint,
                     cache_fingerprint,
-                    start.astimezone(UTC).isoformat(timespec="seconds"),
-                    end.astimezone(UTC).isoformat(timespec="seconds"),
+                    _iso(start),
+                    _iso(end),
                 ),
             ).fetchone()
         return row is not None
@@ -1220,7 +1243,7 @@ class TelemetryStore:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    event.timestamp.astimezone(UTC).isoformat(timespec="seconds"),
+                    _iso(event.timestamp),
                     event.session_hash,
                     event.cache_fingerprint,
                     event.request_fingerprint,
@@ -1261,9 +1284,7 @@ class TelemetryStore:
         earlier request (the affinity must react to fresh evidence only).
         """
         if since is not None:
-            since_iso = datetime.fromtimestamp(since, tz=UTC).isoformat(
-                timespec="seconds"
-            )
+            since_iso = _iso(datetime.fromtimestamp(since, tz=UTC))
             sql = (
                 f"SELECT {', '.join(_ROUTE_EVENT_COLUMNS)} FROM route_events "
                 "WHERE session_hash = ? AND timestamp >= ? ORDER BY id DESC LIMIT 1"

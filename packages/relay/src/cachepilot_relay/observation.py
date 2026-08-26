@@ -124,6 +124,39 @@ def provider_from_upstream(url: str) -> str:
     return _KNOWN_GATEWAYS.get(host, host)
 
 
+def endpoint_identity(url: str) -> str:
+    """The identity/persistence form of an upstream URL: scheme, host, path.
+
+    The query string, the fragment and any ``user:pass@`` userinfo are stripped.
+    Two independent reasons, both invariants of this project:
+
+    - ``endpoint`` is a cache-identity field (PRD §22) and keys the §82 TTL
+      profile, so a per-request query parameter fragments cache identity and
+      spawns a fresh profile per request. Sharper: a provider that signals
+      streaming in the query (``?alt=sse``) would put the stream flag INSIDE
+      cache identity, which invariant 8 explicitly excludes — the bounded warm
+      would then no longer refresh the entry the streaming request depends on.
+    - ``route_events.endpoint`` is the one identity column persisted in the
+      clear (PRD §71 route identity), and the query string is exactly where a
+      credential travels for ``?key=<secret>``-style providers. The relay only
+      recognises the ``Authorization`` header as a credential channel, so such
+      a key would land unhashed in the telemetry DB — AGENTS.md rule 10.
+
+    The FORWARDED request is untouched: the relay still sends method, path and
+    query verbatim (``RelayProxy.forward``). Only what CachePilot identifies
+    and stores is normalized.
+    """
+    without_fragment = url.split("#", 1)[0]
+    without_query = without_fragment.split("?", 1)[0]
+    scheme, separator, rest = without_query.partition("://")
+    if not separator:
+        scheme, rest = "", without_query
+    authority, slash, path = rest.partition("/")
+    if "@" in authority:
+        authority = authority.rsplit("@", 1)[1]
+    return f"{scheme}{separator}{authority}{slash}{path}"
+
+
 def derive_auth_scope(headers: Mapping[str, str]) -> str:
     """Auth/profile scope label derived WITHOUT persisting credentials.
 
@@ -231,11 +264,12 @@ def build_canonical_request(
     model = (payload or {}).get("model") or "unknown"
     messages = _non_system_messages(payload) if payload else []
     tools = (payload or {}).get("tools") or (payload or {}).get("functions")
+    endpoint = endpoint_identity(upstream_url)
     return CanonicalRequest.from_content(
-        provider=provider_from_upstream(upstream_url),
+        provider=provider_from_upstream(endpoint),
         model=model,
         api_mode=infer_api_mode(path, payload),
-        endpoint=upstream_url,
+        endpoint=endpoint,
         auth_scope=auth_scope,
         prompt_prefix=_canonical_json(messages) if messages else None,
         system=_system_content(payload) if payload else None,
@@ -263,8 +297,8 @@ def extract_route_identity(
 ) -> RouteIdentity:
     """Extract observable route identity (PRD §71) from the physical request
     and response headers. Unobservable fields stay None."""
-    gateway = provider_from_upstream(upstream_url)
-    endpoint = upstream_url
+    endpoint = endpoint_identity(upstream_url)
+    gateway = provider_from_upstream(endpoint)
     lower_headers = {key.lower(): value for key, value in response_headers.items()}
     upstream_provider = next(
         (lower_headers[key] for key in _HEADER_UPSTREAM_PROVIDER if key in lower_headers), None
@@ -291,9 +325,10 @@ def request_route_identity(upstream_url: str) -> RouteIdentity:
     hashes are identical, keeping the lease's route key in sync with the
     observed route (P08 TTL route keying, PRD §82).
     """
+    endpoint = endpoint_identity(upstream_url)
     return RouteIdentity(
-        gateway=provider_from_upstream(upstream_url),
-        endpoint=upstream_url,
+        gateway=provider_from_upstream(endpoint),
+        endpoint=endpoint,
     )
 
 
@@ -319,6 +354,10 @@ class RequestObserver:
         #: False the observer records ZERO churn events (``CACHEPILOT_CHURN_DETECTION_ENABLED``).
         self.churn_detection_enabled = churn_detection_enabled
         self._normalizer = UsageNormalizer()
+        #: Streaming responses observed without usage telemetry (PRD §70). A
+        #: nonzero value means the cost/TTL/survival evidence chain is inert
+        #: for that share of traffic — see :meth:`observe_streaming`.
+        self.streaming_unverified = 0
         #: P09 (PRD UC-5): classifies a miss on a repeated logical request
         #: after a route change as ROUTE_INSTABILITY (never short-TTL
         #: evidence). Gated by ``CACHEPILOT_ROUTE_INTEL`` (default true).
@@ -422,10 +461,28 @@ class RequestObserver:
         purity first. Streaming usage parsing (e.g. OpenAI ``stream_options``
         final-chunk usage) is deferred to a later phase.
 
+        That deferral is NOT free, and it used to be silent. With no usage:
+
+        - ``update_cost_estimates`` never runs, so a lease's resume-cost
+          estimates stay None, ``pricing_known`` is False and the economic
+          controller returns SKIP_UNKNOWN_PRICING on every tick — a
+          streaming-only deployment never warms, and no amount of
+          ``CACHEPILOT_PRICING_*`` configuration changes that;
+        - ``SUCCESS_UNVERIFIED`` moves no TTL bound and is not a sample, so the
+          learned-TTL tier is unreachable and the resolver stays on the
+          bootstrap default;
+        - the survival curve gets no evidence (only verified outcomes count).
+
+        So the first streaming response per process logs a WARNING naming those
+        consequences: the operator sees "warming is inert" instead of inferring
+        it from an empty cost column. Every subsequent one is DEBUG, and
+        ``streaming_unverified`` counts them for the whole process.
+
         Returns the classified outcome (None when observation is disabled).
         """
         if not self.enabled or self.store is None:
             return None
+        self._note_streaming_inertness()
         if not 200 <= status_code < 300:
             # A non-2xx "streaming" response is simply a failed request; the
             # (never-consumed) response body is irrelevant to the FAILED
@@ -461,6 +518,25 @@ class RequestObserver:
             body=body,
         )
         return Outcome.SUCCESS_UNVERIFIED
+
+    def _note_streaming_inertness(self) -> None:
+        """Surface the streaming observation gap once per process (loudly)."""
+        self.streaming_unverified += 1
+        if self.streaming_unverified == 1:
+            logger.warning(
+                "streaming response observed: no usage telemetry is available "
+                "(the stream is never consumed), so this request records "
+                "SUCCESS_UNVERIFIED with zero usage. Consequences while traffic "
+                "stays streaming: resume-cost estimates stay unknown, so the "
+                "economic controller skips every warm with SKIP_UNKNOWN_PRICING; "
+                "TTL bounds never move, so the learned-TTL tier stays "
+                "unreachable; and the survival curve gets no evidence."
+            )
+        else:
+            logger.debug(
+                "streaming response observed (unverified, zero usage; count=%d)",
+                self.streaming_unverified,
+            )
 
     def observe_failure(
         self,
@@ -703,6 +779,13 @@ class RequestObserver:
         hint stay None, never fabricated. Fail-open: any classifier error
         degrades to an empty classification (booleans/cause still recorded by
         the caller — traffic unaffected, AGENTS.md invariant 9).
+
+        ``cache_identity_changed=True`` is sound here by construction: this
+        method is only ever reached from the fingerprint-transition guard in
+        :meth:`_record`, never per request. It lets the classifier name PRD
+        §137's "cache key churn" for a move the tracked layers cannot see
+        (auth scope / endpoint / api_mode / provider) instead of persisting a
+        row with ``cache_key_changed=True`` and no cause at all.
         """
         if previous_body is not None and current_body is not None:
             previous_payload = _json_or_none(previous_body)
@@ -720,6 +803,7 @@ class RequestObserver:
                             route_hash=event.route_hash,
                             model=event.model,
                         ),
+                        cache_identity_changed=True,
                     )
                 except Exception:
                     logger.warning("churn classification failed (traffic unaffected)", exc_info=True)
@@ -739,6 +823,7 @@ class RequestObserver:
                     route_hash=event.route_hash,
                     model=event.model,
                 ),
+                cache_identity_changed=True,
             )
         except Exception:
             logger.warning("hash-only churn classification failed (traffic unaffected)", exc_info=True)

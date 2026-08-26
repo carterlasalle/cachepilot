@@ -124,14 +124,28 @@ def test_confidence_increases_on_consistent_observations():
     assert profile.sample_count == 2
 
 
-def test_unverified_lowers_confidence_but_counts_as_observation():
+def test_unverified_lowers_confidence_but_is_not_a_sample():
+    """§58: SUCCESS_UNVERIFIED is explicitly not evidence, so it is not a sample.
+
+    Counting it toward ``sample_count`` lets pure non-evidence clear the
+    resolver's ``sample_count >= minimum_samples`` gate and promote a profile to
+    the learned tier (PRD §59).
+    """
     profile = _fresh_profile()
     profile.observe(Outcome.CONFIRMED_HIT, 100.0)
     profile.observe(Outcome.SUCCESS_UNVERIFIED, None)
     assert profile.confidence == pytest.approx(0.50)
-    assert profile.sample_count == 2
+    assert profile.sample_count == 1  # the hit only
     # bounds are untouched by an unverified response
     assert profile.lower_bound_s == 100.0
+
+
+def test_unverified_observations_alone_never_accumulate_samples():
+    profile = _fresh_profile()
+    for _ in range(5):
+        profile.observe(Outcome.SUCCESS_UNVERIFIED, None)
+    assert profile.sample_count == 0
+    assert profile.confidence < 0.5  # non-evidence only ever lowers confidence
 
 
 def test_inconsistent_evidence_lowers_confidence():
@@ -283,6 +297,58 @@ def test_learner_churn_between_invalidates_pair(tmp_path):
     assert learner.learn(_obs(Outcome.CONFIRMED_HIT, age_s=183.0)) is None
     row = store.last_ttl_observation(FP)
     assert row is not None and not row.clean
+    store.close()
+
+
+def test_churn_at_a_window_endpoint_invalidates_the_pair(tmp_path):
+    """PRD §56: the window is inclusive, so an endpoint-collision is not CLEAN.
+
+    The relay writes the request event, the churn event and the TTL observation
+    for one request at effectively the same instant, so a churn event landing
+    exactly on an endpoint is the common case, not a corner case. With strict
+    ``>``/``<`` it was invisible and a demonstrably dirty pair was allowed to
+    refine the TTL bounds — a MISS_REBUILT caused by an identity change would
+    cap ``upper_bound_s`` at a tiny idle age.
+    """
+    for endpoint_offset in (0.0, 183.0):
+        store = _store(tmp_path / f"endpoint-{endpoint_offset}")
+        learner = TTLLearner(store)
+        learner.learn(_obs(Outcome.CONFIRMED_HIT, age_s=0.0))
+        store.record_churn(
+            ChurnEvent(
+                timestamp=T0 + timedelta(seconds=endpoint_offset),
+                session_hash="s1",
+                previous_cache_fingerprint="other-fp",
+                new_cache_fingerprint=FP,
+            )
+        )
+        assert learner.learn(_obs(Outcome.MISS_REBUILT, age_s=183.0)) is None
+        row = store.last_ttl_observation(FP)
+        assert row is not None and not row.clean
+        store.close()
+
+
+def test_stored_timestamps_keep_sub_second_precision(tmp_path):
+    """Truncating to whole seconds biased every idle age upward by up to 1s.
+
+    ``idle_age_s`` is a live microsecond clock minus a STORED timestamp, so a
+    floored write is a one-directional over-estimate that inflates both learned
+    TTL bounds (PRD §55) and makes the scheduler warm later than the evidence
+    supports.
+    """
+    store = _store(tmp_path)
+    precise = T0 + timedelta(seconds=7, microseconds=250_000)
+    store.record_ttl_observation(
+        timestamp=precise,
+        cache_fingerprint=FP,
+        route_hash=ROUTE,
+        idle_age_s=7.25,
+        outcome=Outcome.CONFIRMED_HIT,
+        clean=True,
+    )
+    row = store.last_ttl_observation(FP)
+    assert row is not None
+    assert row.timestamp == precise  # no silent flooring
     store.close()
 
 
@@ -440,6 +506,32 @@ def test_resolver_minimum_samples_gate(tmp_path):
     store = _store(tmp_path)
     _learn_four_hits(store)  # 4 samples, confidence 0.70
     resolver = TTLResolver(store.profile_for, default_ttl_s=300.0, minimum_samples=5)
+    result = _resolve(resolver)
+    assert result.source == "default"
+    assert result.ttl_s == 300.0
+    store.close()
+
+
+def test_unverified_observations_cannot_promote_a_profile_to_learned(tmp_path):
+    """§58/§59: non-evidence must never carry a profile over the samples gate.
+
+    The profile below is two clean samples short of nothing but the gate: high
+    confidence, a real lower bound, ``minimum_samples=3``. A SUCCESS_UNVERIFIED
+    response adds no knowledge, so it must not be the observation that makes the
+    learned TTL authoritative.
+    """
+    store = _store(tmp_path)
+    profile = _fresh_profile()
+    profile.confidence = 0.95
+    profile.sample_count = 2
+    profile.lower_bound_s = 400.0
+    profile.estimated_ttl_s = profile.estimate()
+    profile.observe(Outcome.SUCCESS_UNVERIFIED, None)
+    assert profile.sample_count == 2
+    assert profile.confidence >= HIGH_CONFIDENCE_THRESHOLD  # confidence is not the gate here
+    store.upsert_profile(profile)
+
+    resolver = TTLResolver(store.profile_for, default_ttl_s=300.0, minimum_samples=3)
     result = _resolve(resolver)
     assert result.source == "default"
     assert result.ttl_s == 300.0

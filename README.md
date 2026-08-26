@@ -147,6 +147,21 @@ re-verify via `ss`/`ps` that no process remains on `908x`. See
 
 All settings are `CACHEPILOT_*` environment variables, read at startup; malformed values fall back to defaults (fail open for traffic). Full inventory in the docs above; the essentials:
 
+> **Cache warming is opt-in and OFF by default.** `CACHEPILOT_LEASE_DRY_RUN`
+> defaults to `true` (and an unrecognized value also resolves to `true` —
+> uncertain configuration must never warm, per AGENTS.md invariant 9), so a
+> default deployment evaluates every lease and logs `WOULD WARM …` without ever
+> sending a warm request. Set `CACHEPILOT_LEASE_DRY_RUN=false` to let warms
+> actually go out. Everything else — long-task backgrounding, churn detection,
+> TTL learning, telemetry — is active by default.
+>
+> **Route affinity has no shipped adapter.** `CACHEPILOT_ROUTE_AFFINITY` gates
+> the economic route-pinning path, but pinning also requires an adapter whose
+> `can_pin_route()` is true, and the only bundled adapter
+> (`OpenAICompatibleAdapter`) returns `False` — the generic OpenAI-compatible
+> dialect has no route-pinning mechanism to use. Turning the switch on without
+> a custom adapter therefore changes nothing.
+
 | Variable | Default | Meaning |
 |---|---|---|
 | `CACHEPILOT_ENABLED` | `true` | Plugin master switch |

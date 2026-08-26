@@ -22,6 +22,7 @@ The store is keyed by ``cache_fingerprint`` (physical cache identity, never
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -31,9 +32,12 @@ class RequestSnapshot:
     """One in-memory snapshot of a cache-producing request (PRD §30).
 
     ``body`` is the raw provider request body as JSON (the warm replay's
-    source). ``upstream_url`` is where the warm is sent; ``authorization``
-    is the request's Authorization header value, held in memory so the warm
-    can authenticate — never persisted, never logged.
+    source). ``upstream_url`` is where the warm is sent; ``replay_headers``
+    are the request headers the warm must resend to be accepted upstream —
+    the adapter's ``replay_headers`` allowlist applied to the incoming
+    request, held in memory so the warm can authenticate against providers
+    whose credential is not an ``Authorization`` header (``x-api-key``, an
+    ``anthropic-version`` pin, an org header). Never persisted, never logged.
 
     This dataclass deliberately carries raw content: it is a *memory-only*
     object by contract (PRD §30) and must never be serialized.
@@ -42,7 +46,7 @@ class RequestSnapshot:
     cache_fingerprint: str
     body: dict[str, Any]
     upstream_url: str
-    authorization: str | None = None
+    replay_headers: Mapping[str, str] = field(default_factory=dict)
     stored_at: float = field(default_factory=time.time)
 
 

@@ -10,10 +10,15 @@ summaries, request bodies) are NEVER logged (AGENTS.md rule 10).
 Phase 2 additions (all fail-open, all gated on ``long_tasks.*`` config):
 
 - ``post_tool_call`` records terminal command durations into the command
-  duration learner (PRD §43) — normalized signatures only, no payload.
+  duration learner (PRD §43) — normalized signatures only, no payload — and
+  releases the ``process`` background target that ``tool_middleware``
+  registered when it auto-backgrounded the command (PRD §46).
 - ``subagent_start`` / ``subagent_stop`` maintain background-target
   refcounts (PRD §46, §48). Target existence comes exclusively from the
   hook payloads — never inferred from conversation text.
+- the session-bearing hooks publish the Hermes session id to
+  :mod:`cachepilot_hermes.session`, which is the identity targets are
+  registered under and the identity the correlation headers carry (PRD §29).
 
 Hook kwargs are documented against the Hermes v0.20.0 call sites
 (hermes_cli/hooks.py::_DEFAULT_PAYLOADS, run_agent.py:2846 for
@@ -31,7 +36,12 @@ from typing import Any
 
 from cachepilot_hermes.config import PLUGIN_LOGGER_NAME, CachePilotConfig, emit_debug
 from cachepilot_hermes.duration_history import CommandDurationHistory
-from cachepilot_hermes.targets import BackgroundTarget, BackgroundTargetRegistry
+from cachepilot_hermes.session import publish_session_id
+from cachepilot_hermes.targets import (
+    BackgroundTarget,
+    BackgroundTargetRegistry,
+    process_target_id,
+)
 
 logger = logging.getLogger(PLUGIN_LOGGER_NAME)
 
@@ -52,12 +62,19 @@ HOOK_NAMES: tuple[str, ...] = (
 def make_post_tool_call(
     config: CachePilotConfig,
     history: CommandDurationHistory | None = None,
+    targets: BackgroundTargetRegistry | None = None,
 ) -> Callable[..., Any]:
     """Return the ``post_tool_call`` callback.
 
-    When *history* is provided and duration learning is enabled, terminal
-    command durations are recorded (normalized signature only — never the
-    command text, per AGENTS.md rule 10).
+    Two independent jobs, neither allowed to gate the other:
+
+    - a completed terminal command releases the ``process`` background target
+      the ``tool_request`` middleware registered when it auto-backgrounded the
+      call (PRD §46) — the lease must stop being armed for work that finished,
+      whether or not duration learning is on;
+    - when *history* is provided and duration learning is enabled, the
+      command's duration is recorded (normalized signature only — never the
+      command text, per AGENTS.md rule 10).
     """
 
     def _on_post_tool_call(
@@ -82,17 +99,22 @@ def make_post_tool_call(
             duration_ms=duration_ms,
         )
         try:
-            if history is None:
-                return None  # noqa: RET501 — observer contract
+            publish_session_id(session_id)
             if tool_name != "terminal":
-                return None  # noqa: RET501 — only terminal is learned
-            if not config.long_tasks.enabled or not config.long_tasks.learn_command_durations:
-                return None  # noqa: RET501 — learning disabled
+                return None  # noqa: RET501 — only terminal is tracked/learned
             if not isinstance(args, Mapping):
                 return None  # noqa: RET501 — malformed payload
             command = args.get("command")
             if not isinstance(command, str) or not command.strip():
-                return None  # noqa: RET501 — nothing to learn
+                return None  # noqa: RET501 — no command identity
+            if targets is not None and config.long_tasks.enabled:
+                # Refcounts clamp at zero, so releasing a command that was
+                # never promoted (and never registered) is a no-op.
+                targets.release(process_target_id(command))
+            if history is None:
+                return None  # noqa: RET501 — no duration learner
+            if not config.long_tasks.enabled or not config.long_tasks.learn_command_durations:
+                return None  # noqa: RET501 — learning disabled
             if duration_ms is None:
                 return None  # noqa: RET501 — duration unknown
             history.record(
@@ -235,6 +257,9 @@ def make_subagent_start(
             child_role=child_role,
         )
         try:
+            # The parent session is the identity the target — and therefore the
+            # relay's cache lease — is keyed on (PRD §46).
+            publish_session_id(parent_session_id)
             if targets is None or not config.long_tasks.enabled:
                 return None  # noqa: RET501 — observer contract
             target_id = child_session_id or child_subagent_id
@@ -310,6 +335,9 @@ def make_on_session_start(config: CachePilotConfig) -> Callable[..., Any]:
             hook="on_session_start",
             session_id=session_id,
         )
+        # PRD §29/§46: the id every later target registration and correlation
+        # header keys on.
+        publish_session_id(session_id)
         return None  # noqa: RET501, PLR1711 — observer contract: pass-through
 
     return _on_session_start
@@ -357,6 +385,7 @@ def make_on_session_reset(config: CachePilotConfig) -> Callable[..., Any]:
             hook="on_session_reset",
             session_id=session_id,
         )
+        publish_session_id(session_id)
         return None  # noqa: RET501, PLR1711 — observer contract: pass-through
 
     return _on_session_reset
@@ -385,10 +414,11 @@ def make_hook_handlers(
     Args:
         config: Plugin settings.
         history: Optional duration learner wired into ``post_tool_call``.
-        targets: Optional target registry wired into the subagent hooks.
+        targets: Optional target registry wired into the subagent hooks and
+            into ``post_tool_call``'s ``process``-target release.
     """
     return {
-        "post_tool_call": make_post_tool_call(config, history),
+        "post_tool_call": make_post_tool_call(config, history, targets),
         "post_api_request": make_post_api_request(config),
         "api_request_error": make_api_request_error(config),
         "subagent_start": make_subagent_start(config, targets),

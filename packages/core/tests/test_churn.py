@@ -315,6 +315,98 @@ def test_classify_cache_key_churn():
     assert classification.confidence == 0.70
 
 
+
+# -- PRD §137 residual cause + confidence arithmetic --------------------------
+
+
+def test_residual_cause_names_untracked_identity_churn():
+    """PRD §137 "cache key churn": the fingerprint moved, no tracked layer did.
+
+    Auth scope, endpoint, api_mode and provider are part of physical cache
+    identity but are outside :class:`LayeredHashes`, so the classifier cannot
+    see them. Without the caller's identity-moved signal it returned no cause
+    at all and ``explain-miss`` printed "n/a (not classified)" for a whole
+    class of real cache destruction.
+    """
+    identical = _content()
+    classification = classify(identical, _content(), cache_identity_changed=True)
+    assert classification.likely_cause == "cache identity changed outside the tracked layers"
+    assert classification.confidence == 0.60
+
+
+def test_residual_cause_never_invents_one_without_the_signal():
+    """The honesty rule holds: an unexplained pair with no signal has no cause."""
+    classification = classify(_content(), _content())
+    assert classification.likely_cause is None
+    assert classification.confidence is None
+
+
+def test_a_tracked_layer_always_beats_the_residual_cause():
+    classification = classify(
+        _content(), _content(model="gpt-5.3"), cache_identity_changed=True
+    )
+    assert classification.likely_cause == "provider failover (model switched)"
+    assert classification.confidence == 0.85
+
+
+def test_residual_cause_works_on_the_hash_only_path():
+    hashes = _content().to_hashes()
+    classification = classify_hashes(hashes, hashes, cache_identity_changed=True)
+    assert classification.likely_cause == "cache identity changed outside the tracked layers"
+    assert classification.confidence == 0.60
+
+
+def test_confidence_never_rises_above_the_base_with_zero_flat_layers():
+    """``base - 0.10 * (changed - 1)`` ADDS 0.10 when no flat layer changed.
+
+    Reachable through the public hash-only API with a layered-but-not-flat
+    snapshot (documented in :class:`LayeredHashes` as the post-restart shape):
+    a cause is found from the layered hashes while every flat flag is False,
+    so the penalty term inverts into a bonus and the case with the LEAST
+    evidence scores highest.
+    """
+    previous = LayeredHashes(
+        system_prefix_hash=hash_content("stable prefix"),
+        system_suffix_hash=hash_content("suffix one"),
+    )
+    current = LayeredHashes(
+        system_prefix_hash=hash_content("stable prefix"),
+        system_suffix_hash=hash_content("suffix two"),
+    )
+    classification = classify_hashes(previous, current)
+    assert classification.system_changed is False  # no flat hashes to compare
+    # The suffix layer's base confidence is 0.85 and there is no EXTRA changed
+    # layer to penalise, so 0.85 is the ceiling for this pair.
+    assert classification.likely_cause == "volatile value inserted into prompt prefix"
+    assert classification.confidence == 0.85
+
+
+def test_residual_cause_confidence_is_its_base_not_a_bonus():
+    """The residual cause is reached with zero changed flat layers too."""
+    classification = classify(_content(), _content(), cache_identity_changed=True)
+    assert classification.confidence == 0.60  # never 0.70
+
+
+def test_classify_hashes_each_side_once(monkeypatch):
+    """PRD §24 layers are hashed once per side, not twice.
+
+    ``classify`` built the layered hashes and then ``_first_divergence``
+    recomputed both sides from scratch — 8 SHA-256 digests plus four canonical
+    JSON serializations per redundant call, over request bodies the relay
+    caches up to 1 MiB.
+    """
+    calls = {"n": 0}
+    original = RequestContent.to_hashes
+
+    def counting(self):
+        calls["n"] += 1
+        return original(self)
+
+    monkeypatch.setattr(RequestContent, "to_hashes", counting)
+    classify(_content(), _content(messages=[{"role": "user", "content": "other"}]))
+    assert calls["n"] == 2  # one per side
+
+
 def test_classify_route_dominates_content_churn():
     """A route change destroys the whole physical cache — it stays the primary
     cause even when content also moved; extra layers lower the confidence."""
@@ -351,20 +443,35 @@ def test_classify_earliest_content_layer_wins_cause():
 # -- first divergent byte + estimated loss ------------------------------------
 
 
-def test_estimated_prefix_loss_tokens_heuristic():
-    long_static = "a" * 400
-    previous = _content(messages=[{"role": "user", "content": long_static + " one"}])
-    current = _content(messages=[{"role": "user", "content": long_static + " two"}])
-    classification = classify(previous, current)
-    assert classification.estimated_prefix_loss_tokens is not None
-    assert classification.estimated_prefix_loss_tokens > 0  # ~100+ tokens shared
-    # longer shared prefix ⇒ larger estimate (monotonic)
-    shorter = classify(
-        _content(messages=[{"role": "user", "content": "one"}]),
-        _content(messages=[{"role": "user", "content": "two"}]),
+def test_estimated_prefix_loss_counts_the_lost_suffix_not_the_kept_prefix():
+    """PRD §25: the loss is what stops being reusable, not what survives.
+
+    Under exact-prefix caching the longest common prefix is exactly the part
+    that stays cached, so a change at the very tail of a large request loses
+    almost nothing while the same-sized request changed at the head loses
+    nearly all of it. Direction, not magic numbers.
+    """
+    long_static = "a" * 4000
+    tail_change = classify(
+        _content(messages=[{"role": "user", "content": long_static + " one"}]),
+        _content(messages=[{"role": "user", "content": long_static + " two"}]),
     )
-    assert shorter.estimated_prefix_loss_tokens is not None
-    assert classification.estimated_prefix_loss_tokens > shorter.estimated_prefix_loss_tokens
+    head_change = classify(
+        _content(messages=[{"role": "user", "content": "one " + long_static}]),
+        _content(messages=[{"role": "user", "content": "two " + long_static}]),
+    )
+    assert tail_change.estimated_prefix_loss_tokens is not None
+    assert head_change.estimated_prefix_loss_tokens is not None
+    # A 4000-char (~1000-token) shared prefix survives a tail edit: only the
+    # short canonical remainder after the divergence is lost, nowhere near what
+    # the prefix itself is worth.
+    assert tail_change.estimated_prefix_loss_tokens < 100
+    # The same request edited at the head loses essentially the whole prefix.
+    assert head_change.estimated_prefix_loss_tokens > 900
+    assert (
+        head_change.estimated_prefix_loss_tokens
+        > 10 * tail_change.estimated_prefix_loss_tokens
+    )
 
 
 def test_estimated_prefix_loss_identical_requests_zero():

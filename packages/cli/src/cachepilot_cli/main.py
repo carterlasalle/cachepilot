@@ -110,6 +110,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         parents=[db_flag],
         help="active cache leases from the telemetry store (PRD §78)",
     )
+    leases_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="include completed and invalidated leases (retained rows, not live work)",
+    )
     leases_parser.set_defaults(handler=cmd_leases)
 
     costs_parser = sub.add_parser(
@@ -304,11 +309,22 @@ def _plugin_state(stats: CacheHealthStats) -> str:
 # -- leases -----------------------------------------------------------------
 
 
+#: Terminal lease states: the lease is finished, so it is not "active" even
+#: though its row is retained (the ``leases`` table is a snapshot table, one row
+#: per lease_id, and rows are never pruned).
+_TERMINAL_LEASE_STATES = frozenset({"inactive", "invalidated"})
+
+
 def cmd_leases(args: argparse.Namespace) -> int:
     """Real lease listing from the telemetry store (PRD §78, Phase 5).
 
     Rows are whatever the relay actually persisted — never fabricated
     (honest by construction; an empty database says so).
+
+    Only LIVE leases are listed. Retained rows for completed and invalidated
+    leases are not active work, and printing them under a command whose empty
+    case says "no active leases" made a historical listing look like a live
+    one. ``--all`` shows every retained row.
     """
     store = open_read_only_store(args.db)
     if store is None:
@@ -318,6 +334,10 @@ def cmd_leases(args: argparse.Namespace) -> int:
         leases = store.list_leases(limit=50)
     finally:
         store.close()
+    if not getattr(args, "all", False):
+        leases = [
+            lease for lease in leases if lease.state.lower() not in _TERMINAL_LEASE_STATES
+        ]
     if not leases:
         print("no active leases")
         return 0

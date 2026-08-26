@@ -237,6 +237,71 @@ def test_warm_bounded_replay_reaches_fake_cache_and_discards_content():
     assert len(executor.sent_bodies) == 1  # nothing more was ever sent
 
 
+# -- §50 WARMING: the one state only an in-flight warm can hold --------------
+
+
+def test_lease_is_warming_while_the_warm_is_in_flight():
+    """§50/§78: `economics positive → WARMING`, and the CLI must be able to show it.
+
+    ``WARMING`` is a resting state PRD §78's ``cachepilot leases`` example
+    renders, but nothing ever assigned it — the lease stayed WARM_SCHEDULED
+    through the whole request, so the state machine could not distinguish
+    "a warm is scheduled" from "a warm is on the wire right now".
+    """
+    clock = FakeClock()
+    observed: list[LeaseState] = []
+
+    class _StateWatchingExecutor:
+        async def execute(self, snapshot):
+            observed.append(lease.state)
+            return WarmResult(
+                outcome=Outcome.CONFIRMED_HIT,
+                usage=TokenUsage(prompt_tokens=4000, cache_read_tokens=4000),
+                cost_usd=Decimal("0.001"),
+            )
+
+    store = SnapshotStore()
+    manager = _manager(clock, snapshot_store=store, warm_executor=_StateWatchingExecutor())
+    lease = _armed_touched_lease(manager, clock)
+    store.store(_snapshot(lease))
+    clock.advance(1000)
+
+    decision = asyncio.run(manager.evaluate_lease(lease.lease_id))
+    assert decision is LeaseDecision.WARMED_CONFIRMED_HIT
+    assert observed == [LeaseState.WARMING]
+    # §50 `→ ARMED`: the warm's own outcome travels in the decision, so the
+    # lease returns to its resting state rather than parking on the outcome.
+    assert lease.state is LeaseState.ARMED
+
+
+def test_warming_resolves_back_even_when_the_warm_fails():
+    clock = FakeClock()
+    executor = StubExecutor(
+        WarmResult(outcome=Outcome.FAILED, usage=TokenUsage(), cost_usd=Decimal(0))
+    )
+    store = SnapshotStore()
+    manager = _manager(clock, snapshot_store=store, warm_executor=executor)
+    lease = _armed_touched_lease(manager, clock)
+    store.store(_snapshot(lease))
+    clock.advance(1000)
+
+    assert asyncio.run(manager.evaluate_lease(lease.lease_id)) is LeaseDecision.WARMED_FAILED
+    # No absorbing FAILED state: repeated failure is the §94 breaker's job.
+    assert lease.state is LeaseState.ARMED
+
+
+def test_lease_state_has_no_unreachable_members():
+    """Every declared state must have a producer (or it lies to the CLI)."""
+    assert {state.value for state in LeaseState} == {
+        "inactive",
+        "armed",
+        "warm_scheduled",
+        "warming",
+        "economic_stop",
+        "invalidated",
+    }
+
+
 # -- outcome semantics: last_cache_touch_at (invariant 3, PRD §147) ----------
 
 

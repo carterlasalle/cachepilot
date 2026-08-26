@@ -16,6 +16,22 @@ A "warm while the process is alive" watchdog is the anti-pattern this phase
 exists to forbid. A 3-hour compile must NOT trigger 36 refreshes just because
 the job exists.
 
+**Two things must be true before any warm is sent, and neither is on by
+default in a fresh install:**
+
+1. `CACHEPILOT_LEASE_DRY_RUN=false`. The default is `true` (an unrecognized
+   value also resolves to `true` — uncertain configuration must not warm,
+   invariant 9), so out of the box the controller runs in full, records its
+   decisions, and every due lease resolves to `SKIPPED_DRY_RUN` with a
+   `WOULD WARM …` log line. Nothing is sent and nothing is spent.
+2. Pricing must be known. Without a `CACHEPILOT_PRICING_*` snapshot (or
+   provider-returned cost), `pricing_known` is false and the controller returns
+   `SKIP_UNKNOWN_PRICING` — savings are never claimed on incomplete cost data
+   (invariant 4). Note that a **streaming** response carries no usage telemetry
+   at all today, so a streaming-only deployment stays at
+   `SKIP_UNKNOWN_PRICING` regardless of configured pricing; the relay logs a
+   warning naming that consequence the first time it observes one.
+
 ---
 
 ## The decision math (PRD §60-62)

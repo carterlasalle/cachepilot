@@ -100,9 +100,17 @@ class CacheProviderAdapter(Protocol):
     the PRD's abstract signature models PRD §31's stream-cancel fallback,
     which only adapters that can *verify* it may use; this phase's
     OpenAI-compatible adapter cannot, so skip is expressed as ``None``.
+
+    ``replay_headers`` is the dialect's allowlist of request headers a warm
+    must resend to be accepted upstream (PRD §31: replay the actual request,
+    do not synthesize one). It is an ALLOWLIST, never passthrough: hop-by-hop
+    headers and the relay's own ``X-CachePilot-*`` correlation headers can
+    then never reach the provider, and the set of secret-bearing values a
+    memory-only snapshot may hold stays enumerable (PRD §30, §90).
     """
 
     capabilities: CacheCapabilities
+    replay_headers: frozenset[str]
 
     def canonical_cache_identity(
         self,
@@ -222,6 +230,22 @@ class OpenAICompatibleAdapter:
         route_affinity_available=False,
     )
 
+    #: PRD §31/§90: the request headers a warm must resend for this dialect to
+    #: be accepted upstream. Lower-case, matched case-insensitively against the
+    #: incoming request. Held only in the memory-only snapshot (PRD §30) and
+    #: never persisted or logged. An allowlist by design — a provider header
+    #: this adapter has not verified is never replayed, and neither are
+    #: hop-by-hop or CachePilot correlation headers.
+    replay_headers = frozenset(
+        {
+            "authorization",
+            "api-key",
+            "openai-organization",
+            "openai-project",
+            "openai-beta",
+        }
+    )
+
     _OUTPUT_BOUND_FIELDS = (
         "max_tokens",
         "max_completion_tokens",
@@ -267,10 +291,21 @@ class OpenAICompatibleAdapter:
     def build_warm_request(self, original: PhysicalRequest) -> PhysicalRequest | None:
         """Bounded cache-equivalent replay (PRD §31).
 
-        Deep-copies the snapshot, then sets the FIRST present output-bound
-        field to ``1`` (``max_tokens``, else ``max_completion_tokens``, else
+        Deep-copies the snapshot, forces ``stream`` off when the original
+        carried it, then sets the FIRST present output-bound field to ``1``
+        (``max_tokens``, else ``max_completion_tokens``, else
         ``max_output_tokens``). Nothing else is invented or mutated — a
-        provider field the original did not support is never added.
+        provider field the original did not support is never added, and
+        ``stream`` is never introduced into a request that lacked it.
+
+        Disabling ``stream`` does not change cache identity: ``stream`` is one
+        of the output-bounding fields deliberately excluded from
+        :data:`~cachepilot_core.fingerprint.CACHE_IDENTITY_FIELDS` (PRD §23,
+        invariant 8), so the warm still replays the same physical cache
+        identity. It is required for verification: an SSE body cannot be parsed
+        for usage, so a streamed warm can only ever be classified
+        SUCCESS_UNVERIFIED — spend with no evidence, and two of those open the
+        §94 circuit breaker.
 
         Returns ``None`` (skip, fail closed) when no output-bound field
         exists: the stream-cancel fallback of PRD §31 is NOT used because
@@ -283,6 +318,8 @@ class OpenAICompatibleAdapter:
                 "carries only hashes and cannot be replayed"
             )
         warm = copy.deepcopy(dict(original))
+        if "stream" in warm:
+            warm["stream"] = False
         for bound_field in self._OUTPUT_BOUND_FIELDS:
             if bound_field in warm:
                 warm[bound_field] = 1
